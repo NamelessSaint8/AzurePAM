@@ -21,11 +21,11 @@ hand to auditors, leadership, or your remediation team.
 | **AzurePolicy**      | Azure Policy compliance state across subscriptions                    | Any Azure subscription    |
 | **Purview**          | Compliance Manager assessment scores and improvement actions           | M365 E5 Compliance        |
 
-# > **All checks are read-only.** EntraChecks never modifies your tenant.
+> **All checks are read-only.** EntraChecks never modifies your tenant.
 
 ---
 
-[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/K3K71U9F55)
+# [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/K3K71U9F55)
 
 ## Quick Start (5 Minutes)
 
