@@ -25,6 +25,8 @@ hand to auditors, leadership, or your remediation team.
 
 ---
 
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/K3K71U9F55)
+
 ## Quick Start (5 Minutes)
 
 ### Step 1 — Install Prerequisites
