@@ -20,6 +20,7 @@ hand to auditors, leadership, or your remediation team.
 | **Defender**         | Defender for Cloud regulatory compliance (CIS, NIST, PCI-DSS, etc.)  | Defender for Cloud        |
 | **AzurePolicy**      | Azure Policy compliance state across subscriptions                    | Any Azure subscription    |
 | **Purview**          | Compliance Manager assessment scores and improvement actions           | M365 E5 Compliance        |
+| **SOC 2**            | AICPA TSC 2017 (revised 2022) readiness — Type 1 + Type 2 period coverage, evidence bundle with SHA-256 chain-of-custody, PII redaction, white-label branding | Any M365 plan (Premium tier unlocks more controls) |
 
 > **All checks are read-only.** EntraChecks never modifies your tenant.
 
@@ -119,6 +120,35 @@ Returns exit code 1 if any FAIL findings are detected.
 .\Start-EntraChecks.ps1 -ConfigFile ".\config\entrachecks.config.json"
 ```
 
+### SOC 2 Readiness
+
+EntraChecks runs a TSC-structured SOC 2 readiness pass that complements the
+core security checks. Two ways to invoke it:
+
+```powershell
+# From the interactive menu: select [6] SOC 2 Readiness, [7] SOC 2 Type 2 (period coverage)
+.\Start-EntraChecks.ps1
+
+# Or auto-run alongside Quick Assessment by setting SOC2.Enabled = true in
+# config\entrachecks.config.json — the SOC 2 report is then produced as
+# part of every Quick / Scheduled run.
+.\Start-EntraChecks.ps1 -Mode Quick -Modules All
+```
+
+The SOC 2 pass produces a standalone TSC report (HTML + Excel + CSV) plus an
+evidence bundle with SHA-256 chain-of-custody and an optional ACL-locked
+identity-resolution map for re-resolving redacted hashes. See
+[docs/SOC2-Guide.md](docs/SOC2-Guide.md) for the full workflow.
+
+### Reducing Authentication Prompts
+
+A SOC 2-enabled run authenticates against **two distinct identity planes**
+(Microsoft Graph + Azure Resource Manager). Their tokens cannot be shared,
+so the floor is two browser sign-ins. Pre-grant admin consent once via
+`Grant-AdminConsent.ps1` to eliminate the consent dialog. To skip the Azure
+prompt as well, run `Connect-AzAccount` in the same shell before launching
+`Start-EntraChecks.ps1` — the cached Az context is reused.
+
 ---
 
 ## Parameters Reference
@@ -163,7 +193,11 @@ EntraChecks/
 │   ├── EntraChecks-ExcelReporting.psm1     # Excel report generation
 │   ├── EntraChecks-DeltaReporting.psm1     # Snapshot comparison engine
 │   ├── EntraChecks-RemediationGuidance.psm1 # Remediation instructions
-│   └── EntraChecks-Hybrid.psm1             # Hybrid identity checks
+│   ├── EntraChecks-Hybrid.psm1             # Hybrid identity checks
+│   ├── EntraChecks-SOC2.psm1               # SOC 2 TSC catalog + assessment engine
+│   ├── EntraChecks-SOC2Reporting.psm1      # SOC 2 HTML/Excel/CSV renderer
+│   ├── EntraChecks-SOC2TypeTwo.psm1        # SOC 2 Type 2 period coverage
+│   └── EntraChecks-Branding.psm1           # White-label branding helper
 ├── config/                        # Configuration files
 │   ├── entrachecks.config.json             # Default configuration
 │   └── entrachecks.config.prod.json        # Production overrides
@@ -209,16 +243,26 @@ and tells you which ones were skipped.
 After an assessment, look in the `Reports/` folder. You'll find a timestamped
 subfolder containing:
 
-- **Comprehensive HTML Report** — Open this in any browser. Color-coded findings with
-  pass/fail/warning status, risk scores, remediation guidance, and an executive summary.
+- **Comprehensive HTML Report** — Open this in any browser. Includes:
+  - **Executive digest** with a one-line posture verdict (`STRONG` / `MINOR DEFICIENCIES` / `GAPS IDENTIFIED`)
+  - Risk-tiered finding cards with stable per-finding deep-link anchors and a copy-link affordance
+  - Dedicated sections for **Microsoft Secure Score** (top improvement actions ranked by priority), **Azure Policy** compliance, and **Purview Compliance Manager** when those modules ran — each section gracefully degrades to a "Not collected" placeholder when its data wasn't supplied
+  - **Print stylesheet** that hides nav/filters and forces black-on-white for clean printable output
+  - Optional **white-label branding** override (org name, logo, primary color) via `-Branding`
+  - **Integrity badge** (SHA-256 of the canonical findings JSON) in the footer, with a sidecar `*.findings.json` for verification
 - **Executive Summary** — A concise overview for leadership with key metrics and
   prioritized recommendations.
 - **Unified Compliance Report** — Consolidated view across all compliance frameworks
-  (CIS, NIST, SOC 2, etc.) when external modules are enabled.
-- **CSV Exports** — Prioritized findings, quick wins, and compliance gaps as rows.
-  Import into Excel, Power BI, or a SIEM for further analysis.
+  (CIS, NIST, SOC 2, PCI-DSS) when external modules are enabled.
+- **SOC 2 Readiness Report** — Standalone TSC-structured report with evidence bundle
+  (when SOC 2 is enabled). See [docs/SOC2-Guide.md](docs/SOC2-Guide.md).
+- **CSV Exports** — Numbered files (`01-ExecutiveSummary.csv` through `12-Purview.csv`)
+  produced automatically when the optional `ImportExcel` module is **not** installed.
+  Mirror the full Excel sheet structure so you can re-combine via Excel's "Get Data >
+  From Folder".
 - **JSON Export** — Machine-readable output for automation pipelines.
-- **Excel Report** — Multi-sheet workbook with charts (requires ImportExcel module).
+- **Excel Report** — Multi-sheet workbook (requires `ImportExcel` module). When absent,
+  the renderer falls back to the numbered CSV bundle automatically.
 
 ### Finding Severities
 
@@ -240,6 +284,26 @@ subfolder containing:
 
 ---
 
+## Verifying Report Integrity
+
+The unified HTML report ships with a SHA-256 hash of its canonical findings
+JSON in the footer, plus a sibling `<report>.html.findings.json` sidecar.
+Verify the report wasn't modified after generation:
+
+```powershell
+Import-Module .\Modules\EntraChecks-HTMLReporting.psm1 -Force
+Test-EntraChecksReportIntegrity -ReportPath .\Reports\<timestamp>\Comprehensive-Assessment-*.html
+```
+
+Returns `IsValid = $true` when the sidecar's recomputed hash matches the
+hash baked into the report. Useful for chain-of-custody when handing
+reports to auditors or storing them long-term.
+
+(For the SOC 2 evidence bundle's separate hash chain, see
+`Test-SOC2EvidenceBundle` in [docs/SOC2-Guide.md](docs/SOC2-Guide.md).)
+
+---
+
 ## Snapshots & Delta Reporting
 
 EntraChecks can save assessment results as **snapshots** so you can track your
@@ -255,6 +319,11 @@ security posture over time:
 
 The delta report highlights what improved, what regressed, and what's new since the
 last assessment. This is invaluable for demonstrating progress to auditors.
+
+The unified HTML report also accepts a `-PreviousAssessment` parameter to render an
+inline **"Since last assessment"** card row in the executive section (Resolved / New
+/ Persistent counts) — handy when you want the delta visible without producing a
+separate delta report.
 
 In Interactive mode, the **Manage Snapshots** and **Compare Snapshots** menus give
 you full control over snapshot selection and comparison.
@@ -347,6 +416,7 @@ For detailed documentation, see the `docs/` folder:
 
 - [Getting Started](docs/GETTING-STARTED.md) — Beginner's guide
 - [User Guide](docs/USER-GUIDE.md) — Complete reference
+- [SOC 2 Guide](docs/SOC2-Guide.md) — TSC coverage, redaction, evidence bundle, Type 2 period coverage
 - [Configuration Guide](docs/Configuration-Guide.md) — Config file reference
 - [Troubleshooting](docs/TROUBLESHOOTING.md) — Extended problem solving
 - [API Reference](docs/API-REFERENCE.md) — Function reference
