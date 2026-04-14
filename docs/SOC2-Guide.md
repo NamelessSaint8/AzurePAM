@@ -133,15 +133,61 @@ Output\SOC2\identity-resolution\identity-resolution-<tenant>-<timestamp>.json
 
 ### Report structure
 
-The HTML report groups findings by TSC family (CC, A, C, PI, P) and lists every
-control in scope. Each control shows its:
-- Automation status (Automated / Supporting / Manual)
-- Control owner hint (Security, Identity, IT Ops, Compliance, etc.)
-- Findings table with status, severity, object, description, remediation
+The HTML report opens with an **Executive Summary** that gives a one-page
+view before any detail:
+- Readiness verdict (STRONG / MINOR DEFICIENCIES / GAPS IDENTIFIED / INSUFFICIENT DATA)
+- Headline numbers: total controls, pass, fail, warnings, licensing gaps, total findings
+- Top 3 failing TSC controls (by finding count)
+- Top 3 licensing-gap features (by TSC coverage count)
+- Jump-to links into each per-family section
 
-The Excel workbook provides a Cover sheet, Summary by Category, Control
-Register, per-family Findings sheets, Manual Attestation register, and Evidence
-Register.
+If any finding originates from a fixture-verified-only Phase 2 check
+(`Test-SOC2DiagnosticSettingsExport`, `Test-SOC2BreakGlassAccountsConfigured`),
+an amber **verification-note banner** renders near the top calling that out,
+and the affected findings carry an inline `fixture-verified` tag in the
+Check column. Spot-check those against your live tenant before relying on
+the output for audit evidence.
+
+The Cover panel carries an **Evidence integrity — verifiable** badge when a
+bundle was produced. The side-panel "Evidence integrity — verifiable"
+subtitle mirrors it with a check-icon SVG. Run
+`Test-SOC2EvidenceBundle -ManifestPath <path>` to recompute and verify.
+
+Each per-family section has an anchor ID (`#family-CC`, `#family-A`, etc.)
+so the Summary-by-Category cards and the Jump-to links in the Executive
+Summary both navigate directly to the relevant section.
+
+A print stylesheet (`@media print`) hides the interactive side panel,
+preserves status colors, and forces page-breaks between per-family sections
+so printing / save-as-PDF produces a usable document.
+
+### CSV and Excel output
+
+When the `ImportExcel` PowerShell module is installed, the workbook emits
+`.xlsx` with multiple sheets (Cover, Summary by Category, Control Register,
+Findings - CC6/CC7/CC8/Other CC/Availability/Confidentiality, Findings -
+Licensing Gaps, Manual Attestation, Evidence Register).
+
+When `ImportExcel` is **not** installed, the CSV fallback produces the same
+data surface as numbered files in a directory:
+
+```
+01-Cover.csv
+02-Summary-by-Category.csv
+03-Control-Register.csv
+04-Findings-CC6.csv
+05-Findings-CC7.csv
+06-Findings-CC8.csv
+07-Findings-Other-CC.csv
+08-Findings-Availability.csv
+09-Findings-Confidentiality.csv
+10-Findings-Licensing-Gaps.csv
+11-Manual-Attestation.csv
+12-Evidence-Register.csv
+```
+
+Files are only written when their data exists (e.g., no licensing-gap
+findings → no `10-` file).
 
 ---
 
