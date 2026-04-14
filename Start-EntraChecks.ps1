@@ -567,10 +567,12 @@ function Connect-EntraCheck {
             # Check if already connected with sufficient scopes
             $existingContext = Get-MgContext -ErrorAction SilentlyContinue
             if ($existingContext -and $existingContext.Account) {
-                # Check for critical scopes - only reconnect if missing essential ones
-                $criticalScopes = @('Directory.Read.All', 'Policy.Read.All', 'AuditLog.Read.All')
+                # Compare against the FULL scope union, not just a 3-scope critical
+                # subset. If the cached context is missing any required scope,
+                # reconnect once with the full set so downstream module calls do
+                # not trigger silent MSAL re-prompts mid-run.
                 $grantedScopes = $existingContext.Scopes
-                $missingCritical = @($criticalScopes | Where-Object { $grantedScopes -notcontains $_ })
+                $missingCritical = @($script:AllGraphScopes | Where-Object { $grantedScopes -notcontains $_ })
 
                 if ($missingCritical.Count -eq 0) {
                     Write-Host "    [OK] Already connected as: $($existingContext.Account)" -ForegroundColor Green

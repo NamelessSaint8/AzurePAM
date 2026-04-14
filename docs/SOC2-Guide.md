@@ -43,6 +43,34 @@ the tool.
 
 ## 2. Running a SOC 2 assessment
 
+### Reducing authentication prompts
+
+A SOC 2-enabled run authenticates against **two distinct identity planes**:
+Microsoft Graph (for Entra/M365 evidence) and Azure Resource Manager (for
+Defender, Backup, and diagnostic-settings evidence). Tokens for these planes
+have different audiences and **cannot be shared** — at minimum you will see
+**two browser sign-ins**.
+
+You can eliminate the third prompt — the Graph "Permissions requested"
+consent dialog — by pre-granting admin consent **once per tenant**:
+
+```powershell
+# Run as a Global Administrator, once per tenant.
+.\Grant-AdminConsent.ps1
+```
+
+Tick **"Consent on behalf of your organization"** in the consent screen.
+Subsequent runs by any user with the appropriate read role will not see
+the consent dialog. The Graph and Azure sign-in surfaces remain (they are
+unavoidable for delegated read-only auth), but they are usually silent
+SSO when the user is already signed in to Windows or Edge.
+
+If you prefer to skip the Azure prompt as well, run `Connect-AzAccount`
+in the same PowerShell session **before** launching `Start-EntraChecks.ps1`
+— the cached Az context will be reused. For fully non-interactive runs
+(CI / scheduled tasks), use a service-principal certificate stored in
+Azure Key Vault — see `docs/KeyVault-Guide.md`.
+
 ### Option A — Interactive menu
 
 ```powershell

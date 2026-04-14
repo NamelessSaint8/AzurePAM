@@ -683,15 +683,22 @@ function Connect-EntraChecks {
         Remove-Item alias:Invoke-GraphRequest -Force -ErrorAction SilentlyContinue
     }
 
-    # Define required scopes
+    # Define required scopes — kept in sync with $script:AllGraphScopes in
+    # Start-EntraChecks.ps1. Requesting the same union here means a stand-alone
+    # invocation does not trigger an incremental-consent re-prompt the next
+    # time the user runs through the menu.
     $requiredScopes = @(
         "Directory.Read.All",
-        "User.Read.All",
-        "Group.Read.All",
-        "Application.Read.All",
-        "RoleManagement.Read.Directory",
         "Policy.Read.All",
-        "AuditLog.Read.All"
+        "SecurityEvents.Read.All",
+        "AuditLog.Read.All",
+        "IdentityRiskEvent.Read.All",
+        "IdentityRiskyUser.Read.All",
+        "Device.Read.All",
+        "DeviceManagementManagedDevices.Read.All",
+        "DeviceManagementConfiguration.Read.All",
+        "InformationProtectionPolicy.Read",
+        "BitLockerKey.ReadBasic.All"
     )
     
     try {
