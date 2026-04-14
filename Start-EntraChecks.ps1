@@ -433,6 +433,7 @@ function Show-MainMenu {
     Write-Host "  │   [4] Compare Snapshots     - Delta reporting                  │" -ForegroundColor Yellow
     Write-Host "  │   [5] Manage Snapshots      - View/delete saved snapshots      │" -ForegroundColor Yellow
     Write-Host "  │   [6] SOC 2 Readiness       - Internal SOC 2 TSC assessment   │" -ForegroundColor Yellow
+    Write-Host "  │   [7] SOC 2 Type 2          - Period coverage from snapshots  │" -ForegroundColor Yellow
     Write-Host "  │                                                                 │" -ForegroundColor Gray
     Write-Host "  │   [A] Authentication        - Connect to Graph and Azure       │" -ForegroundColor Cyan
     Write-Host "  │   [D] Disconnect            - Sign out (switch tenant)         │" -ForegroundColor Cyan
@@ -1463,6 +1464,180 @@ function Invoke-SOC2ReadinessFromMenu {
     }
 }
 
+function Invoke-SOC2TypeTwoFromMenu {
+    <#
+    .SYNOPSIS
+        Menu handler for SOC 2 Type 2 period coverage (option [7]).
+    .DESCRIPTION
+        Reads SOC2.AzureReadiness.TypeTwo config + SOC2.TypeTwoPeriod, prompts
+        interactively for any missing required values (StartDate/EndDate),
+        invokes Get-SOC2PeriodCoverage, builds the evidence bundle, renders
+        the standalone HTML report, opens it in the default browser.
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$TenantName,
+        [string]$OutputDirectory,
+        [string]$SnapshotDirectory
+    )
+
+    Write-Host "`n  ===== SOC 2 Type 2 Period Coverage =====" -ForegroundColor Cyan
+
+    # Load required modules
+    $needed = @(
+        'EntraChecks-Branding.psm1',
+        'EntraChecks-ComplianceMapping.psm1',
+        'EntraChecks-SOC2.psm1',
+        'EntraChecks-SOC2TypeTwo.psm1'
+    )
+    foreach ($n in $needed) {
+        $p = Join-Path $script:ModulesPath $n
+        if (Test-Path $p) {
+            Import-Module $p -Force -ErrorAction Stop
+        } else {
+            Write-Host "  [!] Missing required module: $p" -ForegroundColor Red
+            return
+        }
+    }
+
+    # Read SOC 2 config (raw JSON path; menu handler convention)
+    $soc2Cfg = $null
+    $configPath = Join-Path $PSScriptRoot 'config\entrachecks.config.json'
+    if (Test-Path $configPath) {
+        try {
+            $cfg = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+            if ($cfg.SOC2) { $soc2Cfg = $cfg.SOC2 }
+        } catch {
+            Write-Host "  [!] Could not parse config; using Type 2 defaults." -ForegroundColor Yellow
+        }
+    }
+
+    # Resolve TypeTwo settings (prefer AzureReadiness, fallback Phase2; namespace shim handles canonical reads via Import-Configuration)
+    $tt = $null
+    if ($soc2Cfg.AzureReadiness -and $soc2Cfg.AzureReadiness.TypeTwo) {
+        $tt = $soc2Cfg.AzureReadiness.TypeTwo
+    } elseif ($soc2Cfg.Phase2 -and $soc2Cfg.Phase2.TypeTwo) {
+        $tt = $soc2Cfg.Phase2.TypeTwo
+    }
+
+    $minSnaps = if ($tt -and $tt.MinSnapshotsRequired) { [int]$tt.MinSnapshotsRequired } else { 12 }
+    $maxGap = if ($tt -and $tt.MaxGapDays) { [int]$tt.MaxGapDays } else { 10 }
+    $exceptionsAllowed = if ($tt -and ($null -ne $tt.ConsistencyExceptionsAllowed)) { [int]$tt.ConsistencyExceptionsAllowed } else { 0 }
+    $reportPrefix = if ($tt -and $tt.ReportFilenamePrefix) { $tt.ReportFilenamePrefix } else { 'SOC2-TypeTwo' }
+    $cfgSnapshotDir = if ($tt -and $tt.SnapshotDirectory) { $tt.SnapshotDirectory } else { $SnapshotDirectory }
+
+    # Resolve period from SOC2.TypeTwoPeriod (top-level) — interactive prompt if missing
+    $startDate = $null
+    $endDate = $null
+    if ($soc2Cfg -and $soc2Cfg.TypeTwoPeriod) {
+        if ($soc2Cfg.TypeTwoPeriod.StartDate) {
+            try {
+                $startDate = [DateTime]::Parse($soc2Cfg.TypeTwoPeriod.StartDate)
+            } catch {
+                Write-Host "  [!] Could not parse SOC2.TypeTwoPeriod.StartDate; will prompt." -ForegroundColor Yellow
+            }
+        }
+        if ($soc2Cfg.TypeTwoPeriod.EndDate) {
+            try {
+                $endDate = [DateTime]::Parse($soc2Cfg.TypeTwoPeriod.EndDate)
+            } catch {
+                Write-Host "  [!] Could not parse SOC2.TypeTwoPeriod.EndDate; will prompt." -ForegroundColor Yellow
+            }
+        }
+    }
+
+    if (-not $startDate) {
+        $sdInput = Read-Host "  Enter period START date (YYYY-MM-DD, UTC)"
+        try { $startDate = [DateTime]::Parse($sdInput) } catch {
+            Write-Host "  [!] Could not parse start date." -ForegroundColor Red; return
+        }
+    }
+    if (-not $endDate) {
+        $edInput = Read-Host "  Enter period END date (YYYY-MM-DD, UTC)"
+        try { $endDate = [DateTime]::Parse($edInput) } catch {
+            Write-Host "  [!] Could not parse end date." -ForegroundColor Red; return
+        }
+    }
+
+    if (-not (Test-Path $cfgSnapshotDir)) {
+        Write-Host "  [!] Snapshot directory does not exist: $cfgSnapshotDir" -ForegroundColor Red
+        Write-Host "  [i] Use option [1] Quick Assessment with -SaveSnapshot to seed snapshots first." -ForegroundColor Gray
+        return
+    }
+
+    # Resolve tenant info
+    $tenantId = ''
+    try {
+        if (Get-Command Get-MgContext -ErrorAction SilentlyContinue) {
+            $ctx = Get-MgContext -ErrorAction SilentlyContinue
+            if ($ctx) { $tenantId = $ctx.TenantId }
+        }
+    } catch { $tenantId = '' }
+    if (-not $tenantId) { $tenantId = 'unknown-tenant' }
+
+    Write-Host "  [i] Analyzing snapshots from $cfgSnapshotDir over $($startDate.ToString('yyyy-MM-dd')) - $($endDate.ToString('yyyy-MM-dd'))" -ForegroundColor Gray
+
+    $coverage = Get-SOC2PeriodCoverage `
+        -SnapshotDirectory $cfgSnapshotDir `
+        -StartDate $startDate `
+        -EndDate $endDate `
+        -MinSnapshotsRequired $minSnaps `
+        -MaxGapDays $maxGap `
+        -ExceptionsAllowed $exceptionsAllowed
+
+    Write-Host "  [i] Snapshots in period: $($coverage.SnapshotCount); largest gap: $($coverage.LargestGapDays) days" -ForegroundColor Gray
+    if (-not $coverage.MeetsTypeTwoThreshold) {
+        Write-Host "  [!] Type 2 coverage threshold NOT MET:" -ForegroundColor Yellow
+        foreach ($r in $coverage.ThresholdDetail) { Write-Host "      - $r" -ForegroundColor Yellow }
+    }
+
+    # Output paths
+    $timestamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
+    $tt2Output = Join-Path $OutputDirectory "SOC2-TypeTwo\$timestamp"
+    $null = New-Item -Path $tt2Output -ItemType Directory -Force
+
+    $assessor = $env:USERNAME
+    $svcOrg = ''
+    if ($soc2Cfg -and $soc2Cfg.Evidence) {
+        if ($soc2Cfg.Evidence.Assessor) { $assessor = $soc2Cfg.Evidence.Assessor }
+        if ($soc2Cfg.Evidence.ServiceOrganization) { $svcOrg = $soc2Cfg.Evidence.ServiceOrganization }
+    }
+
+    $evidenceDir = Join-Path $tt2Output 'evidence-bundle'
+    $evidence = New-SOC2TypeTwoEvidenceBundle `
+        -Coverage $coverage `
+        -OutputDirectory $evidenceDir `
+        -TenantId $tenantId `
+        -TenantName $TenantName `
+        -Assessor $assessor `
+        -ServiceOrganization $svcOrg
+
+    # Branding context
+    $branding = $null
+    if (Get-Command Get-ReportBrandingContext -ErrorAction SilentlyContinue) {
+        $brandingCfg = $null
+        if ($soc2Cfg -and $soc2Cfg.Branding) { $brandingCfg = $soc2Cfg.Branding }
+        $branding = Get-ReportBrandingContext -Config $brandingCfg -ReportTitle 'SOC 2 Type 2 Period Coverage'
+    }
+
+    $htmlPath = Join-Path $tt2Output "$reportPrefix-Report.html"
+    $null = New-SOC2TypeTwoReport -Coverage $coverage -Evidence $evidence -OutputPath $htmlPath -Branding $branding
+
+    Write-Host "`n  [OK] SOC 2 Type 2 report complete." -ForegroundColor Green
+    Write-Host "      Period:          $($coverage.Period.StartUtc) -> $($coverage.Period.EndUtc) ($($coverage.Period.Days) days)" -ForegroundColor White
+    Write-Host "      Snapshots used:  $($coverage.SnapshotCount)" -ForegroundColor White
+    Write-Host "      Threshold met:   $($coverage.MeetsTypeTwoThreshold)" -ForegroundColor White
+    Write-Host "      Bundle hash:     $($evidence.BundleHash)" -ForegroundColor White
+    Write-Host "      HTML report:     $htmlPath" -ForegroundColor White
+    Write-Host "      Evidence bundle: $($evidence.Directory)" -ForegroundColor White
+
+    try {
+        Start-Process $htmlPath
+    } catch {
+        Write-Host "  [!] Could not open HTML report automatically: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+}
+
 function Export-AssessmentResult {
     param(
         [string]$OutputDir,
@@ -1787,8 +1962,14 @@ function Start-InteractiveMode {
             }
 
             "6" {
-                # SOC 2 Internal Readiness Assessment
+                # SOC 2 Internal Readiness Assessment (Type 1)
                 Invoke-SOC2ReadinessFromMenu -TenantName $tenantName -OutputDirectory $OutputDirectory
+                Read-Host "`n  Press Enter to continue"
+            }
+
+            "7" {
+                # SOC 2 Type 2 period coverage from snapshots
+                Invoke-SOC2TypeTwoFromMenu -TenantName $tenantName -OutputDirectory $OutputDirectory -SnapshotDirectory $script:SnapshotsPath
                 Read-Host "`n  Press Enter to continue"
             }
 

@@ -691,6 +691,56 @@ function Get-ConfigurationSchema {
                                     }
                                 }
                             }
+                            TypeTwo = @{
+                                type = "object"
+                                description = "SOC 2 Type 2 period coverage configuration. Applies only when invoking the Type 2 report workflow."
+                                properties = @{
+                                    SnapshotDirectory = @{
+                                        type = "string"
+                                        default = ".\\Snapshots"
+                                        description = "Directory containing source snapshots to consume"
+                                    }
+                                    MinSnapshotsRequired = @{
+                                        type = "integer"
+                                        minimum = 1
+                                        maximum = 365
+                                        default = 12
+                                    }
+                                    SnapshotCadence = @{
+                                        type = "string"
+                                        enum = @("Daily", "Weekly", "Monthly")
+                                        default = "Weekly"
+                                    }
+                                    MaxGapDays = @{
+                                        type = "integer"
+                                        minimum = 1
+                                        maximum = 365
+                                        default = 10
+                                        description = "Maximum allowed gap between consecutive snapshots; exceeding this flags the period as CadenceNotRespected"
+                                    }
+                                    ConsistencyExceptionsAllowed = @{
+                                        type = "integer"
+                                        minimum = 0
+                                        maximum = 100
+                                        default = 0
+                                        description = "Number of FAIL occurrences per control tolerated before classifying as Inconsistent"
+                                    }
+                                    IncludeFreshAssessment = @{
+                                        type = "boolean"
+                                        default = $false
+                                        description = "When true, also displays a fresh Type 1 current-state ribbon alongside the period view"
+                                    }
+                                    HashSourceSnapshots = @{
+                                        type = "boolean"
+                                        default = $true
+                                        description = "Hash each source snapshot file and record in evidence bundle for tamper detection"
+                                    }
+                                    ReportFilenamePrefix = @{
+                                        type = "string"
+                                        default = "SOC2-TypeTwo"
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1053,6 +1103,33 @@ function Test-Configuration {
                 $wsId = $block.DiagnosticSettings.RequiredWorkspaceId
                 if ($wsId -notmatch '^/subscriptions/[0-9a-fA-F-]+/resourceGroups/.+/providers/Microsoft\.OperationalInsights/workspaces/.+$') {
                     $warnings += "$path.DiagnosticSettings.RequiredWorkspaceId does not look like a full Log Analytics workspace resource ID"
+                }
+            }
+
+            # SOC 2 Type 2 (Phase 3 PR 2) — nested under AzureReadiness/Phase2
+            if ($block.TypeTwo) {
+                $tt = $block.TypeTwo
+
+                if ($null -ne $tt.MinSnapshotsRequired) {
+                    if ($tt.MinSnapshotsRequired -lt 1 -or $tt.MinSnapshotsRequired -gt 365) {
+                        $errors += "$path.TypeTwo.MinSnapshotsRequired must be between 1 and 365"
+                    }
+                }
+                if ($tt.SnapshotCadence -and $tt.SnapshotCadence -notin @('Daily', 'Weekly', 'Monthly')) {
+                    $errors += "$path.TypeTwo.SnapshotCadence must be one of: Daily, Weekly, Monthly"
+                }
+                if ($null -ne $tt.MaxGapDays) {
+                    if ($tt.MaxGapDays -lt 1 -or $tt.MaxGapDays -gt 365) {
+                        $errors += "$path.TypeTwo.MaxGapDays must be between 1 and 365"
+                    }
+                }
+                if ($null -ne $tt.ConsistencyExceptionsAllowed) {
+                    if ($tt.ConsistencyExceptionsAllowed -lt 0 -or $tt.ConsistencyExceptionsAllowed -gt 100) {
+                        $errors += "$path.TypeTwo.ConsistencyExceptionsAllowed must be between 0 and 100"
+                    }
+                }
+                if ($tt.SnapshotDirectory -and -not (Test-Path -LiteralPath $tt.SnapshotDirectory)) {
+                    $warnings += "$path.TypeTwo.SnapshotDirectory does not exist: $($tt.SnapshotDirectory) (will be checked at run time)"
                 }
             }
         }

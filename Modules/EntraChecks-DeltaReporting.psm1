@@ -184,8 +184,12 @@ function Save-ComplianceSnapshot {
     if ($Findings -and $Findings.Count -gt 0) {
         $snapshot.Sources.Findings.Available = $true
         $snapshot.Sources.Findings.Count = $Findings.Count
+        # Schema v1.7+ (Phase 3 PR 2): added Type and TSCReferences so SOC 2
+        # Type 2 period-coverage analysis can map findings to TSC controls
+        # without re-running Add-ComplianceMapping. Additive — older
+        # consumers ignore the new fields.
         $snapshot.Sources.Findings.Data = $Findings | ForEach-Object {
-            @{
+            $entry = @{
                 CheckName = $_.CheckName
                 Status = $_.Status
                 Object = $_.Object
@@ -193,6 +197,13 @@ function Save-ComplianceSnapshot {
                 Category = $_.Category
                 Severity = $_.Severity
             }
+            if ($null -ne $_.PSObject.Properties['Type'] -and $_.Type) {
+                $entry['Type'] = $_.Type
+            }
+            if ($null -ne $_.PSObject.Properties['TSCReferences'] -and $_.TSCReferences) {
+                $entry['TSCReferences'] = @($_.TSCReferences)
+            }
+            $entry
         }
         
         $snapshot.Summary.TotalFindings = $Findings.Count

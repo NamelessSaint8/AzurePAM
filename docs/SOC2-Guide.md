@@ -237,16 +237,109 @@ Recommended retention: **7 years** (configurable via `Evidence.RetentionYears`).
 
 ## 8. Type 2 and period coverage
 
-Type 2 reporting (control operated consistently over a period of coverage)
-requires a snapshot history. This is planned for Phase 3. Until then, use
-`Type = "Type1"` for point-in-time readiness.
+Type 2 reports cover **how each control operated across a period of coverage**
+(e.g., 90 days), not a single point in time. The implementation lives in
+`Modules/EntraChecks-SOC2TypeTwo.psm1` and consumes the existing snapshot
+system from `Modules/EntraChecks-DeltaReporting.psm1`.
 
-To prepare for Type 2:
-1. Start taking weekly snapshots now (Save-ComplianceSnapshot in scheduled mode).
-2. Use a stable `SaltDirectory` across runs so redacted hashes are referentially
-   consistent.
-3. When Phase 3 ships, `New-SOC2TypeTwoReport` will consume the snapshot
-   history and emit a period-coverage report.
+### Prerequisites
+
+1. **Snapshot history.** Take regular snapshots throughout the coverage
+   period using `Save-ComplianceSnapshot` (option [1] Quick Assessment with
+   `-SaveSnapshot`, or scheduled mode). Default cadence: weekly.
+2. **Snapshot format v1.7+.** Phase 3 PR 2 added `Type` and `TSCReferences`
+   per finding to the snapshot projection. Older snapshots fall back to
+   compliance-mapping lookup via `Category` — works but slightly less
+   precise. For new snapshots, this is automatic.
+3. **Configuration.** Set `SOC2.AzureReadiness.TypeTwo.*` in
+   `config/entrachecks.config.json`. Default values are sensible
+   (Weekly cadence, 12-snapshot minimum, 10-day max gap, strict 0
+   exception tolerance).
+
+### Running Type 2
+
+**Interactive:** menu option `[7] SOC 2 Type 2`. Prompts for period start/end
+dates if not pre-configured in `SOC2.TypeTwoPeriod.{StartDate,EndDate}`.
+
+**Scripted:**
+
+```powershell
+Import-Module .\Modules\EntraChecks-ComplianceMapping.psm1 -Force
+Import-Module .\Modules\EntraChecks-Branding.psm1 -Force
+Import-Module .\Modules\EntraChecks-SOC2.psm1 -Force
+Import-Module .\Modules\EntraChecks-SOC2TypeTwo.psm1 -Force
+
+$coverage = Get-SOC2PeriodCoverage `
+    -SnapshotDirectory .\Snapshots `
+    -StartDate '2026-01-01' `
+    -EndDate '2026-04-01' `
+    -MinSnapshotsRequired 12 `
+    -MaxGapDays 10 `
+    -ExceptionsAllowed 0
+
+$evidence = New-SOC2TypeTwoEvidenceBundle `
+    -Coverage $coverage `
+    -OutputDirectory .\Output\SOC2-TypeTwo\evidence-bundle `
+    -TenantId (Get-MgContext).TenantId `
+    -TenantName 'Contoso' `
+    -Assessor $env:USERNAME
+
+$branding = Get-ReportBrandingContext -Config $null -ReportTitle 'SOC 2 Type 2 Period Coverage'
+New-SOC2TypeTwoReport -Coverage $coverage -Evidence $evidence -Branding $branding `
+    -OutputPath .\Output\SOC2-TypeTwo\SOC2-TypeTwo-Report.html
+```
+
+### Per-control consistency states
+
+Each TSC control is classified into one of these states based on its
+worst-status across snapshots in the period:
+
+| State | Meaning |
+|---|---|
+| `ConsistentlyPassing` | Every snapshot saw a PASS/OK — control operated throughout the period |
+| `DegradedButOperating` | Mix of PASS + WARNING (no FAIL) — control operated with deficiencies |
+| `Inconsistent` | At least one FAIL anywhere in the period — SOC 2 "exception" |
+| `ConsistentlyFailing` | Every snapshot saw a FAIL — control did not operate |
+| `Unobserved` | No findings mapped to the control in any snapshot |
+| `ManualAttestationRequired` | Control is non-automatable; out-of-band attestation needed |
+
+Override the strictness with `SOC2.AzureReadiness.TypeTwo.ConsistencyExceptionsAllowed`
+(default 0). Setting it to 1 means "tolerate one FAIL in the period before
+classifying as Inconsistent."
+
+### Coverage threshold (`MeetsTypeTwoThreshold`)
+
+A Type 2 claim requires:
+- **Snapshot count ≥ MinSnapshotsRequired** (default 12)
+- **Largest gap between consecutive snapshots ≤ MaxGapDays** (default 10 for Weekly)
+- **Leading gap (start of period → first snapshot) ≤ MaxGapDays**
+- **Trailing gap (last snapshot → end of period) ≤ MaxGapDays**
+
+If any of these fails, the report still generates but prominently displays
+"Type 2 coverage NOT MET" and lists the reasons. The per-control analysis is
+still shown — treat it as Type 1-equivalent over whatever snapshots exist.
+
+### Evidence bundle and chain-of-custody
+
+Type 2 produces a separate evidence bundle from Phase 1's Type 1 bundle:
+
+```
+Output/SOC2-TypeTwo/<timestamp>/
+├── SOC2-TypeTwo-Report.html
+└── evidence-bundle/
+    ├── manifest.json              # Type='Type2', Period.{StartUtc,EndUtc,Days}, BundleHash, ...
+    ├── snapshots-manifest.json    # SnapshotId + SourceSHA256 for each consumed snapshot
+    ├── period-coverage/
+    │   ├── CC6.1.json             # per-control state, occurrences, per-snapshot trace
+    │   └── ...
+    └── manual-attestation/
+        └── CC1.1.md               # period-annotated attestation templates
+```
+
+Verify integrity with `Test-SOC2TypeTwoBundle -ManifestPath ...` — recomputes
+all file hashes, the rolling bundle hash, AND validates that every source
+snapshot still hashes to its recorded SHA-256 (chain-of-custody check across
+the snapshot → report flow).
 
 ---
 

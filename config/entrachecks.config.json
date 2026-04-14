@@ -163,6 +163,17 @@
           "DefenderForEndpoint": "INFO",
           "Priva": "INFO"
         }
+      },
+      "TypeTwo": {
+        "_comment": "SOC 2 Type 2 period coverage (Phase 3). Applies only when invoking the Type 2 report workflow (menu [7]).",
+        "SnapshotDirectory": ".\\Snapshots",
+        "MinSnapshotsRequired": 12,
+        "SnapshotCadence": "Weekly",
+        "MaxGapDays": 10,
+        "ConsistencyExceptionsAllowed": 0,
+        "IncludeFreshAssessment": false,
+        "HashSourceSnapshots": true,
+        "ReportFilenamePrefix": "SOC2-TypeTwo"
       }
     }
   }
