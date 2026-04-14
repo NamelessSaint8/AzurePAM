@@ -1,0 +1,13 @@
+{
+  "value": [
+    {
+      "id": "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-backup/providers/Microsoft.RecoveryServices/vaults/vault-grs/backupFabrics/Azure/protectionContainers/iaasvmcontainer;test;rg-app;vm-app-01/protectedItems/vm;iaasvmcontainer;test;rg-app;vm-app-01",
+      "name": "vm;iaasvmcontainer;test;rg-app;vm-app-01",
+      "properties": {
+        "friendlyName": "vm-app-01",
+        "protectionState": "Protected",
+        "lastBackupStatus": "Completed"
+      }
+    }
+  ]
+}

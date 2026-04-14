@@ -1,0 +1,22 @@
+{
+  "value": [
+    {
+      "@odata.type": "#microsoft.graph.user",
+      "id": "user-id-alice",
+      "userPrincipalName": "alice@testdomain.invalid",
+      "displayName": "Alice Admin"
+    },
+    {
+      "@odata.type": "#microsoft.graph.user",
+      "id": "user-id-breakglass-1",
+      "userPrincipalName": "breakglass-1@testdomain.invalid",
+      "displayName": "Break Glass 1"
+    },
+    {
+      "@odata.type": "#microsoft.graph.user",
+      "id": "user-id-breakglass-2",
+      "userPrincipalName": "breakglass-2@testdomain.invalid",
+      "displayName": "Break Glass 2"
+    }
+  ]
+}

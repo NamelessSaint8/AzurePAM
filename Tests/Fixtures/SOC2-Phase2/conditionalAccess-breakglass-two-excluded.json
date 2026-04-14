@@ -1,0 +1,28 @@
+{
+  "value": [
+    {
+      "id": "policy-block-legacy-auth",
+      "displayName": "Block legacy authentication",
+      "state": "enabled",
+      "conditions": {
+        "users": {
+          "includeUsers": ["All"],
+          "excludeUsers": ["user-id-breakglass-1", "user-id-breakglass-2"],
+          "excludeGroups": []
+        }
+      }
+    },
+    {
+      "id": "policy-require-mfa-admins",
+      "displayName": "Require MFA for admins",
+      "state": "enabled",
+      "conditions": {
+        "users": {
+          "includeUsers": ["All"],
+          "excludeUsers": ["user-id-breakglass-1", "user-id-breakglass-2"],
+          "excludeGroups": []
+        }
+      }
+    }
+  ]
+}

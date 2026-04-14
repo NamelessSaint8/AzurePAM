@@ -1,0 +1,14 @@
+{
+  "value": [
+    {
+      "id": "role-object-id-ga",
+      "displayName": "Global Administrator",
+      "roleTemplateId": "62e90394-69f5-4237-9190-012177145e10"
+    },
+    {
+      "id": "role-object-id-sec",
+      "displayName": "Security Reader",
+      "roleTemplateId": "5d6b6bb7-de71-4623-b4af-96380a352509"
+    }
+  ]
+}

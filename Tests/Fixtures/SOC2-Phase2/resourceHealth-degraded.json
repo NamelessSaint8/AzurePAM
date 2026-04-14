@@ -1,0 +1,14 @@
+{
+  "value": [
+    { "properties": { "availabilityState": "Available" } },
+    { "properties": { "availabilityState": "Available" } },
+    { "properties": { "availabilityState": "Available" } },
+    { "properties": { "availabilityState": "Available" } },
+    { "properties": { "availabilityState": "Available" } },
+    { "properties": { "availabilityState": "Available" } },
+    { "properties": { "availabilityState": "Available" } },
+    { "properties": { "availabilityState": "Unavailable" } },
+    { "properties": { "availabilityState": "Unavailable" } },
+    { "properties": { "availabilityState": "Degraded" } }
+  ]
+}

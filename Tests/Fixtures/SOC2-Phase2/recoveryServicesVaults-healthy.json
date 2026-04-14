@@ -1,0 +1,28 @@
+{
+  "value": [
+    {
+      "id": "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-backup/providers/Microsoft.RecoveryServices/vaults/vault-grs",
+      "name": "vault-grs",
+      "type": "Microsoft.RecoveryServices/vaults",
+      "location": "eastus",
+      "properties": {
+        "redundancySettings": {
+          "standardTierStorageRedundancy": "GRS"
+        },
+        "backupStorageVersion": "V2"
+      }
+    },
+    {
+      "id": "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-backup/providers/Microsoft.RecoveryServices/vaults/vault-lrs",
+      "name": "vault-lrs",
+      "type": "Microsoft.RecoveryServices/vaults",
+      "location": "eastus",
+      "properties": {
+        "redundancySettings": {
+          "standardTierStorageRedundancy": "LRS"
+        },
+        "backupStorageVersion": "V2"
+      }
+    }
+  ]
+}

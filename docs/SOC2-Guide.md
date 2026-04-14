@@ -278,13 +278,119 @@ To prepare for Type 2:
 
 ---
 
-## 11. What's next (Phase 2+)
+## 11. Phase 2 coverage (shipped)
 
-- Deeper A / C automation (backup, service health, encryption posture).
-- Break-glass verification for CC7.5.
-- Type 2 period coverage and consistency evidence.
-- Optional CMS signing of evidence bundles via Azure Key Vault.
-- Priva-based privacy signals when licensed.
+Phase 2 added six synthetic Azure-readiness checks and a licensing
+graceful-degradation layer. All Phase 2 code lives alongside Phase 1 in
+`Modules/EntraChecks-SOC2.psm1`; no new module imports needed.
+
+### New checks
+
+| TSC | Check | Data source | Required permissions |
+|---|---|---|---|
+| A1.1 | `Test-SOC2ServiceHealthBaseline` | Azure Resource Health | `Reader` on each in-scope subscription |
+| A1.2 | `Test-SOC2BackupConfiguration` | Recovery Services vaults + protected items | Azure RBAC `Backup Reader` (or `Reader` with limitations) |
+| CC4.1, CC7.2 | `Test-SOC2DiagnosticSettingsExport` | Entra `microsoft.aadiam` + Log Analytics workspace | Azure RBAC `Monitoring Reader` at tenant root (`/providers/microsoft.aadiam`) |
+| CC6.7 | `Test-SOC2EncryptionPosture` | Defender for Cloud assessments (encryption keywords) | Defender `Security Reader` (already Phase 1) |
+| CC6.8 | `Test-SOC2MalwareProtection` | Defender for Endpoint connector (`WDATP` setting) + assessments | Defender `Security Reader` |
+| CC7.5 | `Test-SOC2BreakGlassAccountsConfigured` | GA role members + Conditional Access exclusions | Graph `Directory.Read.All`, `Policy.Read.All`, `RoleManagement.Read.Directory` (Phase 1 scopes) |
+
+### New Az modules
+
+Installed by `Install-Prerequisites.ps1` (skippable via `-GraphOnly`):
+
+- `Az.RecoveryServices` ≥ 6.0.0
+- `Az.Monitor` ≥ 4.0.0
+- `Az.OperationalInsights`
+
+### Phase 2 configuration keys
+
+All optional and under `SOC2.Phase2`:
+
+```json
+"Phase2": {
+  "SubscriptionFilter": [],
+  "Backup": { "MinRedundancyTier": "GRS" },
+  "ServiceHealth": { "AvailabilityThresholdPercent": 98 },
+  "DiagnosticSettings": {
+    "RequiredWorkspaceId": "",
+    "RequiredCategories": ["AuditLogs", "SignInLogs"]
+  },
+  "BreakGlass": {
+    "MinimumAccounts": 2,
+    "AccountUpnPatterns": []
+  },
+  "Licensing": {
+    "Overrides": {
+      "IdentityProtection": "INFO",
+      "Intune": "INFO",
+      "PurviewE5": "INFO",
+      "DefenderForCloud": "INFO",
+      "DefenderForEndpoint": "INFO",
+      "Priva": "INFO"
+    }
+  }
+}
+```
+
+### Licensing gaps: "control not assessed" rows
+
+Phase 2 introduces `SOC2_LicensingGap_*` findings for features your tenant is
+not licensed for:
+
+- `SOC2_LicensingGap_IdentityProtection` (requires P2) → affects CC7.3
+- `SOC2_LicensingGap_Intune` (requires EMS E3+) → affects CC6.4
+- `SOC2_LicensingGap_PurviewE5` (requires E5 / Compliance) → affects CC6.7, C1.1, C1.2
+- `SOC2_LicensingGap_DefenderForCloud` (requires paid Defender plan) → affects CC4.2, CC6.7, CC6.8
+- `SOC2_LicensingGap_DefenderForEndpoint` → affects CC6.8
+- `SOC2_LicensingGap_Priva` → affects P1.1, P2.1, P3.1
+
+By default these render as `INFO / Severity=Low`, so the affected TSCs show
+a visible **"control not assessed due to licensing"** row in the audit report
+rather than silently passing. For internal readiness where the org has
+committed to procuring a license, escalate via
+`SOC2.Phase2.Licensing.Overrides.<Feature> = "WARNING"` (or `"FAIL"`) so the
+gap is tracked as a deficiency until procurement closes.
+
+### Capability probing
+
+`Get-SOC2LicensingCapabilities` runs once per assessment, caches results for
+the module lifetime. Call with `-Refresh` to re-probe. Returns a hashtable
+with keys `HasP2`, `HasIntune`, `HasPurviewE5`, `HasDefenderForCloud`,
+`HasDefenderForEndpoint`, `HasPriva`, `HasAzContext`.
+
+### Per-check verification confidence (honest assessment)
+
+Phase 2 ships **fixture-verified** for all six checks (see
+`Tests/SOC2-Phase2.Tests.ps1`). Live-tenant verification status varies:
+
+| Check | Confidence | Why |
+|---|---|---|
+| `Test-SOC2ServiceHealthBaseline` | **High** | Stable REST API, simple shape |
+| `Test-SOC2EncryptionPosture` | **High** | Reuses Phase 1's Defender data path (live-verified) |
+| `Test-SOC2MalwareProtection` | **High** | Same — Defender path stable |
+| `Test-SOC2BackupConfiguration` | **Medium** | Vault API-version variability cannot be fully fixtured |
+| `Test-SOC2DiagnosticSettingsExport` | **Low — fixture-verified only** | `microsoft.aadiam` is preview API; cross-subscription workspace refs and permission asymmetries are hard to simulate |
+| `Test-SOC2BreakGlassAccountsConfigured` | **Low — fixture-verified only** | Nested group membership + CA exclusion semantics are edge-case heavy; Global Reader is sufficient to live-verify this one when available |
+
+Spot-check the two low-confidence checks against your own tenant before
+relying on their output for audit evidence.
+
+### Azure RBAC roles to grant beyond Phase 1
+
+For Phase 2 to evaluate Azure-side controls, grant the assessment identity:
+
+- `Reader` on each in-scope subscription (already needed for Phase 1's Defender)
+- `Backup Reader` on each in-scope subscription (A1.2)
+- `Monitoring Reader` at the tenant root scope `/providers/microsoft.aadiam` (CC4.1, CC7.2)
+
+## 12. What's next (Phase 3+)
+
+- Type 2 period coverage reporting from snapshot history (`New-SOC2TypeTwoReport`)
+- Executive dashboard "X controls not assessed due to licensing" tile
+- Config namespace migration: rename `SOC2.Phase2.*` to a semantic name (e.g., `SOC2.AzureReadiness.*`) with backwards-compat shim
+- Optional CMS signing of evidence bundles via Azure Key Vault
+- Priva-based privacy automation (when Priva licensing is in scope)
 
 Track the current roadmap in
-`plans\SOC2-Implementation-Plan.md`.
+`plans\SOC2-Implementation-Plan.md` and `plans\SOC2-Phase2-Implementation-Plan.md`.

@@ -1,0 +1,15 @@
+{
+  "value": [
+    {
+      "id": "/providers/microsoft.aadiam/diagnosticSettings/ds-audit-only",
+      "name": "ds-audit-only",
+      "properties": {
+        "workspaceId": "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-log/providers/Microsoft.OperationalInsights/workspaces/ws-security",
+        "logs": [
+          { "category": "AuditLogs", "enabled": true },
+          { "category": "SignInLogs", "enabled": false }
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "value": [
+    {
+      "@odata.type": "#microsoft.graph.user",
+      "id": "user-id-alice",
+      "userPrincipalName": "alice@testdomain.invalid",
+      "displayName": "Alice Admin"
+    }
+  ]
+}

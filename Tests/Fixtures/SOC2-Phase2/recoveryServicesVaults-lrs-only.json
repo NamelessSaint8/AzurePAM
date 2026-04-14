@@ -1,0 +1,16 @@
+{
+  "value": [
+    {
+      "id": "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-backup/providers/Microsoft.RecoveryServices/vaults/vault-lrs-only",
+      "name": "vault-lrs-only",
+      "type": "Microsoft.RecoveryServices/vaults",
+      "location": "eastus",
+      "properties": {
+        "redundancySettings": {
+          "standardTierStorageRedundancy": "LRS"
+        },
+        "backupStorageVersion": "V2"
+      }
+    }
+  ]
+}
