@@ -61,12 +61,39 @@ BeforeAll {
     function New-TestAssessmentResultWithEvidence {
         param([object[]]$Findings, [string[]]$Categories = @('CC'))
         $r = New-TestAssessmentResult -Findings $Findings -Categories $Categories
-        $r.Evidence = @{
+        # IMPORTANT: match the production shape. New-SOC2EvidenceBundle
+        # returns a PSCustomObject (not a hashtable). Using a hashtable here
+        # would hide PSCustomObject->Hashtable coercion bugs in row-builder
+        # helpers — which is exactly the bug that slipped past the first
+        # pass of reporting-enhancements tests.
+        $r.Evidence = [pscustomobject]@{
             ManifestPath = ''
             BundleHash = 'a1b2c3d4e5f6a7b8a1b2c3d4e5f6a7b8a1b2c3d4e5f6a7b8a1b2c3d4e5f6a7b8'
             Directory = 'C:\tmp\evidence'
+            FileCount = 0
+            GeneratedAt = '2026-04-14T20:20:13Z'
         }
         $r
+    }
+}
+
+Describe 'Regression: production PSCustomObject shapes flow through helpers' {
+    # Reproduces a bug found only when running against a real tenant: the
+    # production Evidence object is a PSCustomObject (from
+    # New-SOC2EvidenceBundle's return), but the helper originally declared
+    # [hashtable]. PowerShell does not auto-coerce PSCustomObject -> Hashtable,
+    # so the workbook writer crashed mid-report.
+    It 'New-SOC2AuditWorkbook end-to-end with PSCustomObject Evidence does not crash' {
+        $findings = @(New-TestFinding -Status 'OK' -TSCRefs @('CC6.1'))
+        $result = New-TestAssessmentResultWithEvidence -Findings $findings
+        $tmpDir = Join-Path $env:TEMP "soc2-regress-$((Get-Random))"
+        $null = New-Item -Path $tmpDir -ItemType Directory -Force
+        $xlsxPath = Join-Path $tmpDir 'workbook.xlsx'
+        try {
+            { $null = New-SOC2AuditWorkbook -AssessmentResult $result -OutputPath $xlsxPath } | Should -Not -Throw
+        } finally {
+            if (Test-Path $tmpDir) { Remove-Item -LiteralPath $tmpDir -Recurse -Force -ErrorAction SilentlyContinue }
+        }
     }
 }
 

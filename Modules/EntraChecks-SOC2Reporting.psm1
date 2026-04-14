@@ -202,11 +202,24 @@ function Get-SOC2ManualAttestationRows {
 <#
 .SYNOPSIS
     Builds evidence-register rows from a manifest. Returns empty when no manifest.
+
+.PARAMETER Evidence
+    Evidence object returned by New-SOC2EvidenceBundle (a PSCustomObject with
+    ManifestPath, BundleHash, Directory, FileCount, GeneratedAt). Accepts null.
+
+    The parameter is typed as [object] rather than [hashtable] because the
+    real production path returns a PSCustomObject; PowerShell does not
+    auto-coerce PSCustomObject -> Hashtable. Tests may pass a hashtable
+    fixture — both shapes expose the same dotted-property access this
+    function uses.
 #>
 function Get-SOC2EvidenceRegisterRows {
     [CmdletBinding()]
     [OutputType([object[]])]
-    param([hashtable]$Evidence)
+    param(
+        [AllowNull()]
+        [object]$Evidence
+    )
 
     $rows = [System.Collections.Generic.List[object]]::new()
     if ($Evidence -and $Evidence.ManifestPath -and (Test-Path -LiteralPath $Evidence.ManifestPath)) {
