@@ -1,6 +1,6 @@
 # EntraChecks — Microsoft Cloud Compliance Assessment Toolkit
 
-**Version 1.0.0** · PowerShell 5.1+ · Windows 10/11 or Server 2016+
+**Version 1.5.0** · PowerShell 5.1+ · Windows 10/11 or Server 2016+
 **Author:** David Stells
 
 EntraChecks runs read-only security and compliance checks across your Microsoft 365
