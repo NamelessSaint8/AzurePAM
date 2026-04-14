@@ -12,6 +12,7 @@ plans/
 
 # OpenWolf local tooling (not public)
 .wolf/
+.openwolf/
 /CLAUDE.md
 node_modules/
 package.json
@@ -34,6 +35,8 @@ Assessment-Data-*.json
 Snapshot-*.json
 DeltaReport-*.html
 Comprehensive-Assessment-*.html
+# Integrity sidecar emitted next to unified HTML reports
+*.findings.json
 
 # Temp files
 *.tmp
