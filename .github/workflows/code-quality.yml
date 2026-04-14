@@ -42,28 +42,36 @@ jobs:
             const reportPath = 'CodeQualityReports';
             const files = fs.readdirSync(reportPath);
             const jsonFile = files.find(f => f.endsWith('.json'));
-            if (jsonFile) {
-              const report = JSON.parse(fs.readFileSync(reportPath + '/' + jsonFile, 'utf8'));
-              const summary = report.Summary;
-              const status = summary.Errors === 0 ? 'PASS' : 'FAIL';
-              const warning = summary.Errors > 0
-                ? '\n\n> **This PR introduces code quality errors that must be fixed before merging.**'
-                : '';
-              const body = '## Code Quality Check ' + status + '\n\n'
-                + '| Metric | Count |\n'
-                + '|--------|------:|\n'
-                + '| Files Analyzed | ' + summary.FilesAnalyzed + ' |\n'
-                + '| Files with Issues | ' + summary.FilesWithIssues + ' |\n'
-                + '| Errors | ' + summary.Errors + ' |\n'
-                + '| Warnings | ' + summary.Warnings + ' |\n'
-                + '| Total Issues | ' + summary.TotalIssues + ' |'
-                + warning + '\n\n'
-                + '[View detailed report](https://github.com/'
-                + process.env.REPO + '/actions/runs/' + process.env.RUN_ID + ')';
-              github.rest.issues.createComment({
+            if (!jsonFile) { return; }
+            const report = JSON.parse(fs.readFileSync(reportPath + '/' + jsonFile, 'utf8'));
+            const summary = report.Summary;
+            const status = summary.Errors === 0 ? 'PASS' : 'FAIL';
+            const warning = summary.Errors > 0
+              ? '\n\n> **This PR introduces code quality errors that must be fixed before merging.**'
+              : '';
+            const body = '## Code Quality Check ' + status + '\n\n'
+              + '| Metric | Count |\n'
+              + '|--------|------:|\n'
+              + '| Files Analyzed | ' + summary.FilesAnalyzed + ' |\n'
+              + '| Files with Issues | ' + summary.FilesWithIssues + ' |\n'
+              + '| Errors | ' + summary.Errors + ' |\n'
+              + '| Warnings | ' + summary.Warnings + ' |\n'
+              + '| Total Issues | ' + summary.TotalIssues + ' |'
+              + warning + '\n\n'
+              + '[View detailed report](https://github.com/'
+              + process.env.REPO + '/actions/runs/' + process.env.RUN_ID + ')';
+            // Derive owner/repo from the REPO env var because context.repo.name
+            // can be empty in some Actions contexts, producing a malformed URL.
+            const [owner, repo] = process.env.REPO.split('/');
+            try {
+              await github.rest.issues.createComment({
                 issue_number: context.issue.number,
-                owner: context.repo.owner,
-                repo: context.repo.name,
+                owner: owner,
+                repo: repo,
                 body: body
               });
+            } catch (err) {
+              // Don't fail the job if posting the comment fails
+              // (e.g. insufficient token scope on a fork PR).
+              core.warning('Could not post PR comment: ' + err.message);
             }
