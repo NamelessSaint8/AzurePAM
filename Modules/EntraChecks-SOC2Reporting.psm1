@@ -91,6 +91,11 @@ function New-SOC2AuditReport {
     $summary = $AssessmentResult.Summary
     $evidence = $AssessmentResult.Evidence
 
+    # Ensure System.Web is loaded before HtmlEncode is called below.
+    # In production (.NET Framework PowerShell 5.1) this is a no-op when the
+    # assembly is already loaded; in Pester's clean runspace it's required.
+    Add-Type -AssemblyName System.Web -ErrorAction SilentlyContinue
+
     $primaryColor = $Branding.PrimaryColor
     $orgName = $Branding.OrganizationName
     $title = $Branding.ReportTitle
@@ -127,6 +132,11 @@ tr:hover { background: #fafbfc; }
 .status-warning { color: #d89b00; font-weight: 600; }
 .status-info { color: #5a6c7d; }
 .status-manual { color: #5b3fa9; font-weight: 600; }
+.status-licensing { color: #6a5fb3; font-weight: 600; }
+.licensing-panel { background: #f3f0fb; border-left: 4px solid #6a5fb3; padding: 12px 16px; margin: 16px 0; border-radius: 4px; }
+.licensing-panel .title { font-weight: 600; color: #6a5fb3; margin-bottom: 8px; }
+.licensing-panel .breakdown { font-size: 0.9em; color: #555; }
+.licensing-panel .breakdown span { display: inline-block; margin-right: 14px; }
 .severity-Critical { background: #c8102e; color: white; padding: 2px 8px; border-radius: 3px; font-size: 0.85em; }
 .severity-High { background: #ff6f00; color: white; padding: 2px 8px; border-radius: 3px; font-size: 0.85em; }
 .severity-Medium { background: #d89b00; color: white; padding: 2px 8px; border-radius: 3px; font-size: 0.85em; }
@@ -188,6 +198,7 @@ footer { background: #2a3441; color: #d0d5dc; text-align: center; padding: 16px;
         if (-not $f) { continue }
         $totalControls = $f.Automated + $f.Manual
         if ($totalControls -eq 0) { continue }
+        $licensingGapCount = if ($null -ne $f.LicensingGaps) { $f.LicensingGaps } else { 0 }
         [void]$sb.AppendLine('<div class="summary-card">')
         [void]$sb.AppendLine("<div class='family'>$family</div>")
         [void]$sb.AppendLine("<div class='row'>Controls: $totalControls (auto: $($f.Automated), manual: $($f.Manual))</div>")
@@ -195,9 +206,29 @@ footer { background: #2a3441; color: #d0d5dc; text-align: center; padding: 16px;
         [void]$sb.AppendLine("<div class='row'><span class='status-fail'>Fail: $($f.Fail)</span></div>")
         [void]$sb.AppendLine("<div class='row'><span class='status-warning'>Warn: $($f.Warning)</span></div>")
         [void]$sb.AppendLine("<div class='row'><span class='status-info'>Info: $($f.Info)</span></div>")
+        [void]$sb.AppendLine("<div class='row'><span class='status-licensing'>Not Assessed (Licensing): $licensingGapCount</span></div>")
         [void]$sb.AppendLine('</div>')
     }
     [void]$sb.AppendLine('</div>')
+
+    # Phase 3 PR 3: Global licensing-gap callout panel
+    if ($summary.PSObject.Properties['LicensingGaps'] -and $summary.LicensingGaps -and $summary.LicensingGaps.Total -gt 0) {
+        [void]$sb.AppendLine('<div class="licensing-panel">')
+        [void]$sb.AppendLine("<div class='title'>Licensing gaps: $($summary.LicensingGaps.Total) control(s) not assessed due to missing licensing</div>")
+        $byFeatureBits = [System.Collections.Generic.List[string]]::new()
+        foreach ($feature in @('IdentityProtection', 'Intune', 'PurviewE5', 'DefenderForCloud', 'DefenderForEndpoint', 'Priva')) {
+            $count = $summary.LicensingGaps.ByFeature[$feature]
+            if ($count -gt 0) {
+                $byFeatureBits.Add("<span><strong>${feature}:</strong> $count</span>") | Out-Null
+            }
+        }
+        if ($byFeatureBits.Count -gt 0) {
+            [void]$sb.AppendLine("<div class='breakdown'>$([string]::Join(' ', $byFeatureBits.ToArray()))</div>")
+        }
+        [void]$sb.AppendLine('<div class="breakdown" style="margin-top:6px;font-size:0.85em;">If a feature should be in scope, set its override in <code>SOC2.AzureReadiness.Licensing.Overrides</code> to escalate from INFO to WARNING/FAIL.</div>')
+        [void]$sb.AppendLine('</div>')
+    }
+
     [void]$sb.AppendLine('</section>')
 
     # Control register grouped by family
@@ -322,7 +353,6 @@ document.addEventListener('input', (e) => {
     [void]$sb.AppendLine('</body>')
     [void]$sb.AppendLine('</html>')
 
-    Add-Type -AssemblyName System.Web -ErrorAction SilentlyContinue
     Set-Content -LiteralPath $OutputPath -Value $sb.ToString() -Encoding UTF8
 
     return $OutputPath
@@ -394,6 +424,7 @@ function New-SOC2AuditWorkbook {
             $f = $summary.ByFamily[$family]
             if (-not $f) { continue }
             if (($f.Automated + $f.Manual) -eq 0) { continue }
+            $licensingGapCount = if ($null -ne $f.LicensingGaps) { $f.LicensingGaps } else { 0 }
             $summaryRows += [pscustomobject]@{
                 Family = $family
                 Automated = $f.Automated
@@ -402,6 +433,7 @@ function New-SOC2AuditWorkbook {
                 Fail = $f.Fail
                 Warning = $f.Warning
                 Info = $f.Info
+                LicensingGaps = $licensingGapCount
             }
         }
         $summaryRows | Export-Excel -Path $OutputPath -WorksheetName 'Summary by Category' -AutoSize -TableName 'tblSummary'
@@ -450,6 +482,38 @@ function New-SOC2AuditWorkbook {
             if ($rows) {
                 $rows | Export-Excel -Path $OutputPath -WorksheetName $sheet -AutoSize
             }
+        }
+
+        # Phase 3 PR 3: Findings - Licensing Gaps sheet
+        $licensingRows = [System.Collections.Generic.List[object]]::new()
+        $allFindings = @()
+        foreach ($controlId in $summary.ControlFindings.Keys) {
+            $allFindings += @($summary.ControlFindings[$controlId])
+        }
+        # De-dupe by Type + Object since the same gap finding can appear under multiple TSCs
+        $seen = [System.Collections.Generic.HashSet[string]]::new()
+        foreach ($finding in $allFindings) {
+            if (-not ($finding.PSObject.Properties['Type'] -and $finding.Type -like 'SOC2_LicensingGap_*')) { continue }
+            $key = "$($finding.Type)|$($finding.Object)"
+            if (-not $seen.Add($key)) { continue }
+            $feature = $finding.Type.Substring('SOC2_LicensingGap_'.Length)
+            $tscList = ''
+            if ($finding.PSObject.Properties['TSCReferences']) { $tscList = ($finding.TSCReferences -join ', ') }
+            $severity = if ($finding.PSObject.Properties['Severity']) { $finding.Severity } else { '' }
+            $owner = if ($finding.PSObject.Properties['ControlOwnerHint']) { $finding.ControlOwnerHint } else { '' }
+            $row = [pscustomobject]@{
+                Feature = $feature
+                Status = $finding.Status
+                Severity = $severity
+                AffectedTSCs = $tscList
+                Description = $finding.Description
+                Remediation = $finding.Remediation
+                ControlOwnerHint = $owner
+            }
+            $licensingRows.Add($row) | Out-Null
+        }
+        if ($licensingRows.Count -gt 0) {
+            $licensingRows.ToArray() | Export-Excel -Path $OutputPath -WorksheetName 'Findings - Licensing Gaps' -AutoSize -TableName 'tblLicensing'
         }
 
         # Manual attestation register

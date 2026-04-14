@@ -2768,7 +2768,23 @@ function Get-SOC2Summary {
         $entry['Fail'] = 0
         $entry['Warning'] = 0
         $entry['Info'] = 0
+        # Phase 3 PR 3: per-family count of SOC2_LicensingGap_* findings.
+        # Additive — gaps continue to also count toward Info for byte-stable
+        # Phase 2 behavior (locked decision #6).
+        $entry['LicensingGaps'] = 0
         $byFamily[$family] = $entry
+    }
+
+    # Phase 3 PR 3: licensing-gap rollup for the executive dashboard tile
+    $licensingGapRollup = @{}
+    $licensingGapRollup['Total'] = 0
+    $licensingGapByFeature = @{}
+    foreach ($feature in @('IdentityProtection', 'Intune', 'PurviewE5', 'DefenderForCloud', 'DefenderForEndpoint', 'Priva', 'Sentinel')) {
+        $licensingGapByFeature[$feature] = 0
+    }
+    $licensingGapByFamily = @{}
+    foreach ($family in @('CC', 'A', 'C', 'PI', 'P')) {
+        $licensingGapByFamily[$family] = 0
     }
 
     $controlFindings = @{}
@@ -2785,10 +2801,43 @@ function Get-SOC2Summary {
 
     foreach ($finding in $Findings) {
         $tscRefs = Get-FindingTSCReferences -Finding $finding
+        $isLicensingGap = $false
+        if ($finding.PSObject.Properties['Type'] -and $finding.Type -and $finding.Type -like 'SOC2_LicensingGap_*') {
+            $isLicensingGap = $true
+            $licensingGapRollup['Total']++
+            $featureName = $finding.Type.Substring('SOC2_LicensingGap_'.Length)
+            if ($licensingGapByFeature.ContainsKey($featureName)) {
+                $licensingGapByFeature[$featureName]++
+            } else {
+                # Future-proof for unknown features (not pre-seeded above)
+                $licensingGapByFeature[$featureName] = 1
+            }
+        }
 
         foreach ($tsc in $tscRefs) {
             if ($controlFindings.ContainsKey($tsc)) {
                 $controlFindings[$tsc] += $finding
+            }
+        }
+
+        # Track per-family licensing-gap counts across ALL referenced TSCs
+        # (a single gap finding can affect multiple families, e.g. PurviewE5 hits CC and C).
+        if ($isLicensingGap) {
+            $touchedFamilies = [System.Collections.Generic.HashSet[string]]::new()
+            foreach ($tsc in $tscRefs) {
+                $fam = $null
+                if ($tsc -match '^CC') { $fam = 'CC' }
+                elseif ($tsc -match '^A') { $fam = 'A' }
+                elseif ($tsc -match '^PI') { $fam = 'PI' }
+                elseif ($tsc -match '^P') { $fam = 'P' }
+                elseif ($tsc -match '^C') { $fam = 'C' }
+                if ($fam -and $licensingGapByFamily.ContainsKey($fam)) {
+                    $null = $touchedFamilies.Add($fam)
+                }
+            }
+            foreach ($fam in $touchedFamilies) {
+                $licensingGapByFamily[$fam]++
+                $byFamily[$fam]['LicensingGaps']++
             }
         }
 
@@ -2813,11 +2862,15 @@ function Get-SOC2Summary {
         }
     }
 
+    $licensingGapRollup['ByFeature'] = $licensingGapByFeature
+    $licensingGapRollup['ByFamily'] = $licensingGapByFamily
+
     return [pscustomobject]@{
         ByFamily = $byFamily
         ControlFindings = $controlFindings
         TotalFindings = $Findings.Count
         TotalControls = $Catalog.Count
+        LicensingGaps = $licensingGapRollup
     }
 }
 
@@ -2841,13 +2894,16 @@ function Get-FindingTSCReferences {
         [object]$Finding
     )
 
+    # Leading-comma return prevents PowerShell from unwrapping single-element
+    # arrays to scalars — callers rely on .Count and [int]-indexing on the
+    # result, which behave very differently on a string vs string[].
     if ($Finding.PSObject.Properties['TSCReferences'] -and $Finding.TSCReferences) {
-        return @($Finding.TSCReferences)
+        return , @($Finding.TSCReferences)
     }
     if ($Finding.PSObject.Properties['ComplianceMappings'] -and $Finding.ComplianceMappings -and $Finding.ComplianceMappings.SOC2) {
-        return @($Finding.ComplianceMappings.SOC2.Criteria)
+        return , @($Finding.ComplianceMappings.SOC2.Criteria)
     }
-    return @()
+    return , @()
 }
 
 function New-SOC2EvidenceBundle {
