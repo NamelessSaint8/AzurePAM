@@ -366,9 +366,80 @@ $Script:SOC2Mapping = @{
         Criteria = @('A1.1')
         Description = 'Capacity/performance monitoring for availability'
     }
+    'SOC2_ServiceHealthHealthy' = @{
+        Criteria = @('A1.1')
+        Description = 'Service health baseline assessed; availability indicators nominal'
+    }
     'SOC2_BackupConfigurationGap' = @{
         Criteria = @('A1.2')
         Description = 'Backup / environmental protection for availability'
+    }
+    'SOC2_BackupConfigurationHealthy' = @{
+        Criteria = @('A1.2')
+        Description = 'Backup vaults configured with protected items and redundancy for availability'
+    }
+
+    # --- Phase 2: Encryption / Malware / Diagnostic Settings healthy markers ---
+    'SOC2_EncryptionPostureHealthy' = @{
+        Criteria = @('CC6.7')
+        Description = 'Encryption-at-rest and in-transit posture assessed as compliant'
+    }
+    'SOC2_MalwareProtectionHealthy' = @{
+        Criteria = @('CC6.8')
+        Description = 'Anti-malware / EDR posture assessed as compliant'
+    }
+    'SOC2_DiagnosticSettingsGap' = @{
+        Criteria = @('CC4.1', 'CC7.2')
+        Description = 'Tenant diagnostic settings export for monitoring coverage'
+    }
+    'SOC2_DiagnosticSettingsHealthy' = @{
+        Criteria = @('CC4.1', 'CC7.2')
+        Description = 'Tenant audit/sign-in logs exported to Log Analytics for monitoring'
+    }
+    'SOC2_BreakGlassConfigured' = @{
+        Criteria = @('CC7.5')
+        Description = 'Break-glass accounts configured with CA exclusions for recovery'
+    }
+    'SOC2_Phase2_AzContextMissing' = @{
+        Criteria = @('CC4.1', 'CC6.7', 'CC6.8', 'CC7.2')
+        Description = 'Azure context required for Phase 2 Azure-side checks'
+    }
+    'SOC2_Phase2_PrereqMissing' = @{
+        Criteria = @('A1.2', 'CC4.1', 'CC7.2')
+        Description = 'Phase 2 prerequisite module missing'
+    }
+
+    # --- Phase 2: Licensing gaps ---
+    # Emitted as INFO (Severity=Low) when a feature's license is not present,
+    # so the affected TSCs show an auditor-visible "control not assessed" row
+    # rather than silently passing.
+    'SOC2_LicensingGap_IdentityProtection' = @{
+        Criteria = @('CC7.3')
+        Description = 'P2 license required to assess risk-based identity policies; control not assessed'
+    }
+    'SOC2_LicensingGap_Intune' = @{
+        Criteria = @('CC6.4')
+        Description = 'Intune / EMS E3+ required to assess device compliance; control not assessed'
+    }
+    'SOC2_LicensingGap_PurviewE5' = @{
+        Criteria = @('CC6.7', 'C1.1', 'C1.2')
+        Description = 'Purview (E5 / Compliance) required to assess DLP/sensitivity/retention; controls not assessed'
+    }
+    'SOC2_LicensingGap_DefenderForCloud' = @{
+        Criteria = @('CC4.2', 'CC6.7', 'CC6.8')
+        Description = 'Defender for Cloud plan required to assess regulatory compliance + alerting; controls not assessed'
+    }
+    'SOC2_LicensingGap_DefenderForEndpoint' = @{
+        Criteria = @('CC6.8')
+        Description = 'Defender for Endpoint required to assess EDR / malware posture'
+    }
+    'SOC2_LicensingGap_Priva' = @{
+        Criteria = @('P1.1', 'P2.1', 'P3.1')
+        Description = 'Microsoft Priva licensing required to assess privacy signals'
+    }
+    'SOC2_LicensingGap_Sentinel' = @{
+        Criteria = @('CC7.4')
+        Description = 'Sentinel workspace absent; incident-response depth unassessed (Phase 3+)'
     }
 }
 

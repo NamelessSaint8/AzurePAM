@@ -1339,6 +1339,16 @@ function Invoke-SOC2ReadinessFromMenu {
     $includeManual = $true
     $assessor = $env:USERNAME
     $svcOrg = ''
+    # Phase 2 defaults
+    $subscriptionFilter = @()
+    $licensingOverrides = @{}
+    $breakGlassMin = 2
+    $breakGlassPatterns = @()
+    $backupMinRedundancy = 'GRS'
+    $svcHealthThreshold = 98
+    $diagCategories = @('AuditLogs', 'SignInLogs')
+    $diagWorkspaceId = ''
+
     if ($soc2Cfg) {
         if ($soc2Cfg.Categories) { $categories = @($soc2Cfg.Categories) }
         if ($null -ne $soc2Cfg.Redaction) {
@@ -1349,6 +1359,34 @@ function Invoke-SOC2ReadinessFromMenu {
         if ($soc2Cfg.Evidence) {
             if ($soc2Cfg.Evidence.Assessor) { $assessor = $soc2Cfg.Evidence.Assessor }
             if ($soc2Cfg.Evidence.ServiceOrganization) { $svcOrg = $soc2Cfg.Evidence.ServiceOrganization }
+        }
+
+        # Phase 2 config
+        if ($soc2Cfg.Phase2) {
+            $p2 = $soc2Cfg.Phase2
+            if ($p2.SubscriptionFilter) { $subscriptionFilter = @($p2.SubscriptionFilter) }
+            if ($p2.Backup -and $p2.Backup.MinRedundancyTier) { $backupMinRedundancy = $p2.Backup.MinRedundancyTier }
+            if ($p2.ServiceHealth -and $p2.ServiceHealth.AvailabilityThresholdPercent) {
+                $svcHealthThreshold = [int]$p2.ServiceHealth.AvailabilityThresholdPercent
+            }
+            if ($p2.DiagnosticSettings) {
+                if ($p2.DiagnosticSettings.RequiredCategories) { $diagCategories = @($p2.DiagnosticSettings.RequiredCategories) }
+                if ($p2.DiagnosticSettings.RequiredWorkspaceId) { $diagWorkspaceId = $p2.DiagnosticSettings.RequiredWorkspaceId }
+            }
+            if ($p2.BreakGlass) {
+                if ($p2.BreakGlass.MinimumAccounts) { $breakGlassMin = [int]$p2.BreakGlass.MinimumAccounts }
+                if ($p2.BreakGlass.AccountUpnPatterns) { $breakGlassPatterns = @($p2.BreakGlass.AccountUpnPatterns) }
+            }
+            if ($p2.Licensing -and $p2.Licensing.Overrides) {
+                # Coerce PSCustomObject/hashtable to plain hashtable regardless of loader
+                if ($p2.Licensing.Overrides -is [hashtable]) {
+                    $licensingOverrides = $p2.Licensing.Overrides
+                } else {
+                    foreach ($prop in $p2.Licensing.Overrides.PSObject.Properties) {
+                        $licensingOverrides[$prop.Name] = $prop.Value
+                    }
+                }
+            }
         }
     }
 
@@ -1361,18 +1399,29 @@ function Invoke-SOC2ReadinessFromMenu {
     }
 
     Write-Host "  [i] Running SOC 2 assessment (Type 1, categories: $($categories -join ', '))" -ForegroundColor Gray
-    $result = Invoke-SOC2Assessment `
-        -ExistingFindings $existingFindings `
-        -TenantId $tenantId `
-        -TenantName $TenantName `
-        -Categories $categories `
-        -OutputDirectory $soc2Output `
-        -IdentityResolutionDirectory $idMapPath `
-        -RedactUsers:$redactUsers `
-        -RedactDevices:$redactDevices `
-        -IncludeManualAttestation $includeManual `
-        -Assessor $assessor `
-        -ServiceOrganization $svcOrg
+    $assessmentParams = @{}
+    $assessmentParams['ExistingFindings'] = $existingFindings
+    $assessmentParams['TenantId'] = $tenantId
+    $assessmentParams['TenantName'] = $TenantName
+    $assessmentParams['Categories'] = $categories
+    $assessmentParams['OutputDirectory'] = $soc2Output
+    $assessmentParams['IdentityResolutionDirectory'] = $idMapPath
+    $assessmentParams['RedactUsers'] = $redactUsers
+    $assessmentParams['RedactDevices'] = $redactDevices
+    $assessmentParams['IncludeManualAttestation'] = $includeManual
+    $assessmentParams['Assessor'] = $assessor
+    $assessmentParams['ServiceOrganization'] = $svcOrg
+    # Phase 2
+    $assessmentParams['SubscriptionFilter'] = $subscriptionFilter
+    $assessmentParams['LicensingOverrides'] = $licensingOverrides
+    $assessmentParams['BreakGlassMinimumAccounts'] = $breakGlassMin
+    $assessmentParams['BreakGlassUpnPatterns'] = $breakGlassPatterns
+    $assessmentParams['BackupMinRedundancyTier'] = $backupMinRedundancy
+    $assessmentParams['ServiceHealthThreshold'] = $svcHealthThreshold
+    $assessmentParams['DiagnosticSettingsRequiredCategories'] = $diagCategories
+    $assessmentParams['DiagnosticSettingsRequiredWorkspaceId'] = $diagWorkspaceId
+
+    $result = Invoke-SOC2Assessment @assessmentParams
 
     # Build branding context + render HTML and workbook
     $branding = Get-ReportBrandingContext `

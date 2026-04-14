@@ -531,6 +531,87 @@ function Get-ConfigurationSchema {
                             SuppressEntraChecksBranding = @{ type = "boolean"; default = $false }
                         }
                     }
+                    Phase2 = @{
+                        type = "object"
+                        description = "SOC 2 Phase 2 Azure-readiness check configuration"
+                        properties = @{
+                            SubscriptionFilter = @{
+                                type = "array"
+                                items = @{ type = "string" }
+                                default = @()
+                                description = "Optional list of subscription IDs or names to scope Azure-side Phase 2 checks"
+                            }
+                            Backup = @{
+                                type = "object"
+                                properties = @{
+                                    VaultFilter = @{
+                                        type = "array"
+                                        items = @{ type = "string" }
+                                        default = @()
+                                    }
+                                    MinRedundancyTier = @{
+                                        type = "string"
+                                        enum = @("LRS", "ZRS", "GRS", "RA-GRS")
+                                        default = "GRS"
+                                    }
+                                }
+                            }
+                            ServiceHealth = @{
+                                type = "object"
+                                properties = @{
+                                    AvailabilityThresholdPercent = @{
+                                        type = "integer"
+                                        minimum = 0
+                                        maximum = 100
+                                        default = 98
+                                    }
+                                }
+                            }
+                            DiagnosticSettings = @{
+                                type = "object"
+                                properties = @{
+                                    RequiredWorkspaceId = @{
+                                        type = "string"
+                                        description = "Optional Log Analytics workspace resource ID; when set, Entra diag export must target this workspace"
+                                    }
+                                    RequiredCategories = @{
+                                        type = "array"
+                                        items = @{ type = "string" }
+                                        default = @("AuditLogs", "SignInLogs")
+                                    }
+                                }
+                            }
+                            BreakGlass = @{
+                                type = "object"
+                                properties = @{
+                                    MinimumAccounts = @{
+                                        type = "integer"
+                                        minimum = 1
+                                        maximum = 10
+                                        default = 2
+                                    }
+                                    AccountUpnPatterns = @{
+                                        type = "array"
+                                        items = @{ type = "string" }
+                                        default = @()
+                                    }
+                                }
+                            }
+                            Licensing = @{
+                                type = "object"
+                                description = "Override licensing-gap finding severity (default INFO). Feature keys: IdentityProtection, Intune, PurviewE5, DefenderForCloud, DefenderForEndpoint, Priva"
+                                properties = @{
+                                    Overrides = @{
+                                        type = "object"
+                                        additionalProperties = @{
+                                            type = "string"
+                                            enum = @("INFO", "WARNING", "FAIL")
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -840,6 +921,49 @@ function Test-Configuration {
             }
             if ($soc2.Branding.OrganizationLogoPath -and -not (Test-Path -LiteralPath $soc2.Branding.OrganizationLogoPath)) {
                 $warnings += "SOC2.Branding.OrganizationLogoPath does not exist: $($soc2.Branding.OrganizationLogoPath)"
+            }
+        }
+
+        # Phase 2 validation
+        if ($soc2.Phase2) {
+            $p2 = $soc2.Phase2
+
+            if ($p2.BreakGlass -and $null -ne $p2.BreakGlass.MinimumAccounts) {
+                $min = $p2.BreakGlass.MinimumAccounts
+                if ($min -lt 1 -or $min -gt 10) {
+                    $errors += "SOC2.Phase2.BreakGlass.MinimumAccounts must be between 1 and 10"
+                }
+            }
+
+            if ($p2.ServiceHealth -and $null -ne $p2.ServiceHealth.AvailabilityThresholdPercent) {
+                $threshold = $p2.ServiceHealth.AvailabilityThresholdPercent
+                if ($threshold -lt 0 -or $threshold -gt 100) {
+                    $errors += "SOC2.Phase2.ServiceHealth.AvailabilityThresholdPercent must be between 0 and 100"
+                }
+            }
+
+            if ($p2.Backup -and $p2.Backup.MinRedundancyTier) {
+                $validTiers = @("LRS", "ZRS", "GRS", "RA-GRS")
+                if ($p2.Backup.MinRedundancyTier -notin $validTiers) {
+                    $errors += "SOC2.Phase2.Backup.MinRedundancyTier must be one of: $($validTiers -join ', ')"
+                }
+            }
+
+            if ($p2.Licensing -and $p2.Licensing.Overrides) {
+                $validSeverities = @("INFO", "WARNING", "FAIL")
+                foreach ($feature in $p2.Licensing.Overrides.Keys) {
+                    $severity = $p2.Licensing.Overrides[$feature]
+                    if ($severity -notin $validSeverities) {
+                        $errors += "SOC2.Phase2.Licensing.Overrides.$feature = '$severity' invalid; must be one of: $($validSeverities -join ', ')"
+                    }
+                }
+            }
+
+            if ($p2.DiagnosticSettings -and $p2.DiagnosticSettings.RequiredWorkspaceId) {
+                $wsId = $p2.DiagnosticSettings.RequiredWorkspaceId
+                if ($wsId -notmatch '^/subscriptions/[0-9a-fA-F-]+/resourceGroups/.+/providers/Microsoft\.OperationalInsights/workspaces/.+$') {
+                    $warnings += "SOC2.Phase2.DiagnosticSettings.RequiredWorkspaceId does not look like a full Log Analytics workspace resource ID"
+                }
             }
         }
     }

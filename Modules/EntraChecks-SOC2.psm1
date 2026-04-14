@@ -911,6 +911,345 @@ function Get-SOC2Finding {
 
 #endregion
 
+#region ==================== AZURE HELPERS (Phase 2) ====================
+
+<#
+.SYNOPSIS
+    Thin Azure REST wrapper used by Phase 2 SOC 2 checks.
+
+.DESCRIPTION
+    Wraps Invoke-AzRestMethod to inject an api-version query parameter and
+    normalize error handling. Returns the parsed JSON body on HTTP 200,
+    $null on 403/404, and logs a warning for other non-success codes.
+
+    Kept as a local helper rather than reusing the one in
+    EntraChecks-DefenderCompliance.psm1 because that function is not exported.
+
+.PARAMETER Uri
+    Full https://management.azure.com/... URI. api-version will be appended
+    automatically if not already present.
+
+.PARAMETER ApiVersion
+    Default '2022-01-01'. Override per-call for APIs that require specific
+    versions (e.g. microsoft.aadiam preview).
+
+.OUTPUTS
+    Deserialized JSON response body, or $null.
+#>
+function Invoke-SOC2AzureRestRequest {
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Uri,
+
+        [string]$ApiVersion = '2022-01-01'
+    )
+
+    try {
+        if ($Uri -notmatch 'api-version=') {
+            $separator = if ($Uri -match '\?') { '&' } else { '?' }
+            $Uri = "$Uri${separator}api-version=$ApiVersion"
+        }
+
+        $response = Invoke-AzRestMethod -Uri $Uri -Method GET -ErrorAction Stop
+
+        if ($response.StatusCode -eq 200) {
+            if ($response.Content) {
+                return $response.Content | ConvertFrom-Json
+            }
+            return $null
+        }
+
+        if (Get-Command Write-Log -ErrorAction SilentlyContinue) {
+            Write-Log -Level DEBUG -Message "Azure REST returned $($response.StatusCode) for $Uri" -Category 'SOC2-Phase2'
+        }
+        return $null
+    } catch {
+        if (Get-Command Write-Log -ErrorAction SilentlyContinue) {
+            Write-Log -Level WARN -Message "Azure REST failed for ${Uri}: $($_.Exception.Message)" -Category 'SOC2-Phase2'
+        }
+        return $null
+    }
+}
+
+<#
+.SYNOPSIS
+    Resolves the in-scope Azure subscriptions for Phase 2 checks.
+
+.DESCRIPTION
+    Wraps Get-AzSubscription with an optional filter. Returns only Enabled
+    subscriptions. Matches user-supplied filter values against either the
+    subscription ID or Name (case-insensitive). Returns empty array on error.
+
+.PARAMETER Filter
+    Optional array of subscription IDs or names. Empty/null means all
+    accessible subscriptions.
+
+.OUTPUTS
+    Array of subscription objects (with Id, Name, TenantId properties).
+#>
+function Get-SOC2TargetSubscriptions {
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [string[]]$Filter = @()
+    )
+
+    try {
+        $subs = Get-AzSubscription -ErrorAction Stop | Where-Object { $_.State -eq 'Enabled' }
+
+        if ($Filter -and $Filter.Count -gt 0) {
+            $filterSet = @($Filter | ForEach-Object { $_.ToLowerInvariant() })
+            $subs = $subs | Where-Object {
+                ($_.Id.ToLowerInvariant() -in $filterSet) -or ($_.Name.ToLowerInvariant() -in $filterSet)
+            }
+        }
+
+        return @($subs)
+    } catch {
+        if (Get-Command Write-Log -ErrorAction SilentlyContinue) {
+            Write-Log -Level WARN -Message "Could not enumerate subscriptions: $($_.Exception.Message)" -Category 'SOC2-Phase2'
+        }
+        return @()
+    }
+}
+
+#endregion
+
+#region ==================== LICENSING CAPABILITIES (Phase 2) ====================
+
+# Cache across assessment runs (per user decision #5 — module-lifetime cache
+# with -Refresh escape hatch)
+$script:SOC2LicensingCache = $null
+
+<#
+.SYNOPSIS
+    Probes tenant licensing capabilities that gate Phase 2 checks.
+
+.DESCRIPTION
+    Runs cheap read-only probes against Graph and Azure REST to determine
+    which licensed features are available. Each probe is wrapped in try/catch
+    so one failure does not poison the rest.
+
+    Results are cached for the lifetime of the module import; pass -Refresh
+    to force a new probe run.
+
+    Returned keys (all boolean): HasP2, HasIntune, HasPurviewE5,
+    HasDefenderForCloud, HasDefenderForEndpoint, HasPriva, HasAzContext.
+
+.PARAMETER Refresh
+    Ignore any cached result and probe fresh.
+
+.OUTPUTS
+    Hashtable of capability flags.
+#>
+function Get-SOC2LicensingCapabilities {
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [switch]$Refresh
+    )
+
+    if (-not $Refresh -and $null -ne $script:SOC2LicensingCache) {
+        return $script:SOC2LicensingCache
+    }
+
+    $caps = @{}
+    $caps['HasP2'] = $false
+    $caps['HasIntune'] = $false
+    $caps['HasPurviewE5'] = $false
+    $caps['HasDefenderForCloud'] = $false
+    $caps['HasDefenderForEndpoint'] = $false
+    $caps['HasPriva'] = $false
+    $caps['HasAzContext'] = $false
+
+    # P2 probe: role eligibility endpoint only exists with P2 / PIM
+    try {
+        $resp = Invoke-MgGraphRequest -Method GET -Uri 'https://graph.microsoft.com/v1.0/roleManagement/directory/roleEligibilitySchedules?$top=1' -ErrorAction Stop
+        if ($null -ne $resp) { $caps['HasP2'] = $true }
+    } catch { $caps['HasP2'] = $false }
+
+    # Intune probe: deviceManagement endpoint requires Intune license
+    try {
+        $resp = Invoke-MgGraphRequest -Method GET -Uri 'https://graph.microsoft.com/v1.0/deviceManagement/managedDevices?$top=1' -ErrorAction Stop
+        if ($null -ne $resp) { $caps['HasIntune'] = $true }
+    } catch { $caps['HasIntune'] = $false }
+
+    # Purview E5 probe: informationProtection requires E5 Compliance
+    try {
+        $resp = Invoke-MgGraphRequest -Method GET -Uri 'https://graph.microsoft.com/beta/security/informationProtection/sensitivityLabels?$top=1' -ErrorAction Stop
+        if ($null -ne $resp) { $caps['HasPurviewE5'] = $true }
+    } catch { $caps['HasPurviewE5'] = $false }
+
+    # Priva probe: subjectRightsRequests endpoint requires Priva
+    try {
+        $resp = Invoke-MgGraphRequest -Method GET -Uri 'https://graph.microsoft.com/beta/privacy/subjectRightsRequests?$top=1' -ErrorAction Stop
+        if ($null -ne $resp) { $caps['HasPriva'] = $true }
+    } catch { $caps['HasPriva'] = $false }
+
+    # Az context + Defender probes (only if Az.Accounts module is loaded + context present)
+    try {
+        if (Get-Command Get-AzContext -ErrorAction SilentlyContinue) {
+            $ctx = Get-AzContext -ErrorAction SilentlyContinue
+            if ($ctx) {
+                $caps['HasAzContext'] = $true
+
+                # Defender for Cloud: any subscription with Security pricings tier > Free
+                $subs = Get-SOC2TargetSubscriptions
+                foreach ($sub in $subs) {
+                    $null = Set-AzContext -SubscriptionId $sub.Id -ErrorAction SilentlyContinue
+                    $uri = "https://management.azure.com/subscriptions/$($sub.Id)/providers/Microsoft.Security/pricings"
+                    $pricings = Invoke-SOC2AzureRestRequest -Uri $uri -ApiVersion '2023-01-01'
+                    if ($pricings -and $pricings.value) {
+                        $paidPlans = @($pricings.value | Where-Object { $_.properties.pricingTier -and $_.properties.pricingTier -ne 'Free' })
+                        if ($paidPlans.Count -gt 0) {
+                            $caps['HasDefenderForCloud'] = $true
+
+                            # Defender for Endpoint (WDATP): check settings endpoint
+                            $wdatpUri = "https://management.azure.com/subscriptions/$($sub.Id)/providers/Microsoft.Security/settings/WDATP"
+                            $wdatp = Invoke-SOC2AzureRestRequest -Uri $wdatpUri -ApiVersion '2022-05-01'
+                            if ($wdatp -and $wdatp.properties -and $wdatp.properties.enabled) {
+                                $caps['HasDefenderForEndpoint'] = $true
+                            }
+                            break
+                        }
+                    }
+                }
+            }
+        }
+    } catch {
+        # Capability probes are best-effort; swallow exceptions so one failing
+        # probe doesn't poison the rest. Surface via debug stream.
+        Write-Debug "Licensing capability probe failed: $($_.Exception.Message)"
+    }
+
+    $script:SOC2LicensingCache = $caps
+    return $caps
+}
+
+<#
+.SYNOPSIS
+    Emits SOC2_LicensingGap_* INFO findings for each missing capability.
+
+.DESCRIPTION
+    Walks the capability hashtable; for each capability that is $false, emits
+    a finding that surfaces the affected TSC controls as "not assessed due
+    to licensing." The default Status/Severity is INFO/Low, overridable via
+    the Overrides hashtable (config key SOC2.Phase2.Licensing.Overrides).
+
+.PARAMETER Capabilities
+    Output of Get-SOC2LicensingCapabilities.
+
+.PARAMETER Overrides
+    Hashtable keyed by feature name (IdentityProtection, Intune, etc.) with
+    value 'INFO' | 'WARNING' | 'FAIL'. Missing keys use default INFO.
+
+.OUTPUTS
+    Array of finding objects (may be empty).
+#>
+function New-SOC2LicensingGapFindings {
+    [CmdletBinding()]
+    [OutputType([pscustomobject[]])]
+    param(
+        [Parameter(Mandatory)]
+        [hashtable]$Capabilities,
+
+        [hashtable]$Overrides = @{}
+    )
+
+    $gaps = [System.Collections.Generic.List[object]]::new()
+
+    # Map: capability flag -> (feature name, Type, default TSCReferences, control owner)
+    $gapMap = [System.Collections.Generic.List[hashtable]]::new()
+
+    $e = @{}
+    $e['Flag'] = 'HasP2'
+    $e['Feature'] = 'IdentityProtection'
+    $e['Type'] = 'SOC2_LicensingGap_IdentityProtection'
+    $e['TSC'] = @('CC7.3')
+    $e['Owner'] = 'Identity / Security'
+    $e['Reason'] = 'Azure AD Premium P2 required to assess risk-based user/sign-in policies'
+    $gapMap.Add($e) | Out-Null
+
+    $e = @{}
+    $e['Flag'] = 'HasIntune'
+    $e['Feature'] = 'Intune'
+    $e['Type'] = 'SOC2_LicensingGap_Intune'
+    $e['TSC'] = @('CC6.4')
+    $e['Owner'] = 'IT Ops'
+    $e['Reason'] = 'Intune / EMS E3+ required to assess device compliance and management'
+    $gapMap.Add($e) | Out-Null
+
+    $e = @{}
+    $e['Flag'] = 'HasPurviewE5'
+    $e['Feature'] = 'PurviewE5'
+    $e['Type'] = 'SOC2_LicensingGap_PurviewE5'
+    $e['TSC'] = @('CC6.7', 'C1.1', 'C1.2')
+    $e['Owner'] = 'Compliance'
+    $e['Reason'] = 'Microsoft Purview (E5 / Compliance add-on) required for DLP, sensitivity labels, retention policies'
+    $gapMap.Add($e) | Out-Null
+
+    $e = @{}
+    $e['Flag'] = 'HasDefenderForCloud'
+    $e['Feature'] = 'DefenderForCloud'
+    $e['Type'] = 'SOC2_LicensingGap_DefenderForCloud'
+    $e['TSC'] = @('CC4.2', 'CC6.7', 'CC6.8')
+    $e['Owner'] = 'Security'
+    $e['Reason'] = 'Defender for Cloud paid plan required to assess regulatory compliance and security alerting'
+    $gapMap.Add($e) | Out-Null
+
+    $e = @{}
+    $e['Flag'] = 'HasDefenderForEndpoint'
+    $e['Feature'] = 'DefenderForEndpoint'
+    $e['Type'] = 'SOC2_LicensingGap_DefenderForEndpoint'
+    $e['TSC'] = @('CC6.8')
+    $e['Owner'] = 'Security'
+    $e['Reason'] = 'Defender for Endpoint connector required to assess EDR / anti-malware posture'
+    $gapMap.Add($e) | Out-Null
+
+    $e = @{}
+    $e['Flag'] = 'HasPriva'
+    $e['Feature'] = 'Priva'
+    $e['Type'] = 'SOC2_LicensingGap_Priva'
+    $e['TSC'] = @('P1.1', 'P2.1', 'P3.1')
+    $e['Owner'] = 'Privacy / Compliance'
+    $e['Reason'] = 'Microsoft Priva license required to assess privacy program signals'
+    $gapMap.Add($e) | Out-Null
+
+    foreach ($gap in $gapMap) {
+        if ($Capabilities[$gap.Flag]) { continue }
+
+        # Apply override if present
+        $severity = 'Low'
+        $status = 'INFO'
+        if ($Overrides.ContainsKey($gap.Feature)) {
+            $override = $Overrides[$gap.Feature]
+            if ($override -in @('WARNING', 'FAIL')) {
+                $status = $override
+                $severity = if ($override -eq 'FAIL') { 'High' } else { 'Medium' }
+            }
+        }
+
+        $params = @{
+            CheckName = 'Get-SOC2LicensingCapabilities'
+            Type = $gap.Type
+            Status = $status
+            Severity = $severity
+            Object = "Licensing: $($gap.Feature)"
+            Description = $gap.Reason + '. Affected TSCs are not assessed.'
+            Remediation = "If this feature is in scope for your SOC 2 readiness, procure the required licensing. Otherwise, document exclusion scope and leave this finding as INFO to acknowledge the gap."
+            TSCReferences = $gap.TSC
+            ControlOwnerHint = $gap.Owner
+        }
+        $gaps.Add((Get-SOC2Finding @params)) | Out-Null
+    }
+
+    return $gaps.ToArray()
+}
+
+#endregion
+
 #region ==================== SYNTHETIC CHECKS ====================
 
 <#
@@ -1133,6 +1472,965 @@ function Test-SOC2IncidentResponseReadiness {
     return $findings.ToArray()
 }
 
+# ---------- Phase 2 synthetic checks ----------
+
+<#
+.SYNOPSIS
+    Evaluates Azure Recovery Services backup posture for A1.2 (availability
+    commitment: environmental protections, backup processes, recovery
+    infrastructure).
+
+.DESCRIPTION
+    Enumerates Recovery Services vaults across in-scope subscriptions and
+    validates: presence of vaults, presence of protected items, minimum
+    redundancy tier. Graceful degradation when Az.RecoveryServices module,
+    Az context, or Backup Reader role is missing.
+
+.PARAMETER Subscriptions
+    Optional subscription filter (ID or name) passed to Get-SOC2TargetSubscriptions.
+
+.PARAMETER MinRedundancyTier
+    Minimum acceptable redundancy tier. One of LRS, ZRS, GRS, RA-GRS.
+    Default GRS — below this produces a WARNING.
+
+.OUTPUTS
+    Array of finding objects.
+#>
+function Test-SOC2BackupConfiguration {
+    [CmdletBinding()]
+    [OutputType([pscustomobject[]])]
+    param(
+        [string[]]$Subscriptions = @(),
+
+        [ValidateSet('LRS', 'ZRS', 'GRS', 'RA-GRS')]
+        [string]$MinRedundancyTier = 'GRS'
+    )
+
+    $findings = [System.Collections.Generic.List[object]]::new()
+
+    # Prerequisite: Az.RecoveryServices module
+    if (-not (Get-Module -ListAvailable -Name Az.RecoveryServices)) {
+        $params = @{
+            CheckName = 'Test-SOC2BackupConfiguration'
+            Type = 'SOC2_Phase2_PrereqMissing'
+            Status = 'INFO'
+            Severity = 'Low'
+            Object = 'Module: Az.RecoveryServices'
+            Description = 'Az.RecoveryServices PowerShell module is not installed; backup posture cannot be evaluated.'
+            Remediation = 'Run Install-Prerequisites.ps1 (adds Az.RecoveryServices) or install manually: Install-Module Az.RecoveryServices -MinimumVersion 6.0.0 -Scope CurrentUser.'
+            TSCReferences = @('A1.2')
+            ControlOwnerHint = 'IT Ops'
+        }
+        $findings.Add((Get-SOC2Finding @params)) | Out-Null
+        return $findings.ToArray()
+    }
+
+    $targetSubs = Get-SOC2TargetSubscriptions -Filter $Subscriptions
+    if ($targetSubs.Count -eq 0) {
+        $params = @{
+            CheckName = 'Test-SOC2BackupConfiguration'
+            Type = 'SOC2_Phase2_AzContextMissing'
+            Status = 'INFO'
+            Severity = 'Low'
+            Object = 'Azure subscriptions'
+            Description = 'No accessible subscriptions. Backup posture cannot be assessed.'
+            Remediation = 'Run Connect-AzAccount with a principal that has Reader on at least one subscription in scope.'
+            TSCReferences = @('A1.2')
+            ControlOwnerHint = 'IT Ops'
+        }
+        $findings.Add((Get-SOC2Finding @params)) | Out-Null
+        return $findings.ToArray()
+    }
+
+    # Redundancy tier ranking for comparison
+    $tierRank = @{}
+    $tierRank['LRS'] = 1
+    $tierRank['ZRS'] = 2
+    $tierRank['GRS'] = 3
+    $tierRank['RA-GRS'] = 4
+    $minRank = $tierRank[$MinRedundancyTier]
+
+    $allVaults = [System.Collections.Generic.List[object]]::new()
+    $vaultsWithItems = 0
+    $vaultsMeetingRedundancy = 0
+
+    foreach ($sub in $targetSubs) {
+        $null = Set-AzContext -SubscriptionId $sub.Id -ErrorAction SilentlyContinue
+
+        $vaultsUri = "https://management.azure.com/subscriptions/$($sub.Id)/providers/Microsoft.RecoveryServices/vaults"
+        $vaultsResp = Invoke-SOC2AzureRestRequest -Uri $vaultsUri -ApiVersion '2023-04-01'
+
+        if ($null -eq $vaultsResp -or $null -eq $vaultsResp.value) { continue }
+
+        foreach ($vault in $vaultsResp.value) {
+            $allVaults.Add($vault) | Out-Null
+
+            # Redundancy tier check (property path varies by vault version; defensive)
+            $tier = $null
+            if ($vault.properties -and $vault.properties.redundancySettings -and $vault.properties.redundancySettings.standardTierStorageRedundancy) {
+                $tier = $vault.properties.redundancySettings.standardTierStorageRedundancy
+            }
+            if ($tier -and $tierRank.ContainsKey($tier) -and $tierRank[$tier] -ge $minRank) {
+                $vaultsMeetingRedundancy++
+            }
+
+            # Protected items presence
+            $itemsUri = "$($vault.id)/backupProtectedItems"
+            $itemsResp = Invoke-SOC2AzureRestRequest -Uri $itemsUri -ApiVersion '2023-04-01'
+            if ($itemsResp -and $itemsResp.value -and @($itemsResp.value).Count -gt 0) {
+                $vaultsWithItems++
+            }
+        }
+    }
+
+    if ($allVaults.Count -eq 0) {
+        $params = @{
+            CheckName = 'Test-SOC2BackupConfiguration'
+            Type = 'SOC2_BackupConfigurationGap'
+            Status = 'FAIL'
+            Severity = 'High'
+            Object = 'Recovery Services vaults'
+            Description = 'No Recovery Services vaults found in in-scope subscriptions. Availability commitment A1.2 (backup / environmental protection) unmet.'
+            Remediation = 'Create at least one Recovery Services vault, configure backup policies for in-scope workloads, and attach protected items. Prefer geo-redundant (GRS/RA-GRS) storage.'
+            TSCReferences = @('A1.2')
+            ControlOwnerHint = 'IT Ops'
+        }
+        $findings.Add((Get-SOC2Finding @params)) | Out-Null
+        return $findings.ToArray()
+    }
+
+    if ($vaultsWithItems -eq 0) {
+        $params = @{
+            CheckName = 'Test-SOC2BackupConfiguration'
+            Type = 'SOC2_BackupConfigurationGap'
+            Status = 'FAIL'
+            Severity = 'High'
+            Object = "Recovery Services vaults ($($allVaults.Count))"
+            Description = "Found $($allVaults.Count) Recovery Services vault(s) but none have protected items. Backup coverage for availability commitment A1.2 is nil."
+            Remediation = 'Configure backup policies on the existing vault(s) and attach in-scope resources (VMs, SQL, file shares, etc.) as protected items.'
+            TSCReferences = @('A1.2')
+            ControlOwnerHint = 'IT Ops'
+        }
+        $findings.Add((Get-SOC2Finding @params)) | Out-Null
+        return $findings.ToArray()
+    }
+
+    if ($vaultsMeetingRedundancy -eq 0) {
+        $params = @{
+            CheckName = 'Test-SOC2BackupConfiguration'
+            Type = 'SOC2_BackupConfigurationGap'
+            Status = 'WARNING'
+            Severity = 'Medium'
+            Object = "Recovery Services vaults ($($allVaults.Count))"
+            Description = "Vaults exist with protected items, but none meet minimum redundancy tier '$MinRedundancyTier'. Single-region failure would cause backup data loss."
+            Remediation = "Re-create or reconfigure at least one vault with $MinRedundancyTier or higher redundancy. Note: redundancy tier cannot be changed after vault creation with items protected; may require data migration."
+            TSCReferences = @('A1.2')
+            ControlOwnerHint = 'IT Ops'
+        }
+        $findings.Add((Get-SOC2Finding @params)) | Out-Null
+        return $findings.ToArray()
+    }
+
+    # Healthy PASS
+    $params = @{
+        CheckName = 'Test-SOC2BackupConfiguration'
+        Type = 'SOC2_BackupConfigurationHealthy'
+        Status = 'OK'
+        Severity = 'Info'
+        Object = "Recovery Services vaults ($($allVaults.Count))"
+        Description = "$($allVaults.Count) vault(s) configured; $vaultsWithItems with protected items; $vaultsMeetingRedundancy meeting minimum redundancy '$MinRedundancyTier'. Availability commitment A1.2 evidence present."
+        Remediation = 'No action required. Re-verify quarterly as part of control-operation evidence.'
+        TSCReferences = @('A1.2')
+        ControlOwnerHint = 'IT Ops'
+    }
+    $findings.Add((Get-SOC2Finding @params)) | Out-Null
+
+    return $findings.ToArray()
+}
+
+<#
+.SYNOPSIS
+    Assesses Azure Resource Health availability baseline for A1.1 (availability
+    commitment: maintain current processing capacity and usage).
+
+.DESCRIPTION
+    Queries Azure Resource Health across in-scope subscriptions and computes
+    the percentage of resources reporting "Available". Below the threshold
+    emits a WARNING; missing Resource Health telemetry emits INFO.
+
+.PARAMETER Subscriptions
+    Optional subscription filter.
+
+.PARAMETER AvailabilityThresholdPercent
+    Minimum acceptable percent of resources reporting Available. Default 98.
+
+.OUTPUTS
+    Array of finding objects.
+#>
+function Test-SOC2ServiceHealthBaseline {
+    [CmdletBinding()]
+    [OutputType([pscustomobject[]])]
+    param(
+        [string[]]$Subscriptions = @(),
+
+        [int]$AvailabilityThresholdPercent = 98
+    )
+
+    $findings = [System.Collections.Generic.List[object]]::new()
+
+    $targetSubs = Get-SOC2TargetSubscriptions -Filter $Subscriptions
+    if ($targetSubs.Count -eq 0) {
+        $params = @{
+            CheckName = 'Test-SOC2ServiceHealthBaseline'
+            Type = 'SOC2_Phase2_AzContextMissing'
+            Status = 'INFO'
+            Severity = 'Low'
+            Object = 'Azure subscriptions'
+            Description = 'No accessible subscriptions. Resource health baseline cannot be assessed.'
+            Remediation = 'Run Connect-AzAccount with Reader on at least one subscription in scope.'
+            TSCReferences = @('A1.1')
+            ControlOwnerHint = 'IT Ops'
+        }
+        $findings.Add((Get-SOC2Finding @params)) | Out-Null
+        return $findings.ToArray()
+    }
+
+    $totalCount = 0
+    $availableCount = 0
+    $unavailableCount = 0
+    $degradedCount = 0
+
+    foreach ($sub in $targetSubs) {
+        $null = Set-AzContext -SubscriptionId $sub.Id -ErrorAction SilentlyContinue
+        $uri = "https://management.azure.com/subscriptions/$($sub.Id)/providers/Microsoft.ResourceHealth/availabilityStatuses"
+        $resp = Invoke-SOC2AzureRestRequest -Uri $uri -ApiVersion '2022-10-01'
+
+        if ($null -eq $resp -or $null -eq $resp.value) { continue }
+
+        foreach ($status in $resp.value) {
+            if (-not $status.properties) { continue }
+            $totalCount++
+            switch ($status.properties.availabilityState) {
+                'Available' { $availableCount++ }
+                'Unavailable' { $unavailableCount++ }
+                'Degraded' { $degradedCount++ }
+            }
+        }
+    }
+
+    if ($totalCount -eq 0) {
+        $params = @{
+            CheckName = 'Test-SOC2ServiceHealthBaseline'
+            Type = 'SOC2_ServiceHealthGap'
+            Status = 'INFO'
+            Severity = 'Low'
+            Object = 'Resource Health telemetry'
+            Description = 'No resources returned health status. A1.1 cannot be assessed from telemetry alone.'
+            Remediation = 'Confirm Reader role on in-scope subscriptions and that at least one resource is reporting to Resource Health.'
+            TSCReferences = @('A1.1')
+            ControlOwnerHint = 'IT Ops'
+        }
+        $findings.Add((Get-SOC2Finding @params)) | Out-Null
+        return $findings.ToArray()
+    }
+
+    $percentAvailable = [math]::Round(($availableCount / $totalCount) * 100, 2)
+
+    if ($percentAvailable -lt $AvailabilityThresholdPercent) {
+        $params = @{
+            CheckName = 'Test-SOC2ServiceHealthBaseline'
+            Type = 'SOC2_ServiceHealthGap'
+            Status = 'WARNING'
+            Severity = 'Medium'
+            Object = "Resource Health ($totalCount resources)"
+            Description = "Resource health $percentAvailable% Available (threshold $AvailabilityThresholdPercent%); $unavailableCount Unavailable, $degradedCount Degraded. Investigate whether SOC 2 in-scope services are affected."
+            Remediation = 'Triage unavailable/degraded resources in the Azure portal Resource Health blade. If in SOC 2 scope, ensure incident response procedures capture the outage.'
+            TSCReferences = @('A1.1')
+            ControlOwnerHint = 'IT Ops'
+        }
+        $findings.Add((Get-SOC2Finding @params)) | Out-Null
+        return $findings.ToArray()
+    }
+
+    $params = @{
+        CheckName = 'Test-SOC2ServiceHealthBaseline'
+        Type = 'SOC2_ServiceHealthHealthy'
+        Status = 'OK'
+        Severity = 'Info'
+        Object = "Resource Health ($totalCount resources)"
+        Description = "Resource health $percentAvailable% Available (threshold $AvailabilityThresholdPercent%); baseline healthy."
+        Remediation = 'No action required. Re-verify periodically as part of availability monitoring.'
+        TSCReferences = @('A1.1')
+        ControlOwnerHint = 'IT Ops'
+    }
+    $findings.Add((Get-SOC2Finding @params)) | Out-Null
+
+    return $findings.ToArray()
+}
+
+<#
+.SYNOPSIS
+    Evaluates Entra tenant-level diagnostic settings export for CC4.1 and CC7.2
+    (monitoring controls, system monitoring via log retention and forwarding).
+
+.DESCRIPTION
+    Reads Entra ID tenant-level diagnostic settings via the preview API
+    `microsoft.aadiam` and verifies required log categories (AuditLogs,
+    SignInLogs at minimum) are exported to a reachable Log Analytics workspace.
+    Optionally enforces a specific required workspace when configured.
+
+.PARAMETER RequiredCategories
+    Log categories that must appear in at least one setting. Default
+    AuditLogs + SignInLogs.
+
+.PARAMETER RequiredWorkspaceId
+    Optional full Log Analytics workspace resource ID. When set, an enabled
+    setting must target this specific workspace to PASS.
+
+.OUTPUTS
+    Array of finding objects.
+#>
+function Test-SOC2DiagnosticSettingsExport {
+    [CmdletBinding()]
+    [OutputType([pscustomobject[]])]
+    param(
+        [string[]]$RequiredCategories = @('AuditLogs', 'SignInLogs'),
+
+        [string]$RequiredWorkspaceId = ''
+    )
+
+    $findings = [System.Collections.Generic.List[object]]::new()
+
+    if (-not (Get-Command Get-AzContext -ErrorAction SilentlyContinue) -or -not (Get-AzContext -ErrorAction SilentlyContinue)) {
+        $params = @{
+            CheckName = 'Test-SOC2DiagnosticSettingsExport'
+            Type = 'SOC2_Phase2_AzContextMissing'
+            Status = 'INFO'
+            Severity = 'Low'
+            Object = 'Azure context'
+            Description = 'Azure context required to query Entra tenant diagnostic settings (microsoft.aadiam). Check cannot run.'
+            Remediation = 'Run Connect-AzAccount with a principal granted Monitoring Reader at the tenant root scope.'
+            TSCReferences = @('CC4.1', 'CC7.2')
+            ControlOwnerHint = 'Security'
+        }
+        $findings.Add((Get-SOC2Finding @params)) | Out-Null
+        return $findings.ToArray()
+    }
+
+    # Entra tenant-level diag settings live under a tenant-scoped resource provider,
+    # not under a subscription. Requires Monitoring Reader at /providers/microsoft.aadiam.
+    $uri = 'https://management.azure.com/providers/microsoft.aadiam/diagnosticSettings'
+    $resp = Invoke-SOC2AzureRestRequest -Uri $uri -ApiVersion '2017-04-01-preview'
+
+    if ($null -eq $resp) {
+        # Could be 403 (missing role) or API hiccup — surface as WARNING so auditors see
+        # "we could not confirm", not a false PASS.
+        $params = @{
+            CheckName = 'Test-SOC2DiagnosticSettingsExport'
+            Type = 'SOC2_DiagnosticSettingsGap'
+            Status = 'WARNING'
+            Severity = 'Medium'
+            Object = 'Entra tenant diagnostic settings'
+            Description = 'Could not read tenant diagnostic settings (microsoft.aadiam). Likely cause: Monitoring Reader role missing at tenant scope.'
+            Remediation = 'Grant Monitoring Reader at the tenant root (/providers/microsoft.aadiam) to the assessment identity and re-run. See docs/SOC2-Guide.md Phase 2 permissions.'
+            TSCReferences = @('CC4.1', 'CC7.2')
+            ControlOwnerHint = 'Security'
+        }
+        $findings.Add((Get-SOC2Finding @params)) | Out-Null
+        return $findings.ToArray()
+    }
+
+    $settings = @()
+    if ($resp.value) { $settings = @($resp.value) }
+
+    if ($settings.Count -eq 0) {
+        $params = @{
+            CheckName = 'Test-SOC2DiagnosticSettingsExport'
+            Type = 'SOC2_DiagnosticSettingsGap'
+            Status = 'FAIL'
+            Severity = 'High'
+            Object = 'Entra tenant diagnostic settings'
+            Description = 'No diagnostic settings configured for the Entra tenant. Audit and sign-in logs are not being exported, so monitoring coverage under CC4.1/CC7.2 cannot be demonstrated.'
+            Remediation = 'In Entra ID -> Monitoring -> Diagnostic settings, add a setting that exports at minimum AuditLogs and SignInLogs to a Log Analytics workspace or storage account.'
+            TSCReferences = @('CC4.1', 'CC7.2')
+            ControlOwnerHint = 'Security'
+        }
+        $findings.Add((Get-SOC2Finding @params)) | Out-Null
+        return $findings.ToArray()
+    }
+
+    # Aggregate exported categories across all enabled settings
+    $exportedCategories = [System.Collections.Generic.HashSet[string]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase
+    )
+    $workspaceTargets = [System.Collections.Generic.HashSet[string]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase
+    )
+
+    foreach ($setting in $settings) {
+        if (-not $setting.properties) { continue }
+        if ($setting.properties.workspaceId) { $null = $workspaceTargets.Add($setting.properties.workspaceId) }
+        if ($setting.properties.logs) {
+            foreach ($log in $setting.properties.logs) {
+                if ($log.enabled -and $log.category) { $null = $exportedCategories.Add($log.category) }
+            }
+        }
+    }
+
+    $missingCategories = @($RequiredCategories | Where-Object { -not $exportedCategories.Contains($_) })
+
+    if ($missingCategories.Count -gt 0) {
+        $params = @{
+            CheckName = 'Test-SOC2DiagnosticSettingsExport'
+            Type = 'SOC2_DiagnosticSettingsGap'
+            Status = 'FAIL'
+            Severity = 'High'
+            Object = 'Entra diagnostic settings - missing categories'
+            Description = "Tenant diagnostic settings exist but required log categories are not exported: $(($missingCategories) -join ', '). Monitoring coverage for CC4.1/CC7.2 is incomplete."
+            Remediation = "Enable the following log categories in an existing diagnostic setting: $(($missingCategories) -join ', ')."
+            TSCReferences = @('CC4.1', 'CC7.2')
+            ControlOwnerHint = 'Security'
+        }
+        $findings.Add((Get-SOC2Finding @params)) | Out-Null
+        return $findings.ToArray()
+    }
+
+    if ($RequiredWorkspaceId) {
+        $matchFound = $workspaceTargets | Where-Object { $_ -eq $RequiredWorkspaceId }
+        if (-not $matchFound) {
+            $params = @{
+                CheckName = 'Test-SOC2DiagnosticSettingsExport'
+                Type = 'SOC2_DiagnosticSettingsGap'
+                Status = 'FAIL'
+                Severity = 'High'
+                Object = 'Entra diagnostic settings - wrong workspace'
+                Description = "Required SOC 2 evidence workspace is not configured as a diagnostic setting target. Found $($workspaceTargets.Count) distinct target(s); required: $RequiredWorkspaceId"
+                Remediation = 'Update at least one diagnostic setting to target the required workspace, or update SOC2.Phase2.DiagnosticSettings.RequiredWorkspaceId if the evidence workspace has moved.'
+                TSCReferences = @('CC4.1', 'CC7.2')
+                ControlOwnerHint = 'Security'
+            }
+            $findings.Add((Get-SOC2Finding @params)) | Out-Null
+            return $findings.ToArray()
+        }
+    }
+
+    $params = @{
+        CheckName = 'Test-SOC2DiagnosticSettingsExport'
+        Type = 'SOC2_DiagnosticSettingsHealthy'
+        Status = 'OK'
+        Severity = 'Info'
+        Object = "Entra diagnostic settings ($($settings.Count))"
+        Description = "$($settings.Count) diagnostic setting(s) configured; all required categories ($(($RequiredCategories) -join ', ')) exported. Monitoring coverage for CC4.1/CC7.2 evidenced."
+        Remediation = 'No action required. Spot-check workspace reachability and retention quarterly.'
+        TSCReferences = @('CC4.1', 'CC7.2')
+        ControlOwnerHint = 'Security'
+    }
+    $findings.Add((Get-SOC2Finding @params)) | Out-Null
+
+    return $findings.ToArray()
+}
+
+<#
+.SYNOPSIS
+    Evaluates encryption-at-rest and encryption-in-transit posture for CC6.7
+    using Defender for Cloud assessments.
+
+.DESCRIPTION
+    Uses Get-DefenderComplianceAssessments (from the Defender module) filtered
+    to encryption-related assessment keywords. Graceful degradation when
+    Defender plans are not enabled.
+
+.PARAMETER Subscriptions
+    Optional subscription filter.
+
+.OUTPUTS
+    Array of finding objects.
+#>
+function Test-SOC2EncryptionPosture {
+    [CmdletBinding()]
+    [OutputType([pscustomobject[]])]
+    param(
+        [string[]]$Subscriptions = @()
+    )
+
+    $findings = [System.Collections.Generic.List[object]]::new()
+
+    if (-not (Get-Command Get-DefenderComplianceAssessments -ErrorAction SilentlyContinue)) {
+        $params = @{
+            CheckName = 'Test-SOC2EncryptionPosture'
+            Type = 'SOC2_Phase2_PrereqMissing'
+            Status = 'INFO'
+            Severity = 'Low'
+            Object = 'Module: EntraChecks-DefenderCompliance'
+            Description = 'Defender compliance module is not loaded. Encryption posture (CC6.7) cannot be evaluated.'
+            Remediation = 'Import EntraChecks-DefenderCompliance before running SOC 2 assessment.'
+            TSCReferences = @('CC6.7')
+            ControlOwnerHint = 'Security'
+        }
+        $findings.Add((Get-SOC2Finding @params)) | Out-Null
+        return $findings.ToArray()
+    }
+
+    $targetSubs = Get-SOC2TargetSubscriptions -Filter $Subscriptions
+    if ($targetSubs.Count -eq 0) {
+        $params = @{
+            CheckName = 'Test-SOC2EncryptionPosture'
+            Type = 'SOC2_Phase2_AzContextMissing'
+            Status = 'INFO'
+            Severity = 'Low'
+            Object = 'Azure subscriptions'
+            Description = 'No accessible subscriptions to query Defender encryption assessments.'
+            Remediation = 'Connect-AzAccount with Security Reader and re-run.'
+            TSCReferences = @('CC6.7')
+            ControlOwnerHint = 'Security'
+        }
+        $findings.Add((Get-SOC2Finding @params)) | Out-Null
+        return $findings.ToArray()
+    }
+
+    $encryptionKeywords = @('encryption', 'encrypt', 'tls', 'https', 'diskencryption', 'bitlocker', 'transparentdataencryption', 'ssl', 'cmk', 'customer-managed')
+    $assessments = @()
+    try {
+        $subIds = @($targetSubs | ForEach-Object { $_.Id })
+        $assessments = Get-DefenderComplianceAssessments -Subscriptions $subIds -ErrorAction Stop
+    } catch {
+        $params = @{
+            CheckName = 'Test-SOC2EncryptionPosture'
+            Type = 'SOC2_LicensingGap_DefenderForCloud'
+            Status = 'INFO'
+            Severity = 'Low'
+            Object = 'Defender for Cloud regulatory compliance'
+            Description = 'Could not query Defender compliance assessments. Likely cause: no paid Defender for Cloud plan on any subscription.'
+            Remediation = 'Enable a Defender for Cloud plan on at least one in-scope subscription and assign a regulatory standard (e.g., Azure Security Benchmark).'
+            TSCReferences = @('CC6.7')
+            ControlOwnerHint = 'Security'
+        }
+        $findings.Add((Get-SOC2Finding @params)) | Out-Null
+        return $findings.ToArray()
+    }
+
+    $encryption = [System.Collections.Generic.List[object]]::new()
+    foreach ($assessment in $assessments) {
+        $text = ($assessment.displayName + ' ' + $assessment.description).ToLowerInvariant()
+        foreach ($kw in $encryptionKeywords) {
+            if ($text -like "*$kw*") {
+                $encryption.Add($assessment) | Out-Null
+                break
+            }
+        }
+    }
+
+    if ($encryption.Count -eq 0) {
+        $params = @{
+            CheckName = 'Test-SOC2EncryptionPosture'
+            Type = 'SOC2_EncryptionPostureGaps'
+            Status = 'INFO'
+            Severity = 'Low'
+            Object = 'Defender encryption assessments'
+            Description = 'No encryption-related assessments returned. Defender regulatory compliance may not have standards assigned, or encryption assessments are out of scope.'
+            Remediation = 'Assign Azure Security Benchmark or CIS standard in Defender for Cloud and re-run.'
+            TSCReferences = @('CC6.7')
+            ControlOwnerHint = 'Security'
+        }
+        $findings.Add((Get-SOC2Finding @params)) | Out-Null
+        return $findings.ToArray()
+    }
+
+    $failed = @($encryption | Where-Object { $_.status -eq 'Failed' -or $_.status -eq 'Unhealthy' })
+
+    if ($failed.Count -gt 0) {
+        foreach ($f in $failed) {
+            $params = @{
+                CheckName = 'Test-SOC2EncryptionPosture'
+                Type = 'SOC2_EncryptionPostureGaps'
+                Status = 'FAIL'
+                Severity = 'High'
+                Object = "Encryption: $($f.displayName)"
+                Description = "Defender assessment failing: $($f.displayName). $($f.description)"
+                Remediation = 'Follow Defender for Cloud remediation guidance in Azure portal for this assessment.'
+                TSCReferences = @('CC6.7')
+                ControlOwnerHint = 'Security'
+            }
+            $findings.Add((Get-SOC2Finding @params)) | Out-Null
+        }
+        return $findings.ToArray()
+    }
+
+    $params = @{
+        CheckName = 'Test-SOC2EncryptionPosture'
+        Type = 'SOC2_EncryptionPostureHealthy'
+        Status = 'OK'
+        Severity = 'Info'
+        Object = "Defender encryption assessments ($($encryption.Count))"
+        Description = "All $($encryption.Count) encryption-related assessment(s) passing. CC6.7 (data in transit/at rest) evidence present."
+        Remediation = 'No action required. Re-verify periodically.'
+        TSCReferences = @('CC6.7')
+        ControlOwnerHint = 'Security'
+    }
+    $findings.Add((Get-SOC2Finding @params)) | Out-Null
+
+    return $findings.ToArray()
+}
+
+<#
+.SYNOPSIS
+    Evaluates anti-malware / EDR posture for CC6.8 (controls to prevent or
+    detect unauthorized or malicious software).
+
+.DESCRIPTION
+    Checks whether Defender for Endpoint connector (WDATP setting) is enabled
+    on at least one in-scope subscription, and cross-checks endpoint-protection
+    assessments from Defender for Cloud where available.
+
+.PARAMETER Subscriptions
+    Optional subscription filter.
+
+.OUTPUTS
+    Array of finding objects.
+#>
+function Test-SOC2MalwareProtection {
+    [CmdletBinding()]
+    [OutputType([pscustomobject[]])]
+    param(
+        [string[]]$Subscriptions = @()
+    )
+
+    $findings = [System.Collections.Generic.List[object]]::new()
+
+    $targetSubs = Get-SOC2TargetSubscriptions -Filter $Subscriptions
+    if ($targetSubs.Count -eq 0) {
+        $params = @{
+            CheckName = 'Test-SOC2MalwareProtection'
+            Type = 'SOC2_Phase2_AzContextMissing'
+            Status = 'INFO'
+            Severity = 'Low'
+            Object = 'Azure subscriptions'
+            Description = 'No accessible subscriptions to query Defender for Endpoint connector state.'
+            Remediation = 'Connect-AzAccount with Security Reader.'
+            TSCReferences = @('CC6.8')
+            ControlOwnerHint = 'Security'
+        }
+        $findings.Add((Get-SOC2Finding @params)) | Out-Null
+        return $findings.ToArray()
+    }
+
+    $wdatpEnabledAnywhere = $false
+    foreach ($sub in $targetSubs) {
+        $null = Set-AzContext -SubscriptionId $sub.Id -ErrorAction SilentlyContinue
+        $uri = "https://management.azure.com/subscriptions/$($sub.Id)/providers/Microsoft.Security/settings/WDATP"
+        $wdatp = Invoke-SOC2AzureRestRequest -Uri $uri -ApiVersion '2022-05-01'
+        if ($wdatp -and $wdatp.properties -and $wdatp.properties.enabled) {
+            $wdatpEnabledAnywhere = $true
+            break
+        }
+    }
+
+    if (-not $wdatpEnabledAnywhere) {
+        $params = @{
+            CheckName = 'Test-SOC2MalwareProtection'
+            Type = 'SOC2_MalwareProtectionGaps'
+            Status = 'FAIL'
+            Severity = 'High'
+            Object = 'Defender for Endpoint connector'
+            Description = 'Defender for Endpoint connector (WDATP) is not enabled on any in-scope subscription. EDR coverage for CC6.8 cannot be verified via Azure.'
+            Remediation = 'Enable the Defender for Endpoint integration in Defender for Cloud on at least one subscription covering in-scope workloads.'
+            TSCReferences = @('CC6.8')
+            ControlOwnerHint = 'Security'
+        }
+        $findings.Add((Get-SOC2Finding @params)) | Out-Null
+        return $findings.ToArray()
+    }
+
+    # Secondary check: Defender malware assessments, if available
+    if (Get-Command Get-DefenderComplianceAssessments -ErrorAction SilentlyContinue) {
+        try {
+            $subIds = @($targetSubs | ForEach-Object { $_.Id })
+            $assessments = Get-DefenderComplianceAssessments -Subscriptions $subIds -ErrorAction Stop
+            $malwareKeywords = @('*malware*', '*antimalware*', '*endpoint protection*', '*edr*')
+            $malware = [System.Collections.Generic.List[object]]::new()
+            foreach ($assessment in $assessments) {
+                $text = ($assessment.displayName + ' ' + $assessment.description).ToLowerInvariant()
+                foreach ($pattern in $malwareKeywords) {
+                    if ($text -like $pattern) {
+                        $malware.Add($assessment) | Out-Null
+                        break
+                    }
+                }
+            }
+            $failedMalware = @($malware | Where-Object { $_.status -eq 'Failed' -or $_.status -eq 'Unhealthy' })
+            if ($failedMalware.Count -gt 0) {
+                foreach ($f in $failedMalware) {
+                    $params = @{
+                        CheckName = 'Test-SOC2MalwareProtection'
+                        Type = 'SOC2_MalwareProtectionGaps'
+                        Status = 'FAIL'
+                        Severity = 'High'
+                        Object = "Malware: $($f.displayName)"
+                        Description = "Defender assessment failing: $($f.displayName). $($f.description)"
+                        Remediation = 'Follow Defender for Cloud remediation guidance for this assessment.'
+                        TSCReferences = @('CC6.8')
+                        ControlOwnerHint = 'Security'
+                    }
+                    $findings.Add((Get-SOC2Finding @params)) | Out-Null
+                }
+                return $findings.ToArray()
+            }
+        } catch {
+            # Defender assessment secondary-check is best-effort; primary
+            # WDATP-connector check already passed when we got here.
+            Write-Debug "Malware assessment secondary-check failed: $($_.Exception.Message)"
+        }
+    }
+
+    $params = @{
+        CheckName = 'Test-SOC2MalwareProtection'
+        Type = 'SOC2_MalwareProtectionHealthy'
+        Status = 'OK'
+        Severity = 'Info'
+        Object = 'Defender for Endpoint'
+        Description = 'Defender for Endpoint connector enabled and no failing anti-malware assessments detected. CC6.8 signal present. Note: connector-enabled does not confirm per-endpoint coverage; complement with Intune device-compliance evidence where available.'
+        Remediation = 'No action required. Spot-check per-device EDR coverage via the Defender portal.'
+        TSCReferences = @('CC6.8')
+        ControlOwnerHint = 'Security'
+    }
+    $findings.Add((Get-SOC2Finding @params)) | Out-Null
+
+    return $findings.ToArray()
+}
+
+<#
+.SYNOPSIS
+    Verifies break-glass / emergency-access accounts are configured per CC7.5
+    (ability to recover from security incidents).
+
+.DESCRIPTION
+    Enumerates Global Administrator members and Conditional Access policies,
+    then identifies GA members whose ObjectId appears in EVERY enabled CA
+    policy's excludeUsers list (user-level exclusion) OR via
+    transitively-resolved excludeGroups membership. PASS requires at least
+    MinimumAccounts such accounts.
+
+.PARAMETER MinimumAccounts
+    Minimum break-glass account count. Default 2.
+
+.PARAMETER AccountUpnPatterns
+    Optional array of glob patterns (e.g., 'breakglass-*@*') that qualifying
+    accounts' UPNs should match. When set, accounts not matching any pattern
+    produce a WARNING.
+
+.OUTPUTS
+    Array of finding objects.
+#>
+function Test-SOC2BreakGlassAccountsConfigured {
+    [CmdletBinding()]
+    [OutputType([pscustomobject[]])]
+    param(
+        [int]$MinimumAccounts = 2,
+
+        [string[]]$AccountUpnPatterns = @()
+    )
+
+    $findings = [System.Collections.Generic.List[object]]::new()
+
+    # Global Administrator role template ID
+    $gaRoleTemplateId = '62e90394-69f5-4237-9190-012177145e10'
+
+    try {
+        # Fetch GA role object and its members
+        $rolesResp = Invoke-MgGraphRequest -Method GET -Uri 'https://graph.microsoft.com/v1.0/directoryRoles' -ErrorAction Stop
+        $gaRole = $null
+        if ($rolesResp.value) {
+            $gaRole = $rolesResp.value | Where-Object { $_.roleTemplateId -eq $gaRoleTemplateId } | Select-Object -First 1
+        }
+        if (-not $gaRole) {
+            $params = @{
+                CheckName = 'Test-SOC2BreakGlassAccountsConfigured'
+                Type = 'SOC2_BreakGlassMissing'
+                Status = 'INFO'
+                Severity = 'Low'
+                Object = 'Global Administrator role'
+                Description = 'Global Administrator role not found as activated directory role. In most tenants this means no GAs are assigned (PIM eligible-only) — verify manually.'
+                Remediation = 'Review directory role assignments. Break-glass accounts are typically permanent GA members, not eligible.'
+                TSCReferences = @('CC7.5')
+                ControlOwnerHint = 'Identity / Security'
+            }
+            $findings.Add((Get-SOC2Finding @params)) | Out-Null
+            return $findings.ToArray()
+        }
+
+        $membersResp = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/directoryRoles/$($gaRole.id)/members" -ErrorAction Stop
+        $gaMembers = @()
+        if ($membersResp.value) {
+            $gaMembers = @($membersResp.value | Where-Object { $_.'@odata.type' -eq '#microsoft.graph.user' })
+        }
+
+        if ($gaMembers.Count -eq 0) {
+            $params = @{
+                CheckName = 'Test-SOC2BreakGlassAccountsConfigured'
+                Type = 'SOC2_BreakGlassMissing'
+                Status = 'FAIL'
+                Severity = 'High'
+                Object = 'Global Administrators'
+                Description = 'Zero active Global Administrator users. No break-glass recovery path exists.'
+                Remediation = 'Create at least 2 break-glass Global Administrator accounts with strong authentication and exclude them from all Conditional Access policies.'
+                TSCReferences = @('CC7.5')
+                ControlOwnerHint = 'Identity / Security'
+            }
+            $findings.Add((Get-SOC2Finding @params)) | Out-Null
+            return $findings.ToArray()
+        }
+
+        if ($gaMembers.Count -eq 1) {
+            $params = @{
+                CheckName = 'Test-SOC2BreakGlassAccountsConfigured'
+                Type = 'SOC2_BreakGlassMissing'
+                Status = 'FAIL'
+                Severity = 'Critical'
+                Object = 'Global Administrators'
+                Description = 'Only one Global Administrator exists. Single point of failure for tenant recovery.'
+                Remediation = 'Add at least one more permanent Global Administrator as a break-glass account, excluded from all Conditional Access policies.'
+                TSCReferences = @('CC7.5')
+                ControlOwnerHint = 'Identity / Security'
+            }
+            $findings.Add((Get-SOC2Finding @params)) | Out-Null
+            return $findings.ToArray()
+        }
+
+        # Fetch enabled CA policies
+        $caResp = Invoke-MgGraphRequest -Method GET -Uri 'https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies' -ErrorAction Stop
+        $enabledPolicies = @()
+        if ($caResp.value) {
+            $enabledPolicies = @($caResp.value | Where-Object { $_.state -eq 'enabled' })
+        }
+
+        if ($enabledPolicies.Count -eq 0) {
+            $params = @{
+                CheckName = 'Test-SOC2BreakGlassAccountsConfigured'
+                Type = 'SOC2_BreakGlassMissing'
+                Status = 'WARNING'
+                Severity = 'Medium'
+                Object = 'Conditional Access policies'
+                Description = 'No enabled Conditional Access policies exist. Break-glass exclusion pattern cannot be verified. All GAs are effectively unrestricted — but CC6.1 is also failing since no CA policies protect any access paths.'
+                Remediation = 'Implement Conditional Access policies for privileged access, then re-verify break-glass exclusions.'
+                TSCReferences = @('CC6.1', 'CC7.5')
+                ControlOwnerHint = 'Identity / Security'
+            }
+            $findings.Add((Get-SOC2Finding @params)) | Out-Null
+            return $findings.ToArray()
+        }
+
+        # Determine break-glass accounts: GA members whose ObjectId is in excludeUsers
+        # of every enabled policy (or via excludeGroups membership).
+        $breakGlassIds = [System.Collections.Generic.List[string]]::new()
+
+        foreach ($ga in $gaMembers) {
+            $excludedFromAll = $true
+            foreach ($policy in $enabledPolicies) {
+                $excluded = $false
+                if ($policy.conditions.users.excludeUsers -and $ga.id -in $policy.conditions.users.excludeUsers) {
+                    $excluded = $true
+                }
+                if (-not $excluded -and $policy.conditions.users.excludeGroups) {
+                    # Check group membership (transitive)
+                    foreach ($groupId in $policy.conditions.users.excludeGroups) {
+                        try {
+                            $memberCheck = Invoke-MgGraphRequest -Method POST `
+                                -Uri "https://graph.microsoft.com/v1.0/users/$($ga.id)/checkMemberGroups" `
+                                -Body (@{ groupIds = @($groupId) } | ConvertTo-Json) `
+                                -ContentType 'application/json' `
+                                -ErrorAction Stop
+                            if ($memberCheck.value -and $memberCheck.value -contains $groupId) {
+                                $excluded = $true
+                                break
+                            }
+                        } catch {
+                            # Transitive membership lookup can 404 for deleted groups
+                            # or fail on rate limits; treat as "not a member" and continue.
+                            Write-Debug "Group membership check failed for group $groupId : $($_.Exception.Message)"
+                        }
+                    }
+                }
+                if (-not $excluded) { $excludedFromAll = $false; break }
+            }
+            if ($excludedFromAll) { $breakGlassIds.Add($ga.id) | Out-Null }
+        }
+
+        if ($breakGlassIds.Count -lt $MinimumAccounts) {
+            $params = @{
+                CheckName = 'Test-SOC2BreakGlassAccountsConfigured'
+                Type = 'SOC2_BreakGlassMissing'
+                Status = 'FAIL'
+                Severity = 'High'
+                Object = 'Break-glass Global Administrators'
+                Description = "Only $($breakGlassIds.Count) GA account(s) are excluded from all $($enabledPolicies.Count) enabled CA policies; SOC 2 CC7.5 recovery control requires at least $MinimumAccounts."
+                Remediation = "Designate at least $MinimumAccounts break-glass Global Administrator accounts and exclude them from every enabled Conditional Access policy (either by user ID or by membership in a break-glass group)."
+                TSCReferences = @('CC7.5')
+                ControlOwnerHint = 'Identity / Security'
+            }
+            $findings.Add((Get-SOC2Finding @params)) | Out-Null
+            return $findings.ToArray()
+        }
+
+        # Optional UPN pattern check
+        if ($AccountUpnPatterns.Count -gt 0) {
+            $nonMatchingCount = 0
+            foreach ($bgId in $breakGlassIds) {
+                $ga = $gaMembers | Where-Object { $_.id -eq $bgId } | Select-Object -First 1
+                $upn = $ga.userPrincipalName
+                $matchesAny = $false
+                foreach ($pattern in $AccountUpnPatterns) {
+                    if ($upn -like $pattern) { $matchesAny = $true; break }
+                }
+                if (-not $matchesAny) { $nonMatchingCount++ }
+            }
+            if ($nonMatchingCount -gt 0) {
+                $params = @{
+                    CheckName = 'Test-SOC2BreakGlassAccountsConfigured'
+                    Type = 'SOC2_BreakGlassMissing'
+                    Status = 'WARNING'
+                    Severity = 'Low'
+                    Object = "Break-glass UPN naming ($nonMatchingCount mismatched)"
+                    Description = "$nonMatchingCount of $($breakGlassIds.Count) break-glass account(s) do not match configured UPN patterns ($(($AccountUpnPatterns) -join ', ')). Accounts are functional but naming convention is inconsistent."
+                    Remediation = 'Either update UPN patterns in SOC2.Phase2.BreakGlass.AccountUpnPatterns to match actual naming, or rename accounts to match the convention.'
+                    TSCReferences = @('CC7.5')
+                    ControlOwnerHint = 'Identity / Security'
+                }
+                $findings.Add((Get-SOC2Finding @params)) | Out-Null
+            }
+        }
+
+        # Healthy PASS
+        $params = @{
+            CheckName = 'Test-SOC2BreakGlassAccountsConfigured'
+            Type = 'SOC2_BreakGlassConfigured'
+            Status = 'OK'
+            Severity = 'Info'
+            Object = "Break-glass Global Administrators ($($breakGlassIds.Count))"
+            Description = "$($breakGlassIds.Count) break-glass GA account(s) excluded from all $($enabledPolicies.Count) enabled CA policies. CC7.5 recovery control satisfied."
+            Remediation = 'No action required. Verify sign-in capability quarterly via a documented runbook and rotate credentials annually.'
+            TSCReferences = @('CC7.5')
+            ControlOwnerHint = 'Identity / Security'
+        }
+        $findings.Add((Get-SOC2Finding @params)) | Out-Null
+
+    } catch {
+        $params = @{
+            CheckName = 'Test-SOC2BreakGlassAccountsConfigured'
+            Type = 'SOC2_BreakGlassMissing'
+            Status = 'WARNING'
+            Severity = 'Low'
+            Object = 'Break-glass verification'
+            Description = "Could not verify break-glass configuration: $($_.Exception.Message)"
+            Remediation = 'Ensure Graph scopes Directory.Read.All, Policy.Read.All, RoleManagement.Read.Directory are granted.'
+            TSCReferences = @('CC7.5')
+            ControlOwnerHint = 'Identity / Security'
+        }
+        $findings.Add((Get-SOC2Finding @params)) | Out-Null
+    }
+
+    return $findings.ToArray()
+}
+
 #endregion
 
 #region ==================== ORCHESTRATION ====================
@@ -1255,7 +2553,24 @@ function Invoke-SOC2Assessment {
 
         [string]$Assessor = '',
 
-        [string]$ServiceOrganization = ''
+        [string]$ServiceOrganization = '',
+
+        # --- Phase 2 parameters ---
+        [string[]]$SubscriptionFilter = @(),
+
+        [hashtable]$LicensingOverrides = @{},
+
+        [int]$BreakGlassMinimumAccounts = 2,
+
+        [string[]]$BreakGlassUpnPatterns = @(),
+
+        [string]$BackupMinRedundancyTier = 'GRS',
+
+        [int]$ServiceHealthThreshold = 98,
+
+        [string[]]$DiagnosticSettingsRequiredCategories = @('AuditLogs', 'SignInLogs'),
+
+        [string]$DiagnosticSettingsRequiredWorkspaceId = ''
     )
 
     if (-not (Test-Path -LiteralPath $OutputDirectory)) {
@@ -1276,12 +2591,77 @@ function Invoke-SOC2Assessment {
     # Step 1: Filter catalog by categories in scope
     $catalog = Get-SOC2TSCCatalog -Categories $Categories
 
-    # Step 2: Run synthetic checks
+    # Step 2a: Probe licensing capabilities once per assessment
+    $caps = Get-SOC2LicensingCapabilities
+    $azContext = $null
+    if (Get-Command Get-AzContext -ErrorAction SilentlyContinue) {
+        $azContext = Get-AzContext -ErrorAction SilentlyContinue
+    }
+
+    # Step 2b: Run synthetic checks (Phase 1 + Phase 2), capability-gated
     $syntheticFindings = [System.Collections.Generic.List[object]]::new()
+
     if ('CC' -in $Categories) {
+        # Phase 1 CC checks
         foreach ($f in @(Test-SOC2AdminContacts)) { $syntheticFindings.Add($f) | Out-Null }
         foreach ($f in @(Test-SOC2SecurityAlertingConfigured)) { $syntheticFindings.Add($f) | Out-Null }
         foreach ($f in @(Test-SOC2IncidentResponseReadiness)) { $syntheticFindings.Add($f) | Out-Null }
+
+        # Phase 2 CC checks (Graph-only -> run unconditionally)
+        $bgParams = @{}
+        if ($BreakGlassMinimumAccounts -gt 0) { $bgParams['MinimumAccounts'] = $BreakGlassMinimumAccounts }
+        if ($BreakGlassUpnPatterns -and $BreakGlassUpnPatterns.Count -gt 0) {
+            $bgParams['AccountUpnPatterns'] = $BreakGlassUpnPatterns
+        }
+        foreach ($f in @(Test-SOC2BreakGlassAccountsConfigured @bgParams)) { $syntheticFindings.Add($f) | Out-Null }
+
+        # Phase 2 CC checks that need Az context
+        if ($azContext) {
+            $dsParams = @{}
+            if ($DiagnosticSettingsRequiredCategories -and $DiagnosticSettingsRequiredCategories.Count -gt 0) {
+                $dsParams['RequiredCategories'] = $DiagnosticSettingsRequiredCategories
+            }
+            if ($DiagnosticSettingsRequiredWorkspaceId) {
+                $dsParams['RequiredWorkspaceId'] = $DiagnosticSettingsRequiredWorkspaceId
+            }
+            foreach ($f in @(Test-SOC2DiagnosticSettingsExport @dsParams)) { $syntheticFindings.Add($f) | Out-Null }
+
+            foreach ($f in @(Test-SOC2EncryptionPosture -Subscriptions $SubscriptionFilter)) { $syntheticFindings.Add($f) | Out-Null }
+            foreach ($f in @(Test-SOC2MalwareProtection -Subscriptions $SubscriptionFilter)) { $syntheticFindings.Add($f) | Out-Null }
+        } else {
+            $umbrella = @{}
+            $umbrella['CheckName'] = 'Invoke-SOC2Assessment'
+            $umbrella['Type'] = 'SOC2_Phase2_AzContextMissing'
+            $umbrella['Status'] = 'INFO'
+            $umbrella['Severity'] = 'Low'
+            $umbrella['Object'] = 'Azure context'
+            $umbrella['Description'] = 'No Azure context available; CC4.1/CC6.7/CC6.8/CC7.2 Azure-side checks will be reported as unassessed.'
+            $umbrella['Remediation'] = 'Run Connect-AzAccount before invoking SOC 2 assessment to enable Phase 2 Azure-side checks.'
+            $umbrella['TSCReferences'] = @('CC4.1', 'CC6.7', 'CC6.8', 'CC7.2')
+            $umbrella['ControlOwnerHint'] = 'Security'
+            $syntheticFindings.Add((Get-SOC2Finding @umbrella)) | Out-Null
+        }
+    }
+
+    if ('A' -in $Categories -and $azContext) {
+        $bkParams = @{}
+        if ($SubscriptionFilter -and $SubscriptionFilter.Count -gt 0) {
+            $bkParams['Subscriptions'] = $SubscriptionFilter
+        }
+        if ($BackupMinRedundancyTier) { $bkParams['MinRedundancyTier'] = $BackupMinRedundancyTier }
+        foreach ($f in @(Test-SOC2BackupConfiguration @bkParams)) { $syntheticFindings.Add($f) | Out-Null }
+
+        $shParams = @{}
+        if ($SubscriptionFilter -and $SubscriptionFilter.Count -gt 0) {
+            $shParams['Subscriptions'] = $SubscriptionFilter
+        }
+        if ($ServiceHealthThreshold -gt 0) { $shParams['AvailabilityThresholdPercent'] = $ServiceHealthThreshold }
+        foreach ($f in @(Test-SOC2ServiceHealthBaseline @shParams)) { $syntheticFindings.Add($f) | Out-Null }
+    }
+
+    # Step 2c: Seed licensing-gap findings
+    foreach ($f in @(New-SOC2LicensingGapFindings -Capabilities $caps -Overrides $LicensingOverrides)) {
+        $syntheticFindings.Add($f) | Out-Null
     }
 
     # Step 3: Annotate existing findings with TSC mappings (via ComplianceMapping)
@@ -1698,6 +3078,7 @@ function Test-SOC2EvidenceBundle {
 #region ==================== MODULE EXPORTS ====================
 
 Export-ModuleMember -Function @(
+    # Phase 1
     'Get-SOC2TSCCatalog',
     'Get-SOC2Finding',
     'Get-SOC2TenantSalt',
@@ -1712,7 +3093,17 @@ Export-ModuleMember -Function @(
     'Invoke-SOC2Assessment',
     'Get-SOC2Summary',
     'New-SOC2EvidenceBundle',
-    'Test-SOC2EvidenceBundle'
+    'Test-SOC2EvidenceBundle',
+    # Phase 2 - Azure helpers + licensing
+    'Get-SOC2LicensingCapabilities',
+    'New-SOC2LicensingGapFindings',
+    # Phase 2 - synthetic checks
+    'Test-SOC2BackupConfiguration',
+    'Test-SOC2ServiceHealthBaseline',
+    'Test-SOC2DiagnosticSettingsExport',
+    'Test-SOC2EncryptionPosture',
+    'Test-SOC2MalwareProtection',
+    'Test-SOC2BreakGlassAccountsConfigured'
 )
 
 #endregion

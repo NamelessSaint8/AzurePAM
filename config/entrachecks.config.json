@@ -135,6 +135,35 @@
       "ReportFooter": "",
       "PrimaryColor": "",
       "SuppressEntraChecksBranding": false
+    },
+    "Phase2": {
+      "_comment": "Phase 2 Azure-readiness depth. Safe to leave empty — each check auto-detects.",
+      "SubscriptionFilter": [],
+      "Backup": {
+        "VaultFilter": [],
+        "MinRedundancyTier": "GRS"
+      },
+      "ServiceHealth": {
+        "AvailabilityThresholdPercent": 98
+      },
+      "DiagnosticSettings": {
+        "RequiredWorkspaceId": "",
+        "RequiredCategories": ["AuditLogs", "SignInLogs"]
+      },
+      "BreakGlass": {
+        "MinimumAccounts": 2,
+        "AccountUpnPatterns": []
+      },
+      "Licensing": {
+        "Overrides": {
+          "IdentityProtection": "INFO",
+          "Intune": "INFO",
+          "PurviewE5": "INFO",
+          "DefenderForCloud": "INFO",
+          "DefenderForEndpoint": "INFO",
+          "Priva": "INFO"
+        }
+      }
     }
   }
 }

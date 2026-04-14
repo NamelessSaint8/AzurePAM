@@ -94,25 +94,54 @@ if ($gallery -and $gallery.InstallationPolicy -ne "Trusted") {
 function Install-RequiredModule {
     param(
         [string]$ModuleName,
-        [string]$Purpose
+        [string]$Purpose,
+        [string]$MinimumVersion = ''
     )
 
     $existing = Get-Module -ListAvailable -Name $ModuleName -ErrorAction SilentlyContinue
+    $latestExisting = $null
     if ($existing) {
-        $ver = ($existing | Sort-Object Version -Descending | Select-Object -First 1).Version
-        Write-Step "$ModuleName v$ver already installed - $Purpose" "OK"
+        $latestExisting = ($existing | Sort-Object Version -Descending | Select-Object -First 1)
     }
-    else {
-        Write-Step "Installing $ModuleName - $Purpose"
-        try {
-            Install-Module -Name $ModuleName -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
-            $ver = (Get-Module -ListAvailable -Name $ModuleName | Sort-Object Version -Descending | Select-Object -First 1).Version
-            Write-Step "$ModuleName v$ver installed successfully" "OK"
+
+    $needsInstall = $false
+    $needsUpgrade = $false
+
+    if (-not $latestExisting) {
+        $needsInstall = $true
+    }
+    elseif ($MinimumVersion) {
+        $required = [version]$MinimumVersion
+        if ($latestExisting.Version -lt $required) {
+            $needsUpgrade = $true
         }
-        catch {
-            Write-Step "Failed to install $ModuleName : $($_.Exception.Message)" "FAIL"
-            Write-Step "You can install it manually later: Install-Module $ModuleName -Scope CurrentUser -Force" "WARN"
-        }
+    }
+
+    if (-not $needsInstall -and -not $needsUpgrade) {
+        $versionText = if ($MinimumVersion) { "$($latestExisting.Version) (>= $MinimumVersion required)" } else { $latestExisting.Version }
+        Write-Step "$ModuleName v$versionText already installed - $Purpose" "OK"
+        return
+    }
+
+    $action = if ($needsUpgrade) { "Upgrading" } else { "Installing" }
+    Write-Step "$action $ModuleName - $Purpose"
+    try {
+        $installParams = @{}
+        $installParams['Name'] = $ModuleName
+        $installParams['Scope'] = 'CurrentUser'
+        $installParams['Force'] = $true
+        $installParams['AllowClobber'] = $true
+        $installParams['ErrorAction'] = 'Stop'
+        if ($MinimumVersion) { $installParams['MinimumVersion'] = $MinimumVersion }
+        Install-Module @installParams
+
+        $ver = (Get-Module -ListAvailable -Name $ModuleName | Sort-Object Version -Descending | Select-Object -First 1).Version
+        Write-Step "$ModuleName v$ver installed successfully" "OK"
+    }
+    catch {
+        Write-Step "Failed to install $ModuleName : $($_.Exception.Message)" "FAIL"
+        $minArg = if ($MinimumVersion) { " -MinimumVersion $MinimumVersion" } else { '' }
+        Write-Step "You can install it manually later: Install-Module $ModuleName$minArg -Scope CurrentUser -Force" "WARN"
     }
 }
 
@@ -131,6 +160,12 @@ if (-not $GraphOnly) {
     Install-RequiredModule "Az.PolicyInsights"  "Azure Policy compliance data"
     Install-RequiredModule "Az.Resources"       "Azure resource inventory"
     Install-RequiredModule "Az.Security"        "Defender for Cloud compliance"
+
+    Write-Host ""
+    Write-Host "-- SOC 2 Phase 2 Azure Modules -----------------------------" -ForegroundColor White
+    Install-RequiredModule "Az.RecoveryServices"    "SOC 2 Phase 2: backup posture (A1.2)"   -MinimumVersion "6.0.0"
+    Install-RequiredModule "Az.Monitor"             "SOC 2 Phase 2: tenant diagnostic settings (CC4.1/CC7.2)" -MinimumVersion "4.0.0"
+    Install-RequiredModule "Az.OperationalInsights" "SOC 2 Phase 2: Log Analytics workspace validation"
 }
 else {
     Write-Host ""
