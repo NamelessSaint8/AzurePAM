@@ -612,6 +612,87 @@ function Get-ConfigurationSchema {
                             }
                         }
                     }
+                    AzureReadiness = @{
+                        type = "object"
+                        description = "SOC 2 Azure-readiness check configuration. Replaces SOC2.Phase2 (deprecated; removed in v1.8.0). Schema is identical."
+                        properties = @{
+                            SubscriptionFilter = @{
+                                type = "array"
+                                items = @{ type = "string" }
+                                default = @()
+                                description = "Optional list of subscription IDs or names to scope Azure-side checks"
+                            }
+                            Backup = @{
+                                type = "object"
+                                properties = @{
+                                    VaultFilter = @{
+                                        type = "array"
+                                        items = @{ type = "string" }
+                                        default = @()
+                                    }
+                                    MinRedundancyTier = @{
+                                        type = "string"
+                                        enum = @("LRS", "ZRS", "GRS", "RA-GRS")
+                                        default = "GRS"
+                                    }
+                                }
+                            }
+                            ServiceHealth = @{
+                                type = "object"
+                                properties = @{
+                                    AvailabilityThresholdPercent = @{
+                                        type = "integer"
+                                        minimum = 0
+                                        maximum = 100
+                                        default = 98
+                                    }
+                                }
+                            }
+                            DiagnosticSettings = @{
+                                type = "object"
+                                properties = @{
+                                    RequiredWorkspaceId = @{
+                                        type = "string"
+                                        description = "Optional Log Analytics workspace resource ID; when set, Entra diag export must target this workspace"
+                                    }
+                                    RequiredCategories = @{
+                                        type = "array"
+                                        items = @{ type = "string" }
+                                        default = @("AuditLogs", "SignInLogs")
+                                    }
+                                }
+                            }
+                            BreakGlass = @{
+                                type = "object"
+                                properties = @{
+                                    MinimumAccounts = @{
+                                        type = "integer"
+                                        minimum = 1
+                                        maximum = 10
+                                        default = 2
+                                    }
+                                    AccountUpnPatterns = @{
+                                        type = "array"
+                                        items = @{ type = "string" }
+                                        default = @()
+                                    }
+                                }
+                            }
+                            Licensing = @{
+                                type = "object"
+                                description = "Override licensing-gap finding severity (default INFO). Feature keys: IdentityProtection, Intune, PurviewE5, DefenderForCloud, DefenderForEndpoint, Priva"
+                                properties = @{
+                                    Overrides = @{
+                                        type = "object"
+                                        additionalProperties = @{
+                                            type = "string"
+                                            enum = @("INFO", "WARNING", "FAIL")
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -924,45 +1005,54 @@ function Test-Configuration {
             }
         }
 
-        # Phase 2 validation
+        # Phase 2 / AzureReadiness validation (identical schema; share logic)
+        $azReadinessBlocks = @()
         if ($soc2.Phase2) {
-            $p2 = $soc2.Phase2
+            $azReadinessBlocks += @{ Block = $soc2.Phase2; Path = 'SOC2.Phase2' }
+        }
+        if ($soc2.AzureReadiness) {
+            $azReadinessBlocks += @{ Block = $soc2.AzureReadiness; Path = 'SOC2.AzureReadiness' }
+        }
 
-            if ($p2.BreakGlass -and $null -ne $p2.BreakGlass.MinimumAccounts) {
-                $min = $p2.BreakGlass.MinimumAccounts
+        foreach ($entry in $azReadinessBlocks) {
+            $block = $entry.Block
+            $path = $entry.Path
+
+            if ($block.BreakGlass -and $null -ne $block.BreakGlass.MinimumAccounts) {
+                $min = $block.BreakGlass.MinimumAccounts
                 if ($min -lt 1 -or $min -gt 10) {
-                    $errors += "SOC2.Phase2.BreakGlass.MinimumAccounts must be between 1 and 10"
+                    $errors += "$path.BreakGlass.MinimumAccounts must be between 1 and 10"
                 }
             }
 
-            if ($p2.ServiceHealth -and $null -ne $p2.ServiceHealth.AvailabilityThresholdPercent) {
-                $threshold = $p2.ServiceHealth.AvailabilityThresholdPercent
+            if ($block.ServiceHealth -and $null -ne $block.ServiceHealth.AvailabilityThresholdPercent) {
+                $threshold = $block.ServiceHealth.AvailabilityThresholdPercent
                 if ($threshold -lt 0 -or $threshold -gt 100) {
-                    $errors += "SOC2.Phase2.ServiceHealth.AvailabilityThresholdPercent must be between 0 and 100"
+                    $errors += "$path.ServiceHealth.AvailabilityThresholdPercent must be between 0 and 100"
                 }
             }
 
-            if ($p2.Backup -and $p2.Backup.MinRedundancyTier) {
+            if ($block.Backup -and $block.Backup.MinRedundancyTier) {
                 $validTiers = @("LRS", "ZRS", "GRS", "RA-GRS")
-                if ($p2.Backup.MinRedundancyTier -notin $validTiers) {
-                    $errors += "SOC2.Phase2.Backup.MinRedundancyTier must be one of: $($validTiers -join ', ')"
+                if ($block.Backup.MinRedundancyTier -notin $validTiers) {
+                    $errors += "$path.Backup.MinRedundancyTier must be one of: $($validTiers -join ', ')"
                 }
             }
 
-            if ($p2.Licensing -and $p2.Licensing.Overrides) {
+            if ($block.Licensing -and $block.Licensing.Overrides) {
                 $validSeverities = @("INFO", "WARNING", "FAIL")
-                foreach ($feature in $p2.Licensing.Overrides.Keys) {
-                    $severity = $p2.Licensing.Overrides[$feature]
+                foreach ($feature in $block.Licensing.Overrides.Keys) {
+                    $severity = $block.Licensing.Overrides[$feature]
                     if ($severity -notin $validSeverities) {
-                        $errors += "SOC2.Phase2.Licensing.Overrides.$feature = '$severity' invalid; must be one of: $($validSeverities -join ', ')"
+                        $errors += "$path.Licensing.Overrides.$feature = '$severity' invalid; must be one of: $($validSeverities -join ', ')"
                     }
                 }
             }
 
-            if ($p2.DiagnosticSettings -and $p2.DiagnosticSettings.RequiredWorkspaceId) {
-                $wsId = $p2.DiagnosticSettings.RequiredWorkspaceId
+            if ($block.DiagnosticSettings -and $block.DiagnosticSettings.RequiredWorkspaceId) {
+                $wsId = $block.DiagnosticSettings.RequiredWorkspaceId
                 if ($wsId -notmatch '^/subscriptions/[0-9a-fA-F-]+/resourceGroups/.+/providers/Microsoft\.OperationalInsights/workspaces/.+$') {
-                    $warnings += "SOC2.Phase2.DiagnosticSettings.RequiredWorkspaceId does not look like a full Log Analytics workspace resource ID"
+                    $warnings += "$path.DiagnosticSettings.RequiredWorkspaceId does not look like a full Log Analytics workspace resource ID"
                 }
             }
         }
@@ -1084,6 +1174,130 @@ function ConvertTo-HashtableDeep {
     }
 }
 
+# Module-scoped guard so the deprecation warning fires once per session.
+$script:Soc2DeprecationWarningIssued = $false
+
+<#
+.SYNOPSIS
+    Resolves SOC2.Phase2 vs SOC2.AzureReadiness namespace migration in place.
+
+.DESCRIPTION
+    SOC 2 Phase 3 renamed `SOC2.Phase2.*` to `SOC2.AzureReadiness.*`. Both keys
+    are accepted through v1.7.x with a deprecation warning. v1.8.0 will remove
+    Phase2 support entirely.
+
+    This shim merges the two namespaces in place so all downstream consumers
+    see the same canonical shape under both keys:
+
+    - When only `SOC2.Phase2` is present, copies it to `SOC2.AzureReadiness`
+      and emits a single deprecation warning.
+    - When only `SOC2.AzureReadiness` is present, mirrors it to `SOC2.Phase2`
+      so any caller that has not yet migrated keeps working. No warning.
+    - When both are present, `SOC2.AzureReadiness` wins per key (recursive merge),
+      and a "both present" warning is emitted.
+    - When neither is present, no action.
+
+    The deprecation warning is emitted via Write-Warning AND Write-Log (when
+    available), suppressed after first issuance for the lifetime of the module.
+
+.PARAMETER ConfigObject
+    The full configuration hashtable. Modified in place; also returned for
+    pipeline use.
+
+.OUTPUTS
+    The same hashtable, with SOC2.AzureReadiness and SOC2.Phase2 in sync.
+
+.EXAMPLE
+    $config = Import-Configuration -FilePath '.\config\entrachecks.config.json'
+    # ^ Resolve-SOC2NamespaceConfig runs internally during Import-Configuration
+
+.EXAMPLE
+    $rawCfg = Get-Content '.\config\entrachecks.config.json' -Raw | ConvertFrom-Json | ConvertTo-HashtableDeep
+    $rawCfg = Resolve-SOC2NamespaceConfig -ConfigObject $rawCfg
+    # ^ For callers that bypass Import-Configuration (e.g., menu handlers reading raw JSON)
+#>
+function Resolve-SOC2NamespaceConfig {
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter(Mandatory)]
+        [AllowNull()]
+        [hashtable]$ConfigObject
+    )
+
+    if ($null -eq $ConfigObject) { return $ConfigObject }
+    if (-not $ConfigObject.ContainsKey('SOC2')) { return $ConfigObject }
+
+    $soc2 = $ConfigObject.SOC2
+    if ($null -eq $soc2 -or -not ($soc2 -is [hashtable])) { return $ConfigObject }
+
+    $hasPhase2 = $soc2.ContainsKey('Phase2') -and $null -ne $soc2.Phase2
+    $hasAzureReadiness = $soc2.ContainsKey('AzureReadiness') -and $null -ne $soc2.AzureReadiness
+
+    if (-not $hasPhase2 -and -not $hasAzureReadiness) { return $ConfigObject }
+
+    # Reusable deprecation notification. Single fire per session.
+    $emitWarning = {
+        param([string]$Reason)
+        if ($script:Soc2DeprecationWarningIssued) { return }
+        $script:Soc2DeprecationWarningIssued = $true
+        $msg = "SOC2.Phase2.* configuration keys are deprecated. Please rename your block to SOC2.AzureReadiness.* (same schema, semantic name). Old keys remain functional through version 1.7.x and will be removed in version 1.8.0. See docs/SOC2-Guide.md SS13 for migration details. ($Reason)"
+        Write-Warning $msg
+        if (Get-Command Write-Log -ErrorAction SilentlyContinue) {
+            Write-Log -Level WARN -Message $msg -Category 'Configuration'
+        }
+    }
+
+    if ($hasPhase2 -and -not $hasAzureReadiness) {
+        # Old-only: alias Phase2 into AzureReadiness so downstream code sees the canonical name.
+        $soc2['AzureReadiness'] = $soc2.Phase2
+        & $emitWarning 'detected SOC2.Phase2 only'
+        return $ConfigObject
+    }
+
+    if ($hasAzureReadiness -and -not $hasPhase2) {
+        # New-only: mirror AzureReadiness back to Phase2 so any pre-Phase-3 caller still works. No warning.
+        $soc2['Phase2'] = $soc2.AzureReadiness
+        return $ConfigObject
+    }
+
+    # Both present: AzureReadiness wins per key via recursive merge.
+    $soc2['AzureReadiness'] = Merge-NamespaceBlocks -Base $soc2.Phase2 -Override $soc2.AzureReadiness
+    $soc2['Phase2'] = $soc2.AzureReadiness
+    & $emitWarning 'both SOC2.AzureReadiness and SOC2.Phase2 detected; AzureReadiness wins per key'
+    return $ConfigObject
+}
+
+<#
+.SYNOPSIS
+    Internal helper: recursive hashtable merge where Override wins per key.
+    Private to this module; supports Resolve-SOC2NamespaceConfig.
+#>
+function Merge-NamespaceBlocks {
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter(Mandatory)][AllowNull()][hashtable]$Base,
+        [Parameter(Mandatory)][AllowNull()][hashtable]$Override
+    )
+
+    if ($null -eq $Base) { return $Override }
+    if ($null -eq $Override) { return $Base }
+
+    $merged = @{}
+    foreach ($key in $Base.Keys) { $merged[$key] = $Base[$key] }
+
+    foreach ($key in $Override.Keys) {
+        if ($merged.ContainsKey($key) -and ($merged[$key] -is [hashtable]) -and ($Override[$key] -is [hashtable])) {
+            $merged[$key] = Merge-NamespaceBlocks -Base $merged[$key] -Override $Override[$key]
+        } else {
+            $merged[$key] = $Override[$key]
+        }
+    }
+
+    return $merged
+}
+
 <#
 .SYNOPSIS
     Loads configuration from a JSON file.
@@ -1178,6 +1392,11 @@ function Import-Configuration {
             }
         }
     }
+
+    # SOC 2 Phase 3: namespace migration shim — runs after env-override merge,
+    # before defaults merge, so all downstream consumers (Test-Configuration,
+    # Get-ConfigValue, etc.) see SOC2.AzureReadiness as the canonical name.
+    $config = Resolve-SOC2NamespaceConfig -ConfigObject $config
 
     # Merge with defaults
     $config = Merge-ConfigurationDefaults -ConfigObject $config
@@ -1775,7 +1994,8 @@ Export-ModuleMember -Function @(
     'Get-Configuration',
     'Get-ConfigValue',
     'Export-Configuration',
-    'New-ConfigurationTemplate'
+    'New-ConfigurationTemplate',
+    'Resolve-SOC2NamespaceConfig'
 )
 
 #endregion

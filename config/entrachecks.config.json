@@ -136,8 +136,8 @@
       "PrimaryColor": "",
       "SuppressEntraChecksBranding": false
     },
-    "Phase2": {
-      "_comment": "Phase 2 Azure-readiness depth. Safe to leave empty — each check auto-detects.",
+    "AzureReadiness": {
+      "_comment": "SOC 2 Azure-readiness depth. Renamed from SOC2.Phase2 in v1.7.0 (old name still works through v1.7.x via the namespace shim, removed in v1.8.0). Safe to leave empty — each check auto-detects.",
       "SubscriptionFilter": [],
       "Backup": {
         "VaultFilter": [],

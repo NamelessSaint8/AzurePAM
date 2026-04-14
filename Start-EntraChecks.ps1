@@ -1361,28 +1361,40 @@ function Invoke-SOC2ReadinessFromMenu {
             if ($soc2Cfg.Evidence.ServiceOrganization) { $svcOrg = $soc2Cfg.Evidence.ServiceOrganization }
         }
 
-        # Phase 2 config
-        if ($soc2Cfg.Phase2) {
-            $p2 = $soc2Cfg.Phase2
-            if ($p2.SubscriptionFilter) { $subscriptionFilter = @($p2.SubscriptionFilter) }
-            if ($p2.Backup -and $p2.Backup.MinRedundancyTier) { $backupMinRedundancy = $p2.Backup.MinRedundancyTier }
-            if ($p2.ServiceHealth -and $p2.ServiceHealth.AvailabilityThresholdPercent) {
-                $svcHealthThreshold = [int]$p2.ServiceHealth.AvailabilityThresholdPercent
+        # SOC 2 Azure-readiness config (Phase 3 namespace migration)
+        # Prefer SOC2.AzureReadiness; fall back to deprecated SOC2.Phase2.
+        # The Resolve-SOC2NamespaceConfig shim handles this canonically when
+        # config is loaded via Import-Configuration; inline fallback here keeps
+        # the menu handler light (no Configuration module import required).
+        $azReadinessBlock = $null
+        if ($soc2Cfg.AzureReadiness) {
+            $azReadinessBlock = $soc2Cfg.AzureReadiness
+        } elseif ($soc2Cfg.Phase2) {
+            $azReadinessBlock = $soc2Cfg.Phase2
+            Write-Host "  [!] SOC2.Phase2 config keys are deprecated; rename to SOC2.AzureReadiness (removed in v1.8.0). See docs/SOC2-Guide.md SS13." -ForegroundColor Yellow
+        }
+
+        if ($azReadinessBlock) {
+            $ar = $azReadinessBlock
+            if ($ar.SubscriptionFilter) { $subscriptionFilter = @($ar.SubscriptionFilter) }
+            if ($ar.Backup -and $ar.Backup.MinRedundancyTier) { $backupMinRedundancy = $ar.Backup.MinRedundancyTier }
+            if ($ar.ServiceHealth -and $ar.ServiceHealth.AvailabilityThresholdPercent) {
+                $svcHealthThreshold = [int]$ar.ServiceHealth.AvailabilityThresholdPercent
             }
-            if ($p2.DiagnosticSettings) {
-                if ($p2.DiagnosticSettings.RequiredCategories) { $diagCategories = @($p2.DiagnosticSettings.RequiredCategories) }
-                if ($p2.DiagnosticSettings.RequiredWorkspaceId) { $diagWorkspaceId = $p2.DiagnosticSettings.RequiredWorkspaceId }
+            if ($ar.DiagnosticSettings) {
+                if ($ar.DiagnosticSettings.RequiredCategories) { $diagCategories = @($ar.DiagnosticSettings.RequiredCategories) }
+                if ($ar.DiagnosticSettings.RequiredWorkspaceId) { $diagWorkspaceId = $ar.DiagnosticSettings.RequiredWorkspaceId }
             }
-            if ($p2.BreakGlass) {
-                if ($p2.BreakGlass.MinimumAccounts) { $breakGlassMin = [int]$p2.BreakGlass.MinimumAccounts }
-                if ($p2.BreakGlass.AccountUpnPatterns) { $breakGlassPatterns = @($p2.BreakGlass.AccountUpnPatterns) }
+            if ($ar.BreakGlass) {
+                if ($ar.BreakGlass.MinimumAccounts) { $breakGlassMin = [int]$ar.BreakGlass.MinimumAccounts }
+                if ($ar.BreakGlass.AccountUpnPatterns) { $breakGlassPatterns = @($ar.BreakGlass.AccountUpnPatterns) }
             }
-            if ($p2.Licensing -and $p2.Licensing.Overrides) {
+            if ($ar.Licensing -and $ar.Licensing.Overrides) {
                 # Coerce PSCustomObject/hashtable to plain hashtable regardless of loader
-                if ($p2.Licensing.Overrides -is [hashtable]) {
-                    $licensingOverrides = $p2.Licensing.Overrides
+                if ($ar.Licensing.Overrides -is [hashtable]) {
+                    $licensingOverrides = $ar.Licensing.Overrides
                 } else {
-                    foreach ($prop in $p2.Licensing.Overrides.PSObject.Properties) {
+                    foreach ($prop in $ar.Licensing.Overrides.PSObject.Properties) {
                         $licensingOverrides[$prop.Name] = $prop.Value
                     }
                 }

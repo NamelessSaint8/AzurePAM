@@ -386,11 +386,57 @@ For Phase 2 to evaluate Azure-side controls, grant the assessment identity:
 
 ## 12. What's next (Phase 3+)
 
-- Type 2 period coverage reporting from snapshot history (`New-SOC2TypeTwoReport`)
-- Executive dashboard "X controls not assessed due to licensing" tile
-- Config namespace migration: rename `SOC2.Phase2.*` to a semantic name (e.g., `SOC2.AzureReadiness.*`) with backwards-compat shim
-- Optional CMS signing of evidence bundles via Azure Key Vault
-- Priva-based privacy automation (when Priva licensing is in scope)
+- Type 2 period coverage reporting from snapshot history (`New-SOC2TypeTwoReport`) — Phase 3 PR 2
+- Executive dashboard "X controls not assessed due to licensing" tile — Phase 3 PR 3
+- Optional CMS signing of evidence bundles via Azure Key Vault — Phase 4
+- Priva-based privacy automation (when Priva licensing is in scope) — Phase 4
 
 Track the current roadmap in
-`plans\SOC2-Implementation-Plan.md` and `plans\SOC2-Phase2-Implementation-Plan.md`.
+`plans\SOC2-Implementation-Plan.md`, `plans\SOC2-Phase2-Implementation-Plan.md`,
+and `plans\SOC2-Phase3-Implementation-Plan.md`.
+
+## 13. Config namespace migration (v1.7.0 → v1.8.0)
+
+Phase 3 renamed the Phase 2 config block from `SOC2.Phase2.*` to a semantic
+namespace, `SOC2.AzureReadiness.*`. The schema is identical — only the key
+name changed.
+
+### What you need to do
+
+If your `entrachecks.config.json` (or any `.dev.json` / `.prod.json`
+override) uses the old key, **rename it now**:
+
+```json
+"SOC2": {
+  "AzureReadiness": {           // <-- was "Phase2"
+    "BreakGlass": { "MinimumAccounts": 2 },
+    "Backup":     { "MinRedundancyTier": "GRS" },
+    "ServiceHealth": { "AvailabilityThresholdPercent": 98 },
+    "DiagnosticSettings": { "RequiredCategories": ["AuditLogs", "SignInLogs"] },
+    "Licensing": { "Overrides": { "IdentityProtection": "INFO" } }
+  }
+}
+```
+
+### Backwards compatibility (v1.7.0 through v1.7.x)
+
+Old `SOC2.Phase2.*` keys continue to work. A one-time deprecation warning
+fires per session when the old name is detected. The shim
+(`Resolve-SOC2NamespaceConfig`) automatically aliases Phase2 into
+AzureReadiness so all downstream code reads the canonical name.
+
+If both keys are present, `SOC2.AzureReadiness` wins per key (recursive
+merge). A separate "both present" warning fires.
+
+### Removal: v1.8.0
+
+In v1.8.0 the shim is removed and `SOC2.Phase2.*` produces a hard validation
+error directing the user to rename. Plan accordingly: schedule the rename
+into your next config maintenance window.
+
+### Why the rename
+
+`Phase2` was an implementation-phase anchor that ages poorly. Future SOC 2
+phases get their own semantic blocks (e.g., `SOC2.TypeTwo.*` for Phase 3
+period reporting, `SOC2.Signing.*` for Phase 4 CMS signing). See decision 4
+in `plans/SOC2-Phase2-Implementation-Plan.md` for the full rationale.
