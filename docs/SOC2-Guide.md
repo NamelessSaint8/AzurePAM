@@ -262,10 +262,24 @@ map as a sibling file — never embedded in the report — lets you:
 
 ### Using the identity-lookup side panel in HTML
 
-Open the report directly from the file system (not over `http://`). The
-sidebar will automatically load the resolution map and expose a text field
-where you can paste a hash prefix (12+ chars is usually unique) to get back the
-UPN and display name.
+The sidebar exposes a text field where you can paste a hash prefix (12+ chars
+is usually unique) to get back the UPN and display name. The resolution map
+itself is loaded **into the browser tab only** — it is never embedded in the
+HTML, so the report file remains safe to distribute.
+
+Two load paths, in order:
+
+1. **Auto-load** — if the report is served over `http://` (e.g.,
+   `python -m http.server` from the report folder), the sidebar fetches the
+   resolution map automatically using the absolute path baked into the report.
+2. **File-picker fallback** — if the report is opened directly from the file
+   system (`file://`), browsers block automatic local-file fetches for security
+   reasons. The sidebar then shows a file picker; select the
+   `identity-resolution-*.json` file shown in the panel and the lookup activates.
+   Data is read with the browser's `FileReader` API and stays in tab memory.
+
+For batch lookups or scripted workflows, use `Resolve-SOC2Identity` (below)
+instead of the HTML widget.
 
 ### Using Resolve-SOC2Identity from PowerShell
 
@@ -462,7 +476,7 @@ the snapshot → report flow).
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | "No prior findings; running Core assessment to seed SOC 2 mapping..." | No EntraChecks run happened first in this session | Run option [1] Quick Assessment first, or let the menu auto-run Core. |
-| Identity lookup sidebar shows "Could not load resolution map" | HTML opened over `http://` (browsers block local-file fetch) | Open the report directly from the file system (`file://`). |
+| Identity lookup sidebar shows the file picker instead of auto-loading | Browsers block `fetch()` of local files when the report is opened over `file://` (expected) | Click the picker and select the `identity-resolution-*.json` shown in the sidebar — the path is displayed there. Or serve the folder over `python -m http.server` for auto-load. |
 | Every TSC shows `MANUAL` | No mapped EntraChecks findings yet | Ensure the Core assessment ran; check that `Add-ComplianceMapping` resolved your findings' `Type`. |
 | `Invalid white-label branding configuration` at startup | `WhiteLabel = true` but `OrganizationName` is blank | Fill in `SOC2.Branding.OrganizationName` in the config. |
 | `Test-SOC2EvidenceBundle` reports mismatches | Someone edited a file in the bundle | Investigate; never hand-edit evidence files — regenerate instead. |

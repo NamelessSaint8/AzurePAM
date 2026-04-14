@@ -487,6 +487,8 @@ footer { background: #2a3441; color: #d0d5dc; text-align: center; padding: 16px;
 .lookup-input { width: 100%; padding: 8px; border: 1px solid #d0d5dc; border-radius: 4px; font-family: monospace; }
 .lookup-result { background: #f0f3f6; padding: 8px; margin-top: 8px; border-radius: 4px; font-family: monospace; font-size: 0.85em; word-break: break-all; }
 .lookup-warning { background: #fff8e1; padding: 8px; margin-top: 8px; border-radius: 4px; font-size: 0.85em; color: #7b5e00; }
+.lookup-picker { display: none; margin-top: 8px; padding: 8px; background: #eef4fb; border: 1px dashed #5b8fb9; border-radius: 4px; font-size: 0.85em; }
+.lookup-picker label { display: block; margin-bottom: 6px; color: #1c3d5a; }
 .evidence-hash { font-family: monospace; font-size: 0.85em; word-break: break-all; }
 /* Phase-3-followup reporting enhancements */
 .badge { display: inline-block; padding: 2px 10px; border-radius: 3px; font-size: 0.85em; font-weight: 600; }
@@ -732,38 +734,95 @@ footer { background: #2a3441; color: #d0d5dc; text-align: center; padding: 16px;
         [void]$sb.AppendLine("<p style='font-family: monospace; font-size: 0.75em; word-break: break-all;'>$([System.Web.HttpUtility]::HtmlEncode($IdentityResolutionMapPath))</p>")
         [void]$sb.AppendLine("<input type='text' id='lookup-input' class='lookup-input' placeholder='Paste hash prefix (12+ chars)' />")
         [void]$sb.AppendLine("<div id='lookup-result' class='lookup-result'>Awaiting input...</div>")
+        [void]$sb.AppendLine("<div id='lookup-picker' class='lookup-picker'>")
+        [void]$sb.AppendLine("<label for='lookup-file'>Select the resolution map JSON shown above. Data stays in your browser tab and is never written back to this file.</label>")
+        [void]$sb.AppendLine("<input type='file' id='lookup-file' accept='application/json,.json' />")
+        [void]$sb.AppendLine("</div>")
         [void]$sb.AppendLine(@"
 <script>
-let resolutionData = null;
-async function loadMap() {
-  try {
-    const r = await fetch('$escapedPath');
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    resolutionData = await r.json();
-    document.getElementById('lookup-result').textContent = 'Loaded ' + resolutionData.Entries.length + ' entries.';
-  } catch (e) {
-    document.getElementById('lookup-result').className = 'lookup-warning';
-    document.getElementById('lookup-result').textContent = 'Could not load resolution map (open this report directly from the file system, not via http://). Error: ' + e.message;
+(function () {
+  let resolutionData = null;
+
+  function setResult(text, warn) {
+    const el = document.getElementById('lookup-result');
+    el.className = warn ? 'lookup-warning' : 'lookup-result';
+    el.textContent = text;
   }
-}
-document.addEventListener('DOMContentLoaded', loadMap);
-document.addEventListener('input', (e) => {
-  if (e.target.id !== 'lookup-input') return;
-  if (!resolutionData) return;
-  const q = (e.target.value || '').toLowerCase().trim();
-  if (q.length < 8) {
-    document.getElementById('lookup-result').textContent = 'Type at least 8 hex chars...';
-    return;
+
+  function showPicker(reason) {
+    document.getElementById('lookup-picker').style.display = 'block';
+    setResult(reason + ' Use the picker below to load the resolution map manually.', true);
   }
-  const matches = resolutionData.Entries.filter(x => x.Hash.startsWith(q));
-  if (matches.length === 0) {
-    document.getElementById('lookup-result').textContent = 'No match.';
-  } else {
-    document.getElementById('lookup-result').innerHTML = matches.slice(0, 5).map(m =>
-      'Hash: ' + m.Hash.substring(0, 16) + '...<br>UPN: ' + (m.UPN || '(none)') + '<br>Display: ' + (m.DisplayName || '(none)')
-    ).join('<hr>');
+
+  function applyData(data, source) {
+    resolutionData = data;
+    const count = (data && data.Entries) ? data.Entries.length : 0;
+    setResult('Loaded ' + count + ' entries' + (source ? ' (' + source + ')' : '') + '. Paste a hash prefix above.', false);
+    document.getElementById('lookup-picker').style.display = 'none';
   }
-});
+
+  async function tryFetch() {
+    try {
+      const r = await fetch('$escapedPath');
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const data = await r.json();
+      applyData(data, 'auto-loaded');
+    } catch (e) {
+      // file:// fetch is blocked by the browser; fall back to the picker.
+      showPicker('Auto-load blocked by the browser when this report is opened from the file system.');
+    }
+  }
+
+  function handlePick(evt) {
+    const file = evt.target.files && evt.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = function (e) {
+      try {
+        const data = JSON.parse(e.target.result);
+        if (!data || !Array.isArray(data.Entries)) {
+          throw new Error('JSON does not look like a resolution map (missing Entries array).');
+        }
+        applyData(data, 'picker: ' + file.name);
+      } catch (err) {
+        setResult('Could not parse selected file: ' + err.message, true);
+      }
+    };
+    reader.onerror = function () {
+      setResult('Could not read selected file.', true);
+    };
+    reader.readAsText(file);
+  }
+
+  function handleQuery(evt) {
+    if (evt.target.id !== 'lookup-input') return;
+    if (!resolutionData) {
+      setResult('No resolution map loaded yet — load one first.', true);
+      return;
+    }
+    const q = (evt.target.value || '').toLowerCase().trim();
+    if (q.length < 8) {
+      setResult('Type at least 8 hex chars...', false);
+      return;
+    }
+    const matches = resolutionData.Entries.filter(function (x) { return x.Hash && x.Hash.toLowerCase().startsWith(q); });
+    const el = document.getElementById('lookup-result');
+    el.className = 'lookup-result';
+    if (matches.length === 0) {
+      el.textContent = 'No match.';
+    } else {
+      el.innerHTML = matches.slice(0, 5).map(function (m) {
+        return 'Hash: ' + m.Hash.substring(0, 16) + '...<br>UPN: ' + (m.UPN || '(none)') + '<br>Display: ' + (m.DisplayName || '(none)');
+      }).join('<hr>');
+    }
+  }
+
+  document.addEventListener('DOMContentLoaded', function () {
+    document.getElementById('lookup-file').addEventListener('change', handlePick);
+    tryFetch();
+  });
+  document.addEventListener('input', handleQuery);
+})();
 </script>
 "@)
     } else {
