@@ -58,6 +58,30 @@ The menu handler will:
 5. Produce the standalone HTML report, Excel workbook, and evidence bundle.
 6. Open the HTML report in your default browser.
 
+### Option A.1 — Automatic run after Quick Assessment
+
+Set `SOC2.Enabled = true` in `config\entrachecks.config.json` (top-level
+under `SOC2`). When Quick Assessment (`[1]` in the interactive menu or
+`-Mode Quick` on the CLI) completes, the SOC 2 readiness pass runs
+automatically against the just-collected findings — one invocation
+produces both the unified report and the SOC 2 report.
+
+```json
+"SOC2": {
+  "Enabled": true,
+  ...
+}
+```
+
+When `SOC2.Enabled = false` (the shipped default), Quick Assessment
+behaves exactly as before — no SOC 2 overhead. The menu option `[6]`
+remains the canonical manual-trigger path regardless of this flag.
+
+Behavior details:
+- Interactive `[1]`: HTML opens in browser after both reports are produced.
+- `-Mode Quick` / `-Mode Scheduled`: HTML is NOT auto-opened (automation friendly).
+- SOC 2 failure during the auto-run never fails the primary Quick Assessment — errors surface as a yellow warning.
+
 ### Option B — Scripted (recommended for automation)
 
 ```powershell

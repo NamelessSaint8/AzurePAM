@@ -1271,16 +1271,27 @@ function Invoke-ModuleAssessment {
 function Invoke-SOC2ReadinessFromMenu {
     <#
     .SYNOPSIS
-        Menu handler for SOC 2 Readiness Assessment (option [6]).
+        Menu handler for SOC 2 Readiness Assessment (option [6]) AND the
+        auto-run path invoked from Quick Assessment when SOC2.Enabled = true.
     .DESCRIPTION
         Loads SOC 2 config, ensures baseline findings exist (runs core +
         available modules if needed), invokes Invoke-SOC2Assessment, and
         renders the standalone SOC 2 HTML + workbook.
+    .PARAMETER SkipCoreSeed
+        When set, skip the "run Core assessment if no findings" seed step.
+        Used by the Quick-Assessment auto-run path where findings have
+        already been collected by the caller.
+    .PARAMETER OpenBrowser
+        When set, open the rendered HTML in the default browser at end of
+        run. Default $true for interactive UX parity with menu [6]; set
+        $false for automation (-Mode Quick / Scheduled).
     #>
     [CmdletBinding()]
     param(
         [string]$TenantName,
-        [string]$OutputDirectory
+        [string]$OutputDirectory,
+        [switch]$SkipCoreSeed,
+        [bool]$OpenBrowser = $true
     )
 
     Write-Host "`n  ===== SOC 2 Internal Readiness Assessment =====" -ForegroundColor Cyan
@@ -1313,7 +1324,8 @@ function Invoke-SOC2ReadinessFromMenu {
 
     # Ensure we have findings to map. If the current session's $script:Findings
     # is empty, run the core assessment (minimum) so SOC 2 has something to map.
-    if (-not $script:Findings -or $script:Findings.Count -eq 0) {
+    # Skipped when caller has just run Quick Assessment (findings already present).
+    if (-not $SkipCoreSeed -and (-not $script:Findings -or $script:Findings.Count -eq 0)) {
         Write-Host "  [i] No prior findings in this session; running Core assessment to seed SOC 2 mapping..." -ForegroundColor Gray
         if (-not $TenantName) { $TenantName = Read-Host "  Enter tenant name" }
         if (-not $SkipAuthentication) { Connect-EntraCheck }
@@ -1457,10 +1469,86 @@ function Invoke-SOC2ReadinessFromMenu {
         Write-Host "      Identity map:    $($result.IdentityMapPath)" -ForegroundColor White
     }
 
+    if ($OpenBrowser) {
+        try {
+            Start-Process $htmlPath
+        } catch {
+            Write-Host "  [!] Could not open HTML report automatically: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
+}
+
+<#
+.SYNOPSIS
+    Reads the SOC2.Enabled flag from the given config file. Returns $false
+    when the file is absent, unparseable, or the flag is missing/false.
+    Pure function — no side effects other than a yellow warning on parse error.
+
+.DESCRIPTION
+    Extracted from Invoke-SOC2ReadinessIfEnabled so the flag-reading logic is
+    testable in isolation without invoking the full SOC 2 pipeline.
+#>
+function Get-SOC2EnabledFromConfig {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)]
+        [string]$ConfigPath
+    )
+
+    if (-not (Test-Path -LiteralPath $ConfigPath)) { return $false }
     try {
-        Start-Process $htmlPath
+        $cfg = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
     } catch {
-        Write-Host "  [!] Could not open HTML report automatically: $($_.Exception.Message)" -ForegroundColor Yellow
+        Write-Host "  [!] Could not parse config for SOC2.Enabled flag; skipping SOC 2 auto-run. ($($_.Exception.Message))" -ForegroundColor Yellow
+        return $false
+    }
+    if (-not $cfg.SOC2) { return $false }
+    if ($null -eq $cfg.SOC2.Enabled) { return $false }
+    return [bool]$cfg.SOC2.Enabled
+}
+
+<#
+.SYNOPSIS
+    Runs SOC 2 readiness against already-collected findings when SOC2.Enabled
+    is true in config. Otherwise returns quietly.
+
+.DESCRIPTION
+    Called from Quick Assessment (menu [1]) and -Mode Quick/Scheduled paths.
+    Reads the SOC2.Enabled flag from config/entrachecks.config.json; if true,
+    hands off to Invoke-SOC2ReadinessFromMenu with -SkipCoreSeed (findings
+    already collected by the caller).
+
+    SOC 2 failure NEVER fails the primary Quick Assessment — errors are
+    caught and logged as a yellow warning only.
+
+.PARAMETER TenantName
+    Tenant name to forward to the SOC 2 run.
+
+.PARAMETER OutputDirectory
+    Output root (same as Quick Assessment's output dir).
+
+.PARAMETER OpenBrowser
+    $true for interactive contexts (menu [1]); $false for automation.
+#>
+function Invoke-SOC2ReadinessIfEnabled {
+    [CmdletBinding()]
+    param(
+        [string]$TenantName,
+        [Parameter(Mandatory)]
+        [string]$OutputDirectory,
+        [bool]$OpenBrowser = $true
+    )
+
+    $configPath = Join-Path $PSScriptRoot 'config\entrachecks.config.json'
+    if (-not (Get-SOC2EnabledFromConfig -ConfigPath $configPath)) { return }
+
+    Write-Host "`n  [i] SOC2.Enabled = true; running SOC 2 readiness assessment..." -ForegroundColor Cyan
+    try {
+        Invoke-SOC2ReadinessFromMenu -TenantName $TenantName -OutputDirectory $OutputDirectory -SkipCoreSeed -OpenBrowser $OpenBrowser
+    } catch {
+        Write-Host "  [!] SOC 2 auto-run failed: $($_.Exception.Message)" -ForegroundColor Yellow
+        Write-Host "  [!] The primary Quick Assessment completed successfully; re-run SOC 2 manually via menu option [6] once addressed." -ForegroundColor Yellow
     }
 }
 
@@ -1838,6 +1926,9 @@ function Start-InteractiveMode {
                 Write-Host "`n  Assessment complete! Duration: $($results.Duration.TotalMinutes.ToString('0.0')) minutes" -ForegroundColor Green
                 Write-Host "  Reports saved to: $reportDir" -ForegroundColor Cyan
 
+                # Auto-run SOC 2 readiness when SOC2.Enabled = true in config
+                Invoke-SOC2ReadinessIfEnabled -TenantName $tenantName -OutputDirectory $OutputDirectory -OpenBrowser $true
+
                 Read-Host "`n  Press Enter to continue"
             }
             
@@ -2047,7 +2138,7 @@ function Start-QuickMode {
     
     $results = Invoke-ModuleAssessment -SelectedModules $modulesToRun -TenantName $TenantName -OutputDir $OutputDirectory
     $reportDir = Export-AssessmentResult -OutputDir $OutputDirectory -TenantName $TenantName -IncludeUnified -GenerateComprehensiveReport:$GenerateComprehensiveReport -GenerateExecutiveSummary:$GenerateExecutiveSummary -GenerateExcelReport:$GenerateExcelReport -GenerateRemediationScripts:$GenerateRemediationScripts
-    
+
     if ($SaveSnapshot) {
         $deltaModule = Join-Path $script:ModulesPath "EntraChecks-DeltaReporting.psm1"
         Import-Module $deltaModule -Force
@@ -2057,7 +2148,11 @@ function Start-QuickMode {
             -AzurePolicyData $script:AzurePolicyData `
             -PurviewComplianceData $script:PurviewComplianceData
     }
-    
+
+    # Auto-run SOC 2 readiness when SOC2.Enabled = true in config. Browser
+    # open is suppressed in scripted Quick/Scheduled mode (automation friendly).
+    Invoke-SOC2ReadinessIfEnabled -TenantName $TenantName -OutputDirectory $OutputDirectory -OpenBrowser $false
+
     if ($CompareWithLast) {
         $deltaModule = Join-Path $script:ModulesPath "EntraChecks-DeltaReporting.psm1"
         Import-Module $deltaModule -Force
@@ -2118,7 +2213,10 @@ function Start-ScheduledMode {
             -AzurePolicyData $script:AzurePolicyData `
             -PurviewComplianceData $script:PurviewComplianceData
     }
-    
+
+    # Auto-run SOC 2 readiness when SOC2.Enabled = true in config.
+    Invoke-SOC2ReadinessIfEnabled -TenantName $TenantName -OutputDirectory $OutputDirectory -OpenBrowser $false
+
     # Return structured result for automation
     return @{
         Success = $results.Errors.Count -eq 0
