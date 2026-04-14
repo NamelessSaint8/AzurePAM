@@ -24,6 +24,15 @@ $modulePath = Split-Path -Parent $PSCommandPath
 Import-Module (Join-Path $modulePath "EntraChecks-ComplianceMapping.psm1") -Force
 Import-Module (Join-Path $modulePath "EntraChecks-RiskScoring.psm1") -Force -DisableNameChecking
 Import-Module (Join-Path $modulePath "EntraChecks-RemediationGuidance.psm1") -Force
+# NOTE: EntraChecks-Branding.psm1 provides Get-ReportBrandingContext, which
+# callers can use to construct the -Branding object passed to
+# New-EnhancedHTMLReport. We don't import it here — only its output is
+# consumed inside this module — so the caller's import scope wins.
+
+# Module-scoped list of check names that produce findings the team has flagged
+# as fixture-verified-only / low-confidence. Empty by default — populate per
+# environment via $module:LowConfidenceCheckNames or by editing this file.
+$script:LowConfidenceCheckNames = @()
 
 #region HTML Generation Functions
 
@@ -70,6 +79,31 @@ function New-EnhancedHTMLReport {
 
         [object]$DefenderCompliance,
 
+        # New in PR 2 — surface data the orchestrator already collects but
+        # that the unified report previously discarded. All three are optional;
+        # missing data renders a "Not collected" placeholder so the user knows
+        # the section exists but was skipped.
+        [object]$SecureScore,
+
+        [object]$AzurePolicy,
+
+        [object]$PurviewCompliance,
+
+        # PR 3 backports.
+        # Branding context (Get-ReportBrandingContext output). When provided,
+        # overrides report title, header gradient, organization name, and logo.
+        [object]$Branding,
+
+        # Default-true so the integrity badge ships in every report. Pass
+        # -IncludeIntegrityBadge:$false to suppress (e.g., for HTML diffs in CI).
+        [bool]$IncludeIntegrityBadge = $true,
+
+        # Default-true so the executive digest renders by default.
+        [bool]$IncludeExecutiveDigest = $true,
+
+        # Override the module-scoped low-confidence list per call.
+        [string[]]$LowConfidenceCheckNames,
+
         [string[]]$IncludeSections = @('All')
     )
 
@@ -101,14 +135,94 @@ function New-EnhancedHTMLReport {
     $quickWins = Get-QuickWins -Findings $enhancedFindings
     $prioritized = Get-PrioritizedFindings -Findings $enhancedFindings
 
+    # Compute findings delta if a previous assessment was supplied. Accepts
+    # either a snapshot object (with a .Findings array) or a bare findings
+    # array — both shapes are reasonable inputs for callers.
+    $findingsDelta = $null
+    if ($PreviousAssessment) {
+        $previousFindings = if ($PreviousAssessment.PSObject.Properties['Findings']) {
+            $PreviousAssessment.Findings
+        }
+        else {
+            @($PreviousAssessment)
+        }
+        $findingsDelta = Get-FindingsDelta -Current $enhancedFindings -Previous $previousFindings
+    }
+
+    # PR 3: resolve effective low-confidence list (per-call override falls back
+    # to module-scoped default).
+    $effectiveLowConfidence = if ($PSBoundParameters.ContainsKey('LowConfidenceCheckNames')) {
+        $LowConfidenceCheckNames
+    }
+    else {
+        $script:LowConfidenceCheckNames
+    }
+
+    # PR 3: compute the executive digest once so it can flow into the cover
+    # block and any downstream summary rendering.
+    $execDigest = $null
+    if ($IncludeExecutiveDigest) {
+        $execDigest = Get-EntraChecksExecutiveDigest -Findings $enhancedFindings -RiskSummary $riskSummary -ComplianceGap $complianceGap -FindingsDelta $findingsDelta
+    }
+
+    # PR 3: low-confidence banner — present when any rendered finding is on
+    # the configured fixture-verified list.
+    $lowConfidenceBanner = ""
+    if ($effectiveLowConfidence -and $effectiveLowConfidence.Count -gt 0) {
+        $hits = @($enhancedFindings | Where-Object {
+                $_.CheckName -and ($effectiveLowConfidence -contains $_.CheckName)
+            })
+        if ($hits.Count -gt 0) {
+            $checkList = ($hits.CheckName | Select-Object -Unique | Sort-Object) -join ', '
+            $lowConfidenceBanner = @"
+    <div class="low-confidence-banner">
+        <strong>Low-confidence checks present.</strong>
+        $($hits.Count) finding(s) come from fixture-verified checks
+        ($([System.Net.WebUtility]::HtmlEncode($checkList))).
+        Treat these as advisory until validated against your live tenant.
+    </div>
+"@
+        }
+    }
+
+    # PR 3: branding — overrides report title, header gradient, org name, logo.
+    $brandedTitleHtml = "&#128274; Microsoft Entra ID Security Assessment"
+    $brandedOrgHtml = ""
+    $headerStyleAttr = ""
+    if ($Branding) {
+        if ($Branding.ReportTitle) {
+            $brandedTitleHtml = [System.Web.HttpUtility]::HtmlEncode([string]$Branding.ReportTitle)
+        }
+        if ($Branding.LogoDataUri) {
+            $brandedTitleHtml = "<img class='branded-logo' src='$($Branding.LogoDataUri)' alt='logo' /> $brandedTitleHtml"
+        }
+        if ($Branding.OrganizationName) {
+            $brandedOrgHtml = "<p><strong>Organization:</strong> $([System.Web.HttpUtility]::HtmlEncode([string]$Branding.OrganizationName))</p>"
+        }
+        if ($Branding.PrimaryColor) {
+            $headerStyleAttr = " style=`"--brand-primary: $($Branding.PrimaryColor); background: $($Branding.PrimaryColor) !important;`""
+        }
+    }
+
+    # PR 3: integrity badge — SHA-256 of the canonical findings JSON, written to
+    # a sibling .findings.json so Test-EntraChecksReportIntegrity can verify.
+    $integrityBlock = ""
+    if ($IncludeIntegrityBadge) {
+        $integrityBlock = New-IntegrityBlock -EnhancedFindings $enhancedFindings -OutputPath $OutputPath
+    }
+
     # Generate HTML sections
     $htmlHead = Get-HTMLHead
     $htmlNav = Get-HTMLNavigation
-    $htmlExecutive = Get-ExecutiveDashboard -RiskSummary $riskSummary -ComplianceGap $complianceGap -TenantInfo $TenantInfo -DefenderCompliance $DefenderCompliance
+    $htmlDigest = if ($execDigest) { Format-ExecutiveDigest -Digest $execDigest -TenantInfo $TenantInfo } else { "" }
+    $htmlExecutive = Get-ExecutiveDashboard -RiskSummary $riskSummary -ComplianceGap $complianceGap -TenantInfo $TenantInfo -DefenderCompliance $DefenderCompliance -FindingsDelta $findingsDelta
     $htmlQuickWins = Get-QuickWinsSection -QuickWins $quickWins
     $htmlPriority = Get-PrioritySection -PrioritizedFindings $prioritized
     $htmlCompliance = Get-ComplianceSection -Findings $enhancedFindings -ComplianceGap $complianceGap -DefenderCompliance $DefenderCompliance
-    $htmlDetailed = Get-DetailedFindingsSection -Findings $enhancedFindings
+    $htmlSecureScore = Get-SecureScoreSection -SecureScore $SecureScore
+    $htmlAzurePolicy = Get-AzurePolicySection -AzurePolicy $AzurePolicy
+    $htmlPurview = Get-PurviewSection -PurviewCompliance $PurviewCompliance
+    $htmlDetailed = Get-DetailedFindingsSection -Findings $enhancedFindings -LowConfidenceCheckNames $effectiveLowConfidence
     $htmlJavaScript = Get-HTMLJavaScript
 
     # Assemble complete HTML
@@ -124,9 +238,10 @@ function New-EnhancedHTMLReport {
 <body>
     $htmlNav
     <div class="container">
-        <header class="report-header">
-            <h1>&#128274; Microsoft Entra ID Security Assessment</h1>
+        <header class="report-header branded-header"$headerStyleAttr>
+            <h1>$brandedTitleHtml</h1>
             <div class="tenant-info">
+                $brandedOrgHtml
                 <p><strong>Tenant:</strong> $($TenantInfo.TenantName)</p>
                 <p><strong>Tenant ID:</strong> $($TenantInfo.TenantId)</p>
                 <p><strong>Report Generated:</strong> $(Get-Date -Format "MMMM dd, yyyy 'at' HH:mm:ss")</p>
@@ -134,11 +249,17 @@ function New-EnhancedHTMLReport {
             </div>
         </header>
 
+        $lowConfidenceBanner
+        $htmlDigest
         $htmlExecutive
         $htmlQuickWins
         $htmlPriority
         $htmlCompliance
+        $htmlSecureScore
+        $htmlAzurePolicy
+        $htmlPurview
         $htmlDetailed
+        $integrityBlock
     </div>
     $htmlJavaScript
 </body>
@@ -857,6 +978,59 @@ function Get-HTMLHead {
         font-style: italic;
         margin-top: 10px;
     }
+
+    /* PR 3 backports: exec digest + verdict */
+    .exec-digest {
+        background: white;
+        padding: 24px;
+        border-radius: 8px;
+        margin-bottom: 30px;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+        border-left: 6px solid #0078d4;
+    }
+    .exec-digest h2 { margin-bottom: 8px; }
+    .exec-digest .verdict-line { font-size: 1.05em; margin: 8px 0 16px 0; }
+    .exec-verdict { display: inline-block; padding: 3px 12px; border-radius: 3px; font-weight: 700; font-size: 0.95em; margin-left: 6px; }
+    .verdict-strong { background: #def4dc; color: #1f6f1a; }
+    .verdict-minor { background: #fff4d4; color: #7b5e00; }
+    .verdict-gaps { background: #fadbd8; color: #8a1f1a; }
+    .verdict-insufficient { background: #e1dfdd; color: #605e5c; }
+    .exec-digest .top-list { margin-top: 8px; }
+    .exec-digest .top-list li { margin: 3px 0 3px 20px; }
+
+    /* Low-confidence callouts */
+    .low-confidence-banner { background: #fff8e1; border-left: 6px solid #d89b00; padding: 12px 16px; margin: 16px 0; border-radius: 4px; font-size: 0.9em; }
+    .low-confidence-banner strong { color: #7b5e00; }
+    .low-confidence-tag { display: inline-block; background: #fff8e1; color: #7b5e00; padding: 1px 6px; border-radius: 3px; font-size: 0.75em; margin-left: 6px; }
+
+    /* Per-finding deep links */
+    .finding-anchor { font-size: 0.75em; opacity: 0.4; margin-left: 8px; cursor: pointer; text-decoration: none; }
+    .finding-anchor:hover { opacity: 1; }
+    .finding-anchor.copied { opacity: 1; color: #107c10; }
+
+    /* Integrity footer */
+    .integrity-footer { margin-top: 40px; padding: 16px 24px; background: #f8f8f8; border-radius: 4px; font-size: 0.85em; color: #605e5c; }
+    .integrity-footer .badge { display: inline-block; padding: 2px 8px; background: #def4dc; color: #1f6f1a; border-radius: 3px; font-weight: 600; margin-right: 6px; }
+    .integrity-footer .hash { font-family: 'Cascadia Code', Consolas, monospace; word-break: break-all; }
+
+    /* White-label branding override hooks */
+    .branded-header { background: var(--brand-primary, linear-gradient(135deg, #0078d4 0%, #0053a6 100%)) !important; }
+    .branded-logo { max-height: 48px; vertical-align: middle; margin-right: 14px; }
+
+    /* Print stylesheet */
+    @media print {
+        body { background: white; color: black; }
+        .nav-bar, .controls-bar, .finding-anchor { display: none; }
+        .container { max-width: none; padding: 0; }
+        .report-header { background: white !important; color: black !important; box-shadow: none; border: 1px solid #d0d5dc; page-break-after: avoid; }
+        .report-header h1 { color: black; }
+        .tenant-info p { background: white; color: black; border: 1px solid #d0d5dc; }
+        section, .exec-digest, .metric-card { break-inside: avoid; page-break-inside: avoid; box-shadow: none; }
+        .low-confidence-banner { break-inside: avoid; }
+        .finding-row { break-inside: avoid; page-break-inside: avoid; }
+        a[href^="#"] { text-decoration: none; color: inherit; }
+        * { -webkit-print-color-adjust: exact !important; color-adjust: exact !important; print-color-adjust: exact !important; }
+    }
 </style>
 '@
 }
@@ -869,10 +1043,564 @@ function Get-HTMLNavigation {
         <li><a href="#quick-wins">Quick Wins</a></li>
         <li><a href="#priority">Priority Findings</a></li>
         <li><a href="#compliance">Compliance Mapping</a></li>
+        <li><a href="#secure-score">Secure Score</a></li>
+        <li><a href="#azure-policy">Azure Policy</a></li>
+        <li><a href="#purview">Purview</a></li>
         <li><a href="#detailed">Detailed Findings</a></li>
     </ul>
 </nav>
 '@
+}
+
+function Get-NotCollectedPlaceholder {
+    <#
+    .SYNOPSIS
+        Standard "data not collected" callout for unified-report sections.
+    #>
+    param(
+        [Parameter(Mandatory)] [string]$SectionName,
+        [Parameter(Mandatory)] [string]$Hint
+    )
+    return @"
+    <div class="compliance-fallback-note" style="padding: 16px; background: #f5f5f5; border-left: 4px solid #b0b7c3; border-radius: 4px;">
+        <p><strong>Not collected:</strong> ${SectionName} data was not provided to this report.</p>
+        <p>$Hint</p>
+    </div>
+"@
+}
+
+function Get-SecureScoreSection {
+    <#
+    .SYNOPSIS
+        Renders the Secure Score section of the unified report.
+    .DESCRIPTION
+        Accepts the hashtable shape returned by Get-SecureScore. Optionally also
+        renders the top improvement actions when SecureScore.ImprovementActions
+        is present (caller can attach this in advance).
+    #>
+    param([object]$SecureScore)
+
+    $hint = 'To populate this section, run the orchestrator with Secure Score collection enabled (menu [4] or pass a SecureScore object via -SecureScore on direct calls).'
+    if (-not $SecureScore) {
+        return @"
+<section class="secure-score" id="secure-score">
+    <h2 class="section-title">&#127919; Microsoft Secure Score</h2>
+    $(Get-NotCollectedPlaceholder -SectionName 'Microsoft Secure Score' -Hint $hint)
+</section>
+"@
+    }
+
+    $score = if ($null -ne $SecureScore.CurrentScore) { $SecureScore.CurrentScore } else { 0 }
+    $maxScore = if ($null -ne $SecureScore.MaxScore) { $SecureScore.MaxScore } else { 0 }
+    $pct = if ($null -ne $SecureScore.ScorePercent) {
+        $SecureScore.ScorePercent
+    }
+    elseif ($maxScore -gt 0) {
+        [math]::Round(($score / $maxScore) * 100, 1)
+    }
+    else { 0 }
+    $color = if ($pct -ge 80) { 'low' } elseif ($pct -ge 60) { 'medium' } else { 'critical' }
+
+    # Improvement actions are attached by the caller as an .ImprovementActions
+    # member. Works for both hashtables (member access falls back to lookup)
+    # and PSCustomObjects.
+    $actionsRows = ""
+    if ($null -ne $SecureScore.ImprovementActions) {
+        $top10 = $SecureScore.ImprovementActions | Select-Object -First 10
+        foreach ($a in $top10) {
+            $linkCell = if ($a.ActionUrl) {
+                "<a href='$([System.Net.WebUtility]::HtmlEncode($a.ActionUrl))' target='_blank' rel='noopener'>Open in portal</a>"
+            }
+            else { '&mdash;' }
+            $title = [System.Net.WebUtility]::HtmlEncode([string]$a.Title)
+            $cat = [System.Net.WebUtility]::HtmlEncode([string]$a.Category)
+            $status = [System.Net.WebUtility]::HtmlEncode([string]$a.ImplementationStatus)
+            $cost = [System.Net.WebUtility]::HtmlEncode([string]$a.ImplementationCost)
+            $impact = [System.Net.WebUtility]::HtmlEncode([string]$a.UserImpact)
+            $actionsRows += "<tr><td>$title</td><td>$cat</td><td>$status</td><td>+$($a.PotentialImprovement)</td><td>$cost</td><td>$impact</td><td>$linkCell</td></tr>`n"
+        }
+    }
+    $actionsTable = if ($actionsRows) {
+        @"
+    <h3 style="margin-top: 24px;">Top improvement actions (by priority)</h3>
+    <table>
+        <thead><tr><th>Action</th><th>Category</th><th>Status</th><th>Potential</th><th>Cost</th><th>User impact</th><th>Portal</th></tr></thead>
+        <tbody>$actionsRows</tbody>
+    </table>
+"@
+    }
+    else {
+        '<p class="compliance-fallback-note">Improvement actions were not provided. Pass <code>Get-SecureScoreImprovementActions</code> output on a <code>.ImprovementActions</code> property to populate this table.</p>'
+    }
+
+    return @"
+<section class="secure-score" id="secure-score">
+    <h2 class="section-title">&#127919; Microsoft Secure Score</h2>
+    <div class="dashboard-grid">
+        <div class="metric-card $color">
+            <div class="metric-label">Current Score</div>
+            <div class="metric-value">$score / $maxScore</div>
+            <div>$pct% of attainable</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-label">Active Users</div>
+            <div class="metric-value">$($SecureScore.ActiveUserCount)</div>
+            <div>of $($SecureScore.LicensedUserCount) licensed</div>
+        </div>
+    </div>
+    $actionsTable
+</section>
+"@
+}
+
+function Get-AzurePolicySection {
+    <#
+    .SYNOPSIS
+        Renders the Azure Policy compliance section of the unified report.
+    .DESCRIPTION
+        Accepts the hashtable shape returned by Get-AzurePolicyComplianceAssessment.
+    #>
+    param([object]$AzurePolicy)
+
+    $hint = 'To populate this section, run the orchestrator with Azure Policy collection enabled (menu [6] or pass an AzurePolicy object via -AzurePolicy).'
+    if (-not $AzurePolicy) {
+        return @"
+<section class="azure-policy" id="azure-policy">
+    <h2 class="section-title">&#9889; Azure Policy Compliance</h2>
+    $(Get-NotCollectedPlaceholder -SectionName 'Azure Policy' -Hint $hint)
+</section>
+"@
+    }
+
+    $summary = $AzurePolicy.Summary
+    $totalSubs = if ($summary.TotalSubscriptions) { $summary.TotalSubscriptions } else { 0 }
+    $nonCompliantPolicies = if ($summary.NonCompliantPolicies) { $summary.NonCompliantPolicies } else { 0 }
+    $nonCompliantResources = if ($summary.NonCompliantResources) { $summary.NonCompliantResources } else { 0 }
+    $totalResources = if ($summary.TotalResources) { $summary.TotalResources } else { 0 }
+
+    $compliancePct = if ($totalResources -gt 0) {
+        [math]::Round((($totalResources - $nonCompliantResources) / $totalResources) * 100, 1)
+    }
+    else { 0 }
+    $color = if ($compliancePct -ge 80) { 'low' } elseif ($compliancePct -ge 60) { 'medium' } else { 'critical' }
+
+    $initiativeRows = ""
+    if ($AzurePolicy.Initiatives -and $AzurePolicy.Initiatives.Keys.Count -gt 0) {
+        foreach ($key in ($AzurePolicy.Initiatives.Keys | Sort-Object)) {
+            $init = $AzurePolicy.Initiatives[$key]
+            $name = [System.Net.WebUtility]::HtmlEncode([string]$init.DisplayName)
+            $framework = [System.Net.WebUtility]::HtmlEncode([string]$init.Framework)
+            $subCount = if ($init.Subscriptions) { @($init.Subscriptions).Count } else { 0 }
+            $initiativeRows += "<tr><td>$name</td><td>$framework</td><td>$subCount</td></tr>`n"
+        }
+    }
+    $initiativesTable = if ($initiativeRows) {
+        @"
+    <h3 style="margin-top: 24px;">Built-in initiatives in scope</h3>
+    <table>
+        <thead><tr><th>Initiative</th><th>Framework</th><th>Subscriptions</th></tr></thead>
+        <tbody>$initiativeRows</tbody>
+    </table>
+"@
+    }
+    else {
+        '<p class="compliance-fallback-note">No regulatory initiatives detected in the assigned policy set.</p>'
+    }
+
+    return @"
+<section class="azure-policy" id="azure-policy">
+    <h2 class="section-title">&#9889; Azure Policy Compliance</h2>
+    <div class="dashboard-grid">
+        <div class="metric-card $color">
+            <div class="metric-label">Resource Compliance</div>
+            <div class="metric-value">$compliancePct%</div>
+            <div>$($totalResources - $nonCompliantResources) of $totalResources resources</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-label">Subscriptions</div>
+            <div class="metric-value">$totalSubs</div>
+            <div>in scope</div>
+        </div>
+        <div class="metric-card $(if ($nonCompliantPolicies -gt 0) { 'high' } else { '' })">
+            <div class="metric-label">Non-compliant policies</div>
+            <div class="metric-value">$nonCompliantPolicies</div>
+            <div>across all subscriptions</div>
+        </div>
+    </div>
+    $initiativesTable
+</section>
+"@
+}
+
+function Get-PurviewSection {
+    <#
+    .SYNOPSIS
+        Renders the Purview Compliance Manager section of the unified report.
+    #>
+    param([object]$PurviewCompliance)
+
+    $hint = 'To populate this section, run the orchestrator with Purview collection enabled (menu [7] or pass a PurviewCompliance object via -PurviewCompliance).'
+    if (-not $PurviewCompliance) {
+        return @"
+<section class="purview" id="purview">
+    <h2 class="section-title">&#128274; Purview Compliance Manager</h2>
+    $(Get-NotCollectedPlaceholder -SectionName 'Purview Compliance Manager' -Hint $hint)
+</section>
+"@
+    }
+
+    $summary = $PurviewCompliance.Summary
+    $cmAvailable = $summary.ComplianceManagerAvailable
+    $cmScore = $summary.ComplianceScore
+    $assessments = if ($summary.TotalAssessments) { $summary.TotalAssessments } else { 0 }
+    $actions = if ($summary.TotalActions) { $summary.TotalActions } else { 0 }
+    $completedActions = if ($summary.CompletedActions) { $summary.CompletedActions } else { 0 }
+    $dlpCount = if ($summary.DLPPoliciesCount) { $summary.DLPPoliciesCount } else { 0 }
+    $labelCount = if ($summary.SensitivityLabelsCount) { $summary.SensitivityLabelsCount } else { 0 }
+    $retentionCount = if ($summary.RetentionPoliciesCount) { $summary.RetentionPoliciesCount } else { 0 }
+
+    $cmCard = if ($cmAvailable -and $null -ne $cmScore) {
+        $color = if ($cmScore -ge 80) { 'low' } elseif ($cmScore -ge 60) { 'medium' } else { 'critical' }
+        @"
+        <div class="metric-card $color">
+            <div class="metric-label">Compliance Manager score</div>
+            <div class="metric-value">$cmScore%</div>
+            <div>$completedActions of $actions actions complete</div>
+        </div>
+"@
+    }
+    else {
+        @"
+        <div class="metric-card">
+            <div class="metric-label">Compliance Manager</div>
+            <div class="metric-value">N/A</div>
+            <div>Not licensed or no data</div>
+        </div>
+"@
+    }
+
+    return @"
+<section class="purview" id="purview">
+    <h2 class="section-title">&#128274; Purview Compliance Manager</h2>
+    <div class="dashboard-grid">
+        $cmCard
+        <div class="metric-card">
+            <div class="metric-label">Assessments</div>
+            <div class="metric-value">$assessments</div>
+            <div>in scope</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-label">DLP Policies</div>
+            <div class="metric-value">$dlpCount</div>
+            <div>in tenant</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-label">Sensitivity labels</div>
+            <div class="metric-value">$labelCount</div>
+            <div>published</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-label">Retention policies</div>
+            <div class="metric-value">$retentionCount</div>
+            <div>configured</div>
+        </div>
+    </div>
+</section>
+"@
+}
+
+function Get-FindingsDelta {
+    <#
+    .SYNOPSIS
+        Compares two finding sets keyed on Description+Object.
+    .DESCRIPTION
+        Returns Resolved / New / Persistent counts. Used by the executive
+        dashboard's "Since last assessment" card row when -PreviousAssessment
+        is supplied to New-EnhancedHTMLReport. Empty / null inputs are valid
+        (e.g., a first-ever run has no previous findings).
+    #>
+    param(
+        [AllowNull()] [AllowEmptyCollection()] [Parameter(Mandatory)] [object[]]$Current,
+        [AllowNull()] [AllowEmptyCollection()] [Parameter(Mandatory)] [object[]]$Previous
+    )
+
+    $currentKeys = @{}
+    if ($Current) {
+        foreach ($f in $Current) {
+            $currentKeys["$($f.Description)|$($f.Object)"] = $true
+        }
+    }
+    $previousKeys = @{}
+    if ($Previous) {
+        foreach ($f in $Previous) {
+            $previousKeys["$($f.Description)|$($f.Object)"] = $true
+        }
+    }
+
+    $resolved = 0
+    foreach ($k in $previousKeys.Keys) {
+        if (-not $currentKeys.ContainsKey($k)) { $resolved++ }
+    }
+    $newCount = 0
+    $persistent = 0
+    foreach ($k in $currentKeys.Keys) {
+        if ($previousKeys.ContainsKey($k)) { $persistent++ } else { $newCount++ }
+    }
+
+    # Individual assignments to avoid PSAlignAssignmentStatement / PSUseConsistentWhitespace conflict.
+    $result = @{}
+    $result['Resolved'] = $resolved
+    $result['New'] = $newCount
+    $result['Persistent'] = $persistent
+    $result['Total'] = $Current.Count
+    return $result
+}
+
+function Get-EntraChecksExecutiveDigest {
+    <#
+    .SYNOPSIS
+        Computes a one-paragraph posture verdict for the unified report.
+    .DESCRIPTION
+        Mirrors the Get-SOC2ExecutiveDigest shape but operates on enhanced
+        EntraChecks findings (which already carry RiskLevel + RiskScore from
+        Add-RiskScoring). Returns a PSCustomObject with the verdict, headline
+        counts, top failing checks, and a delta line if FindingsDelta was
+        supplied.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)] [array]$Findings,
+        [Parameter(Mandatory)] [object]$RiskSummary,
+        [Parameter(Mandatory)] [object]$ComplianceGap,
+        [object]$FindingsDelta
+    )
+
+    $crit = if ($null -ne $RiskSummary.CriticalCount) { [int]$RiskSummary.CriticalCount } else { 0 }
+    $high = if ($null -ne $RiskSummary.HighCount) { [int]$RiskSummary.HighCount } else { 0 }
+    $quickWins = if ($null -ne $RiskSummary.QuickWinsCount) { [int]$RiskSummary.QuickWinsCount } else { 0 }
+    $total = $Findings.Count
+
+    $verdict = 'INSUFFICIENT DATA'
+    $verdictClass = 'verdict-insufficient'
+    if ($total -gt 0) {
+        if ($crit -eq 0 -and $high -eq 0) {
+            $verdict = 'STRONG'
+            $verdictClass = 'verdict-strong'
+        }
+        elseif ($crit -eq 0 -and $high -le 5) {
+            $verdict = 'MINOR DEFICIENCIES'
+            $verdictClass = 'verdict-minor'
+        }
+        else {
+            $verdict = 'GAPS IDENTIFIED'
+            $verdictClass = 'verdict-gaps'
+        }
+    }
+
+    # Top 3 highest-risk findings (by RiskScore).
+    $topFindings = @($Findings |
+            Where-Object { $_.Status -in @('FAIL', 'WARNING') } |
+            Sort-Object { [int]($_.RiskScore) } -Descending |
+            Select-Object -First 3)
+
+    # Frameworks with the most affected controls.
+    $frameworkGaps = @()
+    if ($ComplianceGap -and $ComplianceGap.FrameworkGaps) {
+        foreach ($key in @('CIS', 'NIST', 'SOC2', 'PCIDSS')) {
+            $g = $ComplianceGap.FrameworkGaps[$key]
+            if ($g -and $g.ControlsAffected -gt 0) {
+                $frameworkGaps += [pscustomobject]@{ Framework = $key; ControlsAffected = $g.ControlsAffected }
+            }
+        }
+        $frameworkGaps = @($frameworkGaps | Sort-Object ControlsAffected -Descending | Select-Object -First 3)
+    }
+
+    return [pscustomobject]@{
+        Verdict = $verdict
+        VerdictClass = $verdictClass
+        TotalFindings = $total
+        CriticalCount = $crit
+        HighCount = $high
+        QuickWinsCount = $quickWins
+        TopFindings = $topFindings
+        FrameworkGaps = $frameworkGaps
+        FindingsDelta = $FindingsDelta
+    }
+}
+
+function Format-ExecutiveDigest {
+    <#
+    .SYNOPSIS
+        Renders the Get-EntraChecksExecutiveDigest output as the cover digest
+        block at the top of the unified report.
+    #>
+    param(
+        [Parameter(Mandatory)] [object]$Digest,
+        [Parameter(Mandatory)] [object]$TenantInfo
+    )
+
+    $verdictHtml = "<span class='exec-verdict $($Digest.VerdictClass)'>$($Digest.Verdict)</span>"
+
+    $deltaLine = ""
+    if ($Digest.FindingsDelta) {
+        $d = $Digest.FindingsDelta
+        $deltaLine = "<p><strong>Since last assessment:</strong> $($d.Resolved) resolved &middot; $($d.New) new &middot; $($d.Persistent) persistent.</p>"
+    }
+
+    $topRows = ""
+    if ($Digest.TopFindings -and $Digest.TopFindings.Count -gt 0) {
+        $topRows = "<p><strong>Top findings (by risk score):</strong></p><ol class='top-list'>"
+        foreach ($f in $Digest.TopFindings) {
+            $desc = [System.Web.HttpUtility]::HtmlEncode([string]$f.Description)
+            $obj = [System.Web.HttpUtility]::HtmlEncode([string]$f.Object)
+            $topRows += "<li>${desc} <em>(${obj})</em> &mdash; risk $($f.RiskScore)</li>"
+        }
+        $topRows += "</ol>"
+    }
+
+    $gapLine = ""
+    if ($Digest.FrameworkGaps -and $Digest.FrameworkGaps.Count -gt 0) {
+        $parts = $Digest.FrameworkGaps | ForEach-Object { "$($_.Framework) ($($_.ControlsAffected))" }
+        $gapLine = "<p><strong>Compliance gaps:</strong> $($parts -join ' &middot; ')</p>"
+    }
+
+    return @"
+<section class="exec-digest" id="exec-digest">
+    <h2>&#128202; Executive Digest</h2>
+    <p class="verdict-line"><strong>Posture:</strong>$verdictHtml &mdash; $($Digest.TotalFindings) findings total ($($Digest.CriticalCount) critical, $($Digest.HighCount) high). $($Digest.QuickWinsCount) quick wins available.</p>
+    $deltaLine
+    $topRows
+    $gapLine
+</section>
+"@
+}
+
+function New-IntegrityBlock {
+    <#
+    .SYNOPSIS
+        Computes a SHA-256 hash of the canonical findings JSON and writes a
+        sibling .findings.json file. Returns the HTML footer block displaying
+        the hash and verification command.
+    .DESCRIPTION
+        The sidecar is the verifiable artifact; the HTML carries the hash for
+        display only. Test-EntraChecksReportIntegrity reads both and confirms
+        they agree. Intentionally tolerant: if writing the sidecar fails
+        (read-only path, etc.) the in-HTML hash is still emitted.
+    #>
+    param(
+        [Parameter(Mandatory)] [array]$EnhancedFindings,
+        [Parameter(Mandatory)] [string]$OutputPath
+    )
+
+    # Canonicalize so identical inputs always hash identically — sort keys via
+    # ConvertTo-Json -Depth, then compute hash on UTF-8 bytes.
+    try {
+        $json = $EnhancedFindings | ConvertTo-Json -Depth 8 -Compress
+    }
+    catch {
+        return ""
+    }
+
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+        $hashBytes = $sha.ComputeHash($bytes)
+        $hashHex = [BitConverter]::ToString($hashBytes).Replace('-', '').ToLowerInvariant()
+    }
+    finally { $sha.Dispose() }
+
+    # Write sidecar JSON. Use WriteAllText (no BOM, no trailing newline) so the
+    # sidecar bytes round-trip exactly through Test-EntraChecksReportIntegrity.
+    # Failure to write is non-fatal — the badge still shows in the HTML.
+    $sidecarPath = "$OutputPath.findings.json"
+    try {
+        [System.IO.File]::WriteAllText($sidecarPath, $json, [System.Text.UTF8Encoding]::new($false))
+    }
+    catch {
+        Write-Verbose "Could not write integrity sidecar at ${sidecarPath}: $($_.Exception.Message)"
+    }
+
+    $sidecarLeaf = Split-Path -Leaf $sidecarPath
+    return @"
+<footer class="integrity-footer" id="integrity">
+    <span class="badge">Integrity-verifiable</span>
+    SHA-256 of findings JSON (sidecar: <code>$([System.Web.HttpUtility]::HtmlEncode($sidecarLeaf))</code>):
+    <span class="hash">$hashHex</span>
+    <p style="margin-top: 8px;">Verify with: <code>Test-EntraChecksReportIntegrity -ReportPath '$([System.Web.HttpUtility]::HtmlEncode((Split-Path -Leaf $OutputPath)))'</code></p>
+</footer>
+"@
+}
+
+function Test-EntraChecksReportIntegrity {
+    <#
+    .SYNOPSIS
+        Verifies that a unified HTML report's findings JSON sidecar still hashes
+        to the value baked into the report footer.
+    .DESCRIPTION
+        Reads <ReportPath>.findings.json, recomputes its SHA-256, and compares
+        against the hash recorded in the report's integrity footer. Returns a
+        PSCustomObject with .IsValid + diagnostic fields.
+    .PARAMETER ReportPath
+        Path to the unified HTML report. The companion sidecar is expected at
+        <ReportPath>.findings.json.
+    .EXAMPLE
+        Test-EntraChecksReportIntegrity -ReportPath .\Output\report.html
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)] [string]$ReportPath
+    )
+
+    $result = [ordered]@{
+        IsValid = $false
+        ReportPath = $ReportPath
+        SidecarPath = "$ReportPath.findings.json"
+        ExpectedHash = $null
+        ActualHash = $null
+        Reason = $null
+    }
+
+    if (-not (Test-Path -LiteralPath $ReportPath)) {
+        $result['Reason'] = "Report not found: $ReportPath"
+        return [pscustomobject]$result
+    }
+    if (-not (Test-Path -LiteralPath $result['SidecarPath'])) {
+        $result['Reason'] = "Sidecar not found: $($result['SidecarPath']) (was the report generated with -IncludeIntegrityBadge:`$false?)"
+        return [pscustomobject]$result
+    }
+
+    $html = Get-Content -LiteralPath $ReportPath -Raw
+    $match = [regex]::Match($html, '<span class="hash">([a-f0-9]{64})</span>')
+    if (-not $match.Success) {
+        $result['Reason'] = "No integrity hash found in report HTML."
+        return [pscustomobject]$result
+    }
+    $result['ExpectedHash'] = $match.Groups[1].Value
+
+    # Read raw bytes (not via Get-Content -Raw, which can mutate line endings).
+    $bytes = [System.IO.File]::ReadAllBytes($result['SidecarPath'])
+    # Strip UTF-8 BOM if present, so older sidecars written via Set-Content
+    # also verify cleanly.
+    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+        $bytes = $bytes[3..($bytes.Length - 1)]
+    }
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hashBytes = $sha.ComputeHash($bytes)
+        $result['ActualHash'] = [BitConverter]::ToString($hashBytes).Replace('-', '').ToLowerInvariant()
+    }
+    finally { $sha.Dispose() }
+
+    if ($result['ExpectedHash'] -eq $result['ActualHash']) {
+        $result['IsValid'] = $true
+        $result['Reason'] = 'Sidecar matches report-embedded hash.'
+    }
+    else {
+        $result['Reason'] = 'Sidecar hash does not match report-embedded hash — file may have been modified.'
+    }
+    return [pscustomobject]$result
 }
 
 function Get-ExecutiveDashboard {
@@ -886,7 +1614,9 @@ function Get-ExecutiveDashboard {
         [Parameter(Mandatory)]
         [object]$TenantInfo,
 
-        [object]$DefenderCompliance
+        [object]$DefenderCompliance,
+
+        [object]$FindingsDelta
     )
 
     # Build compliance impact section based on data source
@@ -946,6 +1676,37 @@ function Get-ExecutiveDashboard {
 "@
     }
 
+    # Optional "Since last assessment" row — only rendered when caller supplied
+    # a previous snapshot via -PreviousAssessment.
+    $deltaRow = ""
+    if ($FindingsDelta) {
+        $resolvedColor = if ($FindingsDelta.Resolved -gt 0) { 'low' } else { '' }
+        $newColor = if ($FindingsDelta.New -gt 0) { 'high' } else { '' }
+        $deltaRow = @"
+
+    <h3 style="margin-top: 30px;">&#128260; Since last assessment</h3>
+    <div class="dashboard-grid">
+        <div class="metric-card $resolvedColor">
+            <div class="metric-label">Resolved</div>
+            <div class="metric-value">$($FindingsDelta.Resolved)</div>
+            <div>Findings closed since last run</div>
+        </div>
+
+        <div class="metric-card $newColor">
+            <div class="metric-label">New</div>
+            <div class="metric-value">$($FindingsDelta.New)</div>
+            <div>Findings introduced since last run</div>
+        </div>
+
+        <div class="metric-card">
+            <div class="metric-label">Persistent</div>
+            <div class="metric-value">$($FindingsDelta.Persistent)</div>
+            <div>Carried over from prior run</div>
+        </div>
+    </div>
+"@
+    }
+
     return @"
 <section class="executive-dashboard" id="executive">
     <h2 class="section-title">&#128202; Executive Summary</h2>
@@ -975,6 +1736,7 @@ function Get-ExecutiveDashboard {
             <div>High impact, low effort</div>
         </div>
     </div>
+    $deltaRow
 
     <div style="margin-top: 30px;">
         <h3>&#128200; Risk Analysis</h3>
@@ -995,11 +1757,14 @@ $complianceCards
 
 function Get-QuickWinsSection {
     param(
+        # Tolerate null/empty (pre-existing — reports with no FAIL findings end
+        # up with $null after the Where-Object filter in Get-QuickWins).
+        [AllowNull()] [AllowEmptyCollection()]
         [Parameter(Mandatory)]
         [array]$QuickWins
     )
 
-    if ($QuickWins.Count -eq 0) {
+    if (-not $QuickWins -or $QuickWins.Count -eq 0) {
         return @"
 <section class="section" id="quick-wins">
     <h2 class="section-title">&#9889; Quick Wins</h2>
@@ -1038,11 +1803,12 @@ function Get-QuickWinsSection {
 
 function Get-PrioritySection {
     param(
+        [AllowNull()] [AllowEmptyCollection()]
         [Parameter(Mandatory)]
         [array]$PrioritizedFindings
     )
 
-    $topFindings = $PrioritizedFindings | Select-Object -First 15
+    $topFindings = if ($PrioritizedFindings) { $PrioritizedFindings | Select-Object -First 15 } else { @() }
     $tableRows = ""
 
     $rank = 1
@@ -1321,12 +2087,15 @@ function Get-ComplianceSectionFallback {
 function Get-DetailedFindingsSection {
     param(
         [Parameter(Mandatory)]
-        [array]$Findings
+        [array]$Findings,
+
+        # PR 3: per-finding anchor + tag.
+        [string[]]$LowConfidenceCheckNames
     )
 
     # Helper function to generate a single finding card with data attributes for filtering
     function Get-FindingCard {
-        param($finding)
+        param($finding, $index, $lowConfList)
 
         $riskLevel = if ($finding.RiskLevel) { $finding.RiskLevel } else { 'Info' }
         $riskLower = $riskLevel.ToLower()
@@ -1338,6 +2107,27 @@ function Get-DetailedFindingsSection {
         $descSafe = if ($finding.Description) { $finding.Description -replace '<', '&lt;' -replace '>', '&gt;' } else { 'N/A' }
         $objSafe = if ($finding.Object) { $finding.Object -replace '<', '&lt;' -replace '>', '&gt;' } else { 'N/A' }
         $remSafe = if ($finding.Remediation) { $finding.Remediation -replace '<', '&lt;' -replace '>', '&gt;' } else { '' }
+
+        # PR 3: stable per-finding anchor id from a hash of description+object.
+        # MD5 is fine here — we're not doing crypto, just generating a short id.
+        $anchorBasis = "$($finding.Description)|$($finding.Object)"
+        $md5 = [System.Security.Cryptography.MD5]::Create()
+        try {
+            $hashBytes = $md5.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($anchorBasis))
+            $anchorHash = [BitConverter]::ToString($hashBytes).Replace('-', '').Substring(0, 10).ToLowerInvariant()
+        }
+        finally { $md5.Dispose() }
+        $anchorId = "finding-$anchorHash"
+
+        # PR 3: low-confidence tag (rendered next to the title when applicable).
+        $lcTag = ""
+        if ($finding.CheckName -and $lowConfList -and ($lowConfList -contains $finding.CheckName)) {
+            $lcTag = " <span class='low-confidence-tag' title='Fixture-verified only — see -LowConfidenceCheckNames in New-EnhancedHTMLReport'>fixture-verified</span>"
+        }
+
+        # PR 3: per-finding deep-link affordance ("link" emoji that copies the
+        # full URL with #anchor to the clipboard via JS).
+        $anchorLink = "<a href='#$anchorId' class='finding-anchor' onclick='copyFindingLink(event, this)' title='Copy link to this finding'>&#128279;</a>"
 
         $complianceRef = if ($finding.ComplianceReference) {
             "<p><strong>Compliance Frameworks:</strong> $($finding.ComplianceReference)</p>"
@@ -1366,11 +2156,11 @@ function Get-DetailedFindingsSection {
         }
 
         return @"
-<div class="finding-card" data-risk="$riskLower" data-status="$statusLower" data-category="$categoryLower">
+<div class="finding-card finding-row" id="$anchorId" data-risk="$riskLower" data-status="$statusLower" data-category="$categoryLower">
     <div class="finding-header" onclick="toggleFinding(this)">
         <div>
             <span class="risk-badge $riskLower">$riskLevel</span>
-            <span class="finding-title">$descSafe</span>
+            <span class="finding-title">$descSafe</span>$lcTag$anchorLink
         </div>
         <span>&#9660;</span>
     </div>
@@ -1440,8 +2230,10 @@ function Get-DetailedFindingsSection {
             $stFindings = $stFindings | Sort-Object { if ($_.RiskScore) { $_.RiskScore } else { 0 } } -Descending
 
             $findingCards = ""
+            $cardIndex = 0
             foreach ($f in $stFindings) {
-                $findingCards += Get-FindingCard -finding $f
+                $findingCards += Get-FindingCard -finding $f -index $cardIndex -lowConfList $LowConfidenceCheckNames
+                $cardIndex++
             }
 
             $statusAccordions += @"
@@ -1517,6 +2309,27 @@ $categoryOptions
 function Get-HTMLJavaScript {
     return @'
 <script>
+    // PR 3 backport: per-finding deep-link copy. Falls back to selection-based
+    // copy on browsers where navigator.clipboard is unavailable (e.g., file://
+    // in older Chromium without secure-context exemption).
+    function copyFindingLink(evt, anchorEl) {
+        evt.preventDefault();
+        evt.stopPropagation();
+        var url = window.location.href.split('#')[0] + anchorEl.getAttribute('href');
+        var done = function () {
+            anchorEl.classList.add('copied');
+            setTimeout(function () { anchorEl.classList.remove('copied'); }, 1500);
+        };
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(url).then(done, function () {
+                window.prompt('Copy this link:', url);
+            });
+        } else {
+            window.prompt('Copy this link:', url);
+            done();
+        }
+    }
+
     function toggleComplianceDetail(btn) {
         var table = btn.nextElementSibling;
         if (table && table.classList.contains('compliance-detail-table')) {
@@ -1666,7 +2479,8 @@ function Get-HTMLJavaScript {
 #region Export Module Members
 
 Export-ModuleMember -Function @(
-    'New-EnhancedHTMLReport'
+    'New-EnhancedHTMLReport',
+    'Test-EntraChecksReportIntegrity'
 )
 
 #endregion

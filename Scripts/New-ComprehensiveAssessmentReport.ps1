@@ -519,11 +519,30 @@ $tenantInfo = [PSCustomObject]@{
 # Pass original Findings (not findingsWithRisk) because New-EnhancedHTMLReport
 # runs its own Add-RiskScoring | Add-ComplianceMapping | Add-RemediationGuidance pipeline
 try {
+    # Enrich Secure Score with improvement actions (rendered as a top-10 table
+    # in the unified report). Only attempt when SecureScore data is present
+    # AND the helper is available — both gracefully degrade.
+    $secureScoreForReport = $externalData.SecureScore
+    if ($secureScoreForReport -and (Get-Command Get-SecureScoreImprovementActions -ErrorAction SilentlyContinue)) {
+        try {
+            $actions = Get-SecureScoreImprovementActions -SecureScore $secureScoreForReport
+            if ($actions) {
+                $secureScoreForReport['ImprovementActions'] = $actions
+            }
+        }
+        catch {
+            Write-Host "    [i] Could not enrich Secure Score with improvement actions: $($_.Exception.Message)" -ForegroundColor Gray
+        }
+    }
+
     $reportPath = New-EnhancedHTMLReport `
         -Findings $Findings `
         -OutputPath $htmlPath `
         -TenantInfo $tenantInfo `
         -DefenderCompliance $externalData.DefenderCompliance `
+        -SecureScore $secureScoreForReport `
+        -AzurePolicy $externalData.AzurePolicy `
+        -PurviewCompliance $externalData.PurviewCompliance `
         -IncludeSections @('All')
 
     Write-Host "    HTML report generated successfully" -ForegroundColor Green
@@ -742,10 +761,17 @@ if ($GenerateExcelReport) {
                 AssessmentDate = $assessmentDate
             }
 
+            # Reuse the same enriched Secure Score object the HTML report received
+            # (or fall back to the raw external data if HTML generation didn't run).
+            $ssForExcel = if ($secureScoreForReport) { $secureScoreForReport } else { $externalData.SecureScore }
+
             New-EnhancedExcelReport `
                 -Findings $findingsWithRisk `
                 -OutputPath $excelPath `
                 -TenantInfo $tenantInfoObj `
+                -SecureScore $ssForExcel `
+                -AzurePolicy $externalData.AzurePolicy `
+                -PurviewCompliance $externalData.PurviewCompliance `
                 -UseImportExcel
 
             Write-Host "    [OK] Excel workbook generated: $excelPath" -ForegroundColor Green
