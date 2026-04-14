@@ -903,6 +903,65 @@ function Test-Configuration {
 
 <#
 .SYNOPSIS
+    Recursively converts a PSCustomObject (typically from ConvertFrom-Json) into
+    a nested hashtable structure. Internal helper.
+
+.DESCRIPTION
+    Replaces the functionality of PowerShell 6+ `ConvertFrom-Json -AsHashtable`
+    for Windows PowerShell 5.1 compatibility. Walks the object graph:
+    PSCustomObject becomes hashtable, enumerables become arrays (single-element
+    arrays preserved), primitives pass through. Strings are treated as scalars,
+    not enumerables.
+
+.PARAMETER InputObject
+    The object to convert. May be null.
+
+.OUTPUTS
+    Hashtable for objects, array for enumerables, scalar otherwise.
+
+.NOTES
+    Private to this module; not exported. The leading comma on the array
+    return preserves single-element arrays so callers iterating via foreach
+    don't see a scalar when JSON declared an array with one element.
+#>
+function ConvertTo-HashtableDeep {
+    [CmdletBinding()]
+    [OutputType([hashtable], [object[]], [object])]
+    param(
+        [Parameter(Mandatory, ValueFromPipeline)]
+        [AllowNull()]
+        $InputObject
+    )
+
+    process {
+        if ($null -eq $InputObject) { return $null }
+
+        # Strings are IEnumerable<char> but must not be exploded.
+        if ($InputObject -is [string]) { return $InputObject }
+
+        if ($InputObject -is [System.Collections.IEnumerable]) {
+            $list = New-Object System.Collections.ArrayList
+            foreach ($item in $InputObject) {
+                $null = $list.Add((ConvertTo-HashtableDeep -InputObject $item))
+            }
+            # Leading comma prevents single-element arrays from being unwrapped.
+            return , $list.ToArray()
+        }
+
+        if ($InputObject -is [System.Management.Automation.PSCustomObject]) {
+            $ht = @{}
+            foreach ($prop in $InputObject.PSObject.Properties) {
+                $ht[$prop.Name] = ConvertTo-HashtableDeep -InputObject $prop.Value
+            }
+            return $ht
+        }
+
+        return $InputObject
+    }
+}
+
+<#
+.SYNOPSIS
     Loads configuration from a JSON file.
 
 .DESCRIPTION
@@ -959,7 +1018,7 @@ function Import-Configuration {
     # Read and parse JSON
     try {
         $jsonContent = Get-Content -Path $FilePath -Raw
-        $config = $jsonContent | ConvertFrom-Json -AsHashtable
+        $config = $jsonContent | ConvertFrom-Json | ConvertTo-HashtableDeep
     }
     catch {
         $errorMsg = "Failed to parse configuration file: $_"
@@ -985,7 +1044,7 @@ function Import-Configuration {
 
             try {
                 $envJsonContent = Get-Content -Path $envConfigPath -Raw
-                $envConfig = $envJsonContent | ConvertFrom-Json -AsHashtable
+                $envConfig = $envJsonContent | ConvertFrom-Json | ConvertTo-HashtableDeep
                 $config = Merge-Configuration -BaseConfig $config -OverrideConfig $envConfig
             }
             catch {
@@ -1107,8 +1166,12 @@ function Expand-StringVariable {
     [OutputType([string])]
     param(
         [Parameter(Mandatory)]
+        [AllowEmptyString()]
         [string]$Value
     )
+
+    # Empty input has nothing to expand.
+    if ([string]::IsNullOrEmpty($Value)) { return $Value }
 
     # Pattern: ${ENV:VAR_NAME} or ${ENV:VAR_NAME:default_value}
     $pattern = '\$\{ENV:([^:}]+)(?::([^}]+))?\}'
