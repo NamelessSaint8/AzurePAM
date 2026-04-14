@@ -457,6 +457,82 @@ function Get-ConfigurationSchema {
                     }
                 }
             }
+            SOC2 = @{
+                type = "object"
+                description = "SOC 2 internal readiness assessment configuration"
+                properties = @{
+                    Enabled = @{
+                        type = "boolean"
+                        default = $false
+                        description = "Enable SOC 2 assessment workflow"
+                    }
+                    Type = @{
+                        type = "string"
+                        enum = @("Type1", "Type2")
+                        default = "Type1"
+                        description = "SOC 2 report type"
+                    }
+                    Categories = @{
+                        type = "array"
+                        items = @{
+                            type = "string"
+                            enum = @("CC", "A", "C", "PI", "P")
+                        }
+                        default = @("CC", "A", "C", "PI", "P")
+                        uniqueItems = $true
+                        description = "Trust Services Categories in scope"
+                    }
+                    IncludeManualAttestation = @{
+                        type = "boolean"
+                        default = $true
+                        description = "Emit MANUAL findings for non-automatable TSCs"
+                    }
+                    TypeTwoPeriod = @{
+                        type = "object"
+                        properties = @{
+                            StartDate = @{ type = "string"; description = "ISO 8601 start date (Type 2 only)" }
+                            EndDate = @{ type = "string"; description = "ISO 8601 end date (Type 2 only)" }
+                            MinSnapshotsRequired = @{ type = "integer"; minimum = 1; maximum = 365; default = 12 }
+                            SnapshotCadence = @{ type = "string"; enum = @("Daily", "Weekly", "Monthly"); default = "Weekly" }
+                        }
+                    }
+                    Evidence = @{
+                        type = "object"
+                        properties = @{
+                            IncludeRawPayloads = @{ type = "boolean"; default = $true }
+                            HashAlgorithm = @{ type = "string"; enum = @("SHA256", "SHA384", "SHA512"); default = "SHA256" }
+                            SignReports = @{ type = "boolean"; default = $false }
+                            SigningCertificateThumbprint = @{ type = "string" }
+                            KeyVaultName = @{ type = "string" }
+                            KeyVaultCertificateName = @{ type = "string" }
+                            Assessor = @{ type = "string" }
+                            ServiceOrganization = @{ type = "string" }
+                            RetentionYears = @{ type = "integer"; minimum = 1; maximum = 50; default = 7 }
+                        }
+                    }
+                    Redaction = @{
+                        type = "object"
+                        properties = @{
+                            RedactUserPII = @{ type = "boolean"; default = $true }
+                            RedactDeviceNames = @{ type = "boolean"; default = $true }
+                            EmitIdentityResolutionMap = @{ type = "boolean"; default = $true }
+                            IdentityResolutionMapPath = @{ type = "string"; default = ".\\Output\\SOC2\\identity-resolution\\" }
+                            EmbedResolutionMapInWorkbook = @{ type = "boolean"; default = $false }
+                        }
+                    }
+                    Branding = @{
+                        type = "object"
+                        properties = @{
+                            WhiteLabel = @{ type = "boolean"; default = $false }
+                            OrganizationName = @{ type = "string" }
+                            OrganizationLogoPath = @{ type = "string" }
+                            ReportFooter = @{ type = "string" }
+                            PrimaryColor = @{ type = "string"; pattern = '^#[0-9A-Fa-f]{6}$' }
+                            SuppressEntraChecksBranding = @{ type = "boolean"; default = $false }
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -717,6 +793,54 @@ function Test-Configuration {
         # Slack validation
         if ($notifications.Slack -and $notifications.Slack.Enabled -and -not $notifications.Slack.WebhookURL) {
             $errors += "Slack.WebhookURL is required when Slack notifications are enabled"
+        }
+    }
+
+    # Validate SOC2 section (optional; only validate when present)
+    if ($ConfigObject.SOC2) {
+        $soc2 = $ConfigObject.SOC2
+
+        if ($soc2.Type -and $soc2.Type -notin @('Type1', 'Type2')) {
+            $errors += "SOC2.Type must be 'Type1' or 'Type2'"
+        }
+
+        if ($soc2.Categories) {
+            $validCategories = @('CC', 'A', 'C', 'PI', 'P')
+            foreach ($cat in $soc2.Categories) {
+                if ($cat -notin $validCategories) {
+                    $errors += "Invalid SOC2.Categories value '$cat'. Valid: $($validCategories -join ', ')"
+                }
+            }
+        }
+
+        if ($soc2.Type -eq 'Type2' -and $soc2.TypeTwoPeriod) {
+            if (-not $soc2.TypeTwoPeriod.StartDate -or -not $soc2.TypeTwoPeriod.EndDate) {
+                $warnings += "SOC2.Type=Type2 requires TypeTwoPeriod.StartDate and TypeTwoPeriod.EndDate"
+            }
+        }
+
+        if ($soc2.Evidence) {
+            if ($soc2.Evidence.HashAlgorithm -and $soc2.Evidence.HashAlgorithm -notin @('SHA256', 'SHA384', 'SHA512')) {
+                $errors += "SOC2.Evidence.HashAlgorithm must be SHA256, SHA384, or SHA512"
+            }
+            if ($soc2.Evidence.SignReports -and -not $soc2.Evidence.KeyVaultName) {
+                $warnings += "SOC2.Evidence.SignReports is true but no KeyVaultName is configured"
+            }
+            if ($soc2.Evidence.RetentionYears -and ($soc2.Evidence.RetentionYears -lt 1 -or $soc2.Evidence.RetentionYears -gt 50)) {
+                $errors += "SOC2.Evidence.RetentionYears must be between 1 and 50"
+            }
+        }
+
+        if ($soc2.Branding -and $soc2.Branding.WhiteLabel) {
+            if (-not $soc2.Branding.OrganizationName) {
+                $errors += "SOC2.Branding.OrganizationName is required when WhiteLabel = true"
+            }
+            if ($soc2.Branding.PrimaryColor -and $soc2.Branding.PrimaryColor -notmatch '^#[0-9A-Fa-f]{6}$') {
+                $errors += "SOC2.Branding.PrimaryColor must be a 6-digit hex color (e.g., '#005A9E')"
+            }
+            if ($soc2.Branding.OrganizationLogoPath -and -not (Test-Path -LiteralPath $soc2.Branding.OrganizationLogoPath)) {
+                $warnings += "SOC2.Branding.OrganizationLogoPath does not exist: $($soc2.Branding.OrganizationLogoPath)"
+            }
         }
     }
 

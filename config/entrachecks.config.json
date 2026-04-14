@@ -97,5 +97,44 @@
       "NIST"
     ],
     "CustomBenchmarks": []
+  },
+  "SOC2": {
+    "_comment": "SOC 2 internal readiness assessment. See docs/SOC2-Guide.md. Disabled by default.",
+    "Enabled": false,
+    "Type": "Type1",
+    "Categories": ["CC", "A", "C", "PI", "P"],
+    "IncludeManualAttestation": true,
+    "TypeTwoPeriod": {
+      "StartDate": "",
+      "EndDate": "",
+      "MinSnapshotsRequired": 12,
+      "SnapshotCadence": "Weekly"
+    },
+    "Evidence": {
+      "IncludeRawPayloads": true,
+      "HashAlgorithm": "SHA256",
+      "SignReports": false,
+      "SigningCertificateThumbprint": "",
+      "KeyVaultName": "",
+      "KeyVaultCertificateName": "",
+      "Assessor": "",
+      "ServiceOrganization": "",
+      "RetentionYears": 7
+    },
+    "Redaction": {
+      "RedactUserPII": true,
+      "RedactDeviceNames": true,
+      "EmitIdentityResolutionMap": true,
+      "IdentityResolutionMapPath": ".\\Output\\SOC2\\identity-resolution\\",
+      "EmbedResolutionMapInWorkbook": false
+    },
+    "Branding": {
+      "WhiteLabel": false,
+      "OrganizationName": "",
+      "OrganizationLogoPath": "",
+      "ReportFooter": "",
+      "PrimaryColor": "",
+      "SuppressEntraChecksBranding": false
+    }
   }
 }

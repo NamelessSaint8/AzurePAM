@@ -432,6 +432,7 @@ function Show-MainMenu {
     Write-Host "  │   [3] View Last Results     - Open most recent reports         │" -ForegroundColor Yellow
     Write-Host "  │   [4] Compare Snapshots     - Delta reporting                  │" -ForegroundColor Yellow
     Write-Host "  │   [5] Manage Snapshots      - View/delete saved snapshots      │" -ForegroundColor Yellow
+    Write-Host "  │   [6] SOC 2 Readiness       - Internal SOC 2 TSC assessment   │" -ForegroundColor Yellow
     Write-Host "  │                                                                 │" -ForegroundColor Gray
     Write-Host "  │   [A] Authentication        - Connect to Graph and Azure       │" -ForegroundColor Cyan
     Write-Host "  │   [D] Disconnect            - Sign out (switch tenant)         │" -ForegroundColor Cyan
@@ -1266,6 +1267,141 @@ function Invoke-ModuleAssessment {
     return $results
 }
 
+function Invoke-SOC2ReadinessFromMenu {
+    <#
+    .SYNOPSIS
+        Menu handler for SOC 2 Readiness Assessment (option [6]).
+    .DESCRIPTION
+        Loads SOC 2 config, ensures baseline findings exist (runs core +
+        available modules if needed), invokes Invoke-SOC2Assessment, and
+        renders the standalone SOC 2 HTML + workbook.
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$TenantName,
+        [string]$OutputDirectory
+    )
+
+    Write-Host "`n  ===== SOC 2 Internal Readiness Assessment =====" -ForegroundColor Cyan
+
+    # Load SOC 2 modules (catalog, reporting, branding)
+    $soc2Module = Join-Path $script:ModulesPath "EntraChecks-SOC2.psm1"
+    $soc2ReportModule = Join-Path $script:ModulesPath "EntraChecks-SOC2Reporting.psm1"
+    $brandingModule = Join-Path $script:ModulesPath "EntraChecks-Branding.psm1"
+    $mappingModule = Join-Path $script:ModulesPath "EntraChecks-ComplianceMapping.psm1"
+    foreach ($m in @($brandingModule, $mappingModule, $soc2Module, $soc2ReportModule)) {
+        if (Test-Path $m) {
+            Import-Module $m -Force -ErrorAction Stop
+        } else {
+            Write-Host "  [!] Missing required module: $m" -ForegroundColor Red
+            return
+        }
+    }
+
+    # Load SOC 2 config (fall back to defaults)
+    $soc2Cfg = $null
+    $configPath = Join-Path $PSScriptRoot "config\entrachecks.config.json"
+    if (Test-Path $configPath) {
+        try {
+            $cfg = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+            if ($cfg.SOC2) { $soc2Cfg = $cfg.SOC2 }
+        } catch {
+            Write-Host "  [!] Could not parse config; using SOC 2 defaults." -ForegroundColor Yellow
+        }
+    }
+
+    # Ensure we have findings to map. If the current session's $script:Findings
+    # is empty, run the core assessment (minimum) so SOC 2 has something to map.
+    if (-not $script:Findings -or $script:Findings.Count -eq 0) {
+        Write-Host "  [i] No prior findings in this session; running Core assessment to seed SOC 2 mapping..." -ForegroundColor Gray
+        if (-not $TenantName) { $TenantName = Read-Host "  Enter tenant name" }
+        if (-not $SkipAuthentication) { Connect-EntraCheck }
+        $null = Invoke-ModuleAssessment -SelectedModules @('Core') -TenantName $TenantName -OutputDir $OutputDirectory
+    }
+
+    $existingFindings = @()
+    if ($script:Findings) { $existingFindings = @($script:Findings) }
+
+    # Resolve tenant info
+    $tenantId = ''
+    try {
+        if (Get-Command Get-MgContext -ErrorAction SilentlyContinue) {
+            $ctx = Get-MgContext -ErrorAction SilentlyContinue
+            if ($ctx) { $tenantId = $ctx.TenantId }
+        }
+    } catch { $tenantId = '' }
+    if (-not $tenantId) { $tenantId = 'unknown-tenant' }
+
+    # Assemble assessment parameters from config
+    $categories = @('CC', 'A', 'C', 'PI', 'P')
+    $redactUsers = $true
+    $redactDevices = $true
+    $includeManual = $true
+    $assessor = $env:USERNAME
+    $svcOrg = ''
+    if ($soc2Cfg) {
+        if ($soc2Cfg.Categories) { $categories = @($soc2Cfg.Categories) }
+        if ($null -ne $soc2Cfg.Redaction) {
+            if ($null -ne $soc2Cfg.Redaction.RedactUserPII) { $redactUsers = [bool]$soc2Cfg.Redaction.RedactUserPII }
+            if ($null -ne $soc2Cfg.Redaction.RedactDeviceNames) { $redactDevices = [bool]$soc2Cfg.Redaction.RedactDeviceNames }
+        }
+        if ($null -ne $soc2Cfg.IncludeManualAttestation) { $includeManual = [bool]$soc2Cfg.IncludeManualAttestation }
+        if ($soc2Cfg.Evidence) {
+            if ($soc2Cfg.Evidence.Assessor) { $assessor = $soc2Cfg.Evidence.Assessor }
+            if ($soc2Cfg.Evidence.ServiceOrganization) { $svcOrg = $soc2Cfg.Evidence.ServiceOrganization }
+        }
+    }
+
+    $timestamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
+    $soc2Output = Join-Path $OutputDirectory "SOC2\$timestamp"
+
+    $idMapPath = Join-Path $OutputDirectory 'SOC2\identity-resolution'
+    if ($soc2Cfg -and $soc2Cfg.Redaction -and $soc2Cfg.Redaction.IdentityResolutionMapPath) {
+        $idMapPath = $soc2Cfg.Redaction.IdentityResolutionMapPath
+    }
+
+    Write-Host "  [i] Running SOC 2 assessment (Type 1, categories: $($categories -join ', '))" -ForegroundColor Gray
+    $result = Invoke-SOC2Assessment `
+        -ExistingFindings $existingFindings `
+        -TenantId $tenantId `
+        -TenantName $TenantName `
+        -Categories $categories `
+        -OutputDirectory $soc2Output `
+        -IdentityResolutionDirectory $idMapPath `
+        -RedactUsers:$redactUsers `
+        -RedactDevices:$redactDevices `
+        -IncludeManualAttestation $includeManual `
+        -Assessor $assessor `
+        -ServiceOrganization $svcOrg
+
+    # Build branding context + render HTML and workbook
+    $branding = Get-ReportBrandingContext `
+        -Config ($soc2Cfg.Branding) `
+        -ReportTitle 'SOC 2 Internal Readiness Assessment'
+
+    $htmlPath = Join-Path $soc2Output 'SOC2-Report.html'
+    $xlsxPath = Join-Path $soc2Output 'SOC2-Workbook.xlsx'
+
+    $null = New-SOC2AuditReport -AssessmentResult $result -OutputPath $htmlPath -Branding $branding -IdentityResolutionMapPath $result.IdentityMapPath
+    $null = New-SOC2AuditWorkbook -AssessmentResult $result -OutputPath $xlsxPath
+
+    Write-Host "`n  [OK] SOC 2 assessment complete." -ForegroundColor Green
+    Write-Host "      Findings:        $($result.Findings.Count)" -ForegroundColor White
+    Write-Host "      Controls in scope: $($result.Summary.TotalControls)" -ForegroundColor White
+    Write-Host "      Evidence bundle: $($result.Evidence.Directory)" -ForegroundColor White
+    Write-Host "      Bundle hash:     $($result.Evidence.BundleHash)" -ForegroundColor White
+    Write-Host "      HTML report:     $htmlPath" -ForegroundColor White
+    if ($result.IdentityMapPath) {
+        Write-Host "      Identity map:    $($result.IdentityMapPath)" -ForegroundColor White
+    }
+
+    try {
+        Start-Process $htmlPath
+    } catch {
+        Write-Host "  [!] Could not open HTML report automatically: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+}
+
 function Export-AssessmentResult {
     param(
         [string]$OutputDir,
@@ -1573,22 +1709,28 @@ function Start-InteractiveMode {
                 $deltaModule = Join-Path $script:ModulesPath "EntraChecks-DeltaReporting.psm1"
                 if (Test-Path $deltaModule) {
                     Import-Module $deltaModule -Force
-                    
+
                     $snapshots = Get-ComplianceSnapshots -SnapshotDirectory $script:SnapshotsPath
-                    
+
                     Write-Host "`n  Saved Snapshots ($($snapshots.Count)):" -ForegroundColor Cyan
                     Write-Host ("  " + ("-" * 70)) -ForegroundColor Gray
-                    
+
                     foreach ($snap in $snapshots) {
                         Write-Host "    $($snap.CreatedAt) | $($snap.SnapshotId) | $($snap.TenantName)" -ForegroundColor White
                     }
-                    
+
                     Write-Host ("  " + ("-" * 70)) -ForegroundColor Gray
                     Write-Host "  Directory: $script:SnapshotsPath" -ForegroundColor Gray
                 }
                 Read-Host "`n  Press Enter to continue"
             }
-            
+
+            "6" {
+                # SOC 2 Internal Readiness Assessment
+                Invoke-SOC2ReadinessFromMenu -TenantName $tenantName -OutputDirectory $OutputDirectory
+                Read-Host "`n  Press Enter to continue"
+            }
+
             "A" {
                 # Authentication
                 Write-Host ""

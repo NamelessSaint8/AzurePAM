@@ -7,6 +7,16 @@ Logs/
 # Internal development notes (not public)
 DevNotes/
 
+# Implementation plans (not public)
+plans/
+
+# OpenWolf local tooling (not public)
+.wolf/
+/CLAUDE.md
+node_modules/
+package.json
+package-lock.json
+
 # Claude Code project context
 .claude/*
 

@@ -179,72 +179,196 @@ $Script:NISTCSFMapping = @{
     }
 }
 
-# SOC 2 Trust Services Criteria mappings
+# SOC 2 Trust Services Criteria mappings (AICPA TSC 2017, revised 2022)
+# Expanded in EntraChecks v1.5+ to cover CC1-CC9, A, C, PI, P as part of
+# the SOC 2 internal readiness feature. See docs/SOC2-Guide.md.
 $Script:SOC2Mapping = @{
-    # Common Criteria (CC)
+    # --- Common Criteria CC6 Logical & Physical Access ---
     'MFA_Disabled' = @{
         Criteria = @('CC6.1', 'CC6.2')
-        Description = 'Logical and physical access controls; Prior to issuing credentials, registration and authorization are completed'
+        Description = 'Logical and physical access controls; prior to issuing credentials, registration and authorization completed'
     }
     'MFA_AdminDisabled' = @{
         Criteria = @('CC6.1', 'CC6.2', 'CC6.3')
-        Description = 'Access controls; Credential management; Privileged access management'
+        Description = 'Access controls; credential management; privileged access management'
     }
     'ConditionalAccess_Missing' = @{
-        Criteria = @('CC6.1', 'CC6.6')
-        Description = 'Logical and physical access controls; Access is modified or removed upon role changes'
+        Criteria = @('CC6.1', 'CC6.6', 'CC7.1', 'CC7.5')
+        Description = 'Logical access controls; boundary protection; security configuration baseline; recovery from incidents via exclusion policies'
     }
     'LegacyAuth_Enabled' = @{
         Criteria = @('CC6.1', 'CC6.6', 'CC7.2')
-        Description = 'Access controls; Security configurations; System monitoring'
+        Description = 'Access controls; boundary protection; system monitoring'
     }
     'AdminRoles_Excessive' = @{
         Criteria = @('CC6.1', 'CC6.3')
-        Description = 'Access controls restricted to authorized users; Privileged access management'
+        Description = 'Access controls restricted to authorized users; privileged access management'
     }
     'GlobalAdmin_Multiple' = @{
         Criteria = @('CC6.3')
         Description = 'Users with administrative privileges are restricted and managed'
     }
     'GuestAccess_Unrestricted' = @{
-        Criteria = @('CC6.1', 'CC6.2', 'CC6.6')
-        Description = 'Access controls; Credential issuance; Access review and removal'
+        Criteria = @('CC6.1', 'CC6.2', 'CC6.6', 'CC9.2')
+        Description = 'Access controls; credential issuance; boundary protection; vendor risk'
     }
     'AppPermissions_Excessive' = @{
         Criteria = @('CC6.1', 'CC6.3')
-        Description = 'Logical access controls; System authorizations appropriate for user roles'
+        Description = 'Logical access controls; system authorizations appropriate for user roles'
     }
     'AppConsent_UserAllowed' = @{
-        Criteria = @('CC6.1', 'CC6.3')
-        Description = 'Access controls; Authorization management'
-    }
-    'DLP_NotConfigured' = @{
-        Criteria = @('CC6.7', 'CC6.1')
-        Description = 'Data classification and protection; Access to sensitive data restricted'
-    }
-    'AuditLog_NotEnabled' = @{
-        Criteria = @('CC7.2', 'CC7.3')
-        Description = 'System monitoring; Security events logged and analyzed'
-    }
-    'MailboxAudit_Disabled' = @{
-        Criteria = @('CC7.2', 'CC7.3')
-        Description = 'System monitoring; Audit logging for security-relevant events'
+        Criteria = @('CC6.1', 'CC6.3', 'CC8.1')
+        Description = 'Access controls; authorization management; change authorization for new applications'
     }
     'SecurityDefaults_Disabled' = @{
         Criteria = @('CC6.1', 'CC7.1')
-        Description = 'Access controls; Security baseline configuration'
-    }
-    'RiskySignIn_NoPolicy' = @{
-        Criteria = @('CC7.2', 'CC7.3')
-        Description = 'System monitoring; Security events detected and analyzed'
+        Description = 'Access controls; security baseline configuration'
     }
     'PasswordExpiry_Disabled' = @{
         Criteria = @('CC6.1', 'CC6.2')
-        Description = 'Access controls; Credential management'
+        Description = 'Access controls; credential management'
     }
     'SelfServicePasswordReset_Disabled' = @{
         Criteria = @('CC6.1', 'CC6.2')
-        Description = 'Access controls; Credential management and recovery'
+        Description = 'Access controls; credential management and recovery'
+    }
+    'AuthorizationPolicy_Permissive' = @{
+        Criteria = @('CC6.2', 'CC8.1')
+        Description = 'Credential issuance authorization; change authorization'
+    }
+    'PrivilegedRoleCreep' = @{
+        Criteria = @('CC6.3')
+        Description = 'Privileged access management; role-based access reviewed'
+    }
+    'PIM_NotConfigured' = @{
+        Criteria = @('CC6.3')
+        Description = 'Privileged access management via just-in-time activation'
+    }
+    'NamedLocation_Missing' = @{
+        Criteria = @('CC6.6')
+        Description = 'Boundary protection; named locations enforce network context for access'
+    }
+    'CrossTenant_Permissive' = @{
+        Criteria = @('CC6.6', 'CC9.2')
+        Description = 'Boundary protection for external tenant relationships; vendor/partner risk'
+    }
+
+    # --- Device & Endpoint (CC6.4) ---
+    'DeviceCompliance_NonCompliant' = @{
+        Criteria = @('CC6.4')
+        Description = 'Managed device compliance policies enforce baseline protections'
+    }
+    'BitLocker_NotEnforced' = @{
+        Criteria = @('CC6.4', 'CC6.7')
+        Description = 'Device encryption protects data at rest on endpoints'
+    }
+    'StaleDevices_Present' = @{
+        Criteria = @('CC6.4')
+        Description = 'Stale managed devices represent access-control hygiene gaps'
+    }
+
+    # --- DLP / Encryption (CC6.7) ---
+    'DLP_NotConfigured' = @{
+        Criteria = @('CC6.1', 'CC6.7', 'C1.1')
+        Description = 'Data classification and protection; access to sensitive data restricted; confidentiality'
+    }
+    'SOC2_EncryptionPostureGaps' = @{
+        Criteria = @('CC6.7')
+        Description = 'Encryption-in-transit and encryption-at-rest posture across tenant assets'
+    }
+    'SensitivityLabels_Missing' = @{
+        Criteria = @('CC6.7', 'C1.1')
+        Description = 'Sensitivity labels classify confidential information'
+    }
+    'RetentionPolicies_Missing' = @{
+        Criteria = @('C1.2')
+        Description = 'Retention/disposal of confidential information'
+    }
+
+    # --- Malware (CC6.8) ---
+    'SOC2_MalwareProtectionGaps' = @{
+        Criteria = @('CC6.8')
+        Description = 'Controls to prevent or detect unauthorized or malicious software'
+    }
+
+    # --- System Operations (CC7) ---
+    'AuditLog_NotEnabled' = @{
+        Criteria = @('CC4.1', 'CC7.2', 'CC7.3')
+        Description = 'Monitoring coverage; system monitoring; security event evaluation'
+    }
+    'AuditLog_RetentionShort' = @{
+        Criteria = @('CC4.1', 'CC7.2')
+        Description = 'Sufficient log retention for detection and investigation'
+    }
+    'MailboxAudit_Disabled' = @{
+        Criteria = @('CC7.2', 'CC7.3')
+        Description = 'Audit logging for security-relevant events'
+    }
+    'RiskySignIn_NoPolicy' = @{
+        Criteria = @('CC7.2', 'CC7.3')
+        Description = 'System monitoring; evaluation of security events'
+    }
+    'UserRisk_NoPolicy' = @{
+        Criteria = @('CC7.3')
+        Description = 'Identity Protection user-risk response policies'
+    }
+    'SOC2_IncidentResponseGap' = @{
+        Criteria = @('CC7.4')
+        Description = 'Incident response program readiness (contacts, PIM, runbooks)'
+    }
+    'SOC2_BreakGlassMissing' = @{
+        Criteria = @('CC7.5')
+        Description = 'Break-glass accounts and recovery access paths'
+    }
+
+    # --- Change Management (CC8) ---
+    'AppRoleAssignment_Overprivileged' = @{
+        Criteria = @('CC8.1')
+        Description = 'Change authorization; least-privilege for application role assignments'
+    }
+    'ApplicationCredential_Expired' = @{
+        Criteria = @('CC8.1')
+        Description = 'Change management: service principal credential rotation hygiene'
+    }
+    'AzurePolicy_Noncompliant' = @{
+        Criteria = @('CC8.1')
+        Description = 'Change management: Azure Policy drift from approved baseline'
+    }
+
+    # --- SOC 2 synthetic checks (CC2 / CC4 / CC7) ---
+    'SOC2_AdminContactsMissing' = @{
+        Criteria = @('CC2.1', 'CC2.3')
+        Description = 'Tenant notification contacts enable external communication of security matters'
+    }
+    'SOC2_AdminContactsConfigured' = @{
+        Criteria = @('CC2.1', 'CC2.3')
+        Description = 'Tenant notification contacts enable external communication of security matters'
+    }
+    'SOC2_SecurityContactsMissing' = @{
+        Criteria = @('CC2.1', 'CC2.3', 'CC7.4')
+        Description = 'Security/compliance notification contacts; incident response readiness'
+    }
+    'SOC2_SecurityContactsConfigured' = @{
+        Criteria = @('CC2.1', 'CC2.3', 'CC7.4')
+        Description = 'Security/compliance notification contacts; incident response readiness'
+    }
+    'SOC2_SecurityAlertingPresent' = @{
+        Criteria = @('CC4.2', 'CC7.4')
+        Description = 'Security alerting infrastructure presence'
+    }
+    'SOC2_SecurityAlertingUnconfigured' = @{
+        Criteria = @('CC4.2', 'CC7.4')
+        Description = 'Security alerting infrastructure coverage'
+    }
+
+    # --- Availability (Phase 2 synthetic checks; mapping ready) ---
+    'SOC2_ServiceHealthGap' = @{
+        Criteria = @('A1.1')
+        Description = 'Capacity/performance monitoring for availability'
+    }
+    'SOC2_BackupConfigurationGap' = @{
+        Criteria = @('A1.2')
+        Description = 'Backup / environmental protection for availability'
     }
 }
 
