@@ -2282,6 +2282,14 @@ function Start-HybridMode {
         try {
             $hybridCorrelation = Get-HybridIdentityCorrelation -Findings $script:Findings
             Write-Host "    [OK] Correlated $($hybridCorrelation.CorrelationCount) principals across cloud + on-prem." -ForegroundColor Green
+            # PR 5 - push cross-surface findings back into the main pool so risk scoring,
+            # HTML / Excel / CSV renderers, and delta reporting all see them alongside
+            # standard findings. They carry Source='HybridCorrelation' so downstream code
+            # can group / filter if needed.
+            if ($hybridCorrelation.CrossSurfaceCount -gt 0) {
+                $script:Findings += $hybridCorrelation.CrossSurfaceFindings
+                Write-Host "    [OK] Emitted $($hybridCorrelation.CrossSurfaceCount) cross-surface finding(s)." -ForegroundColor Green
+            }
         }
         catch {
             Write-Host "    [!] Correlation pass failed: $($_.Exception.Message)" -ForegroundColor Yellow

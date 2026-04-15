@@ -1371,6 +1371,44 @@ function Get-HybridCorrelationSection {
         '<p class="compliance-fallback-note">No principals were flagged in both planes during this run.</p>'
     }
 
+    # PR 5 - Cross-surface findings section.
+    $crossCount = if ($HybridCorrelation.CrossSurfaceCount) { $HybridCorrelation.CrossSurfaceCount } else { 0 }
+    $crossBody = ''
+    if ($HybridCorrelation.CrossSurfaceFindings -and $HybridCorrelation.CrossSurfaceFindings.Count -gt 0) {
+        $sevRank = @{ 'Critical' = 0; 'High' = 1; 'Medium' = 2; 'Low' = 3 }
+        $ordered = $HybridCorrelation.CrossSurfaceFindings | Sort-Object { $sevRank[[string]$_.Severity] }
+        foreach ($cs in $ordered) {
+            $sev = [System.Web.HttpUtility]::HtmlEncode([string]$cs.Severity)
+            $sevClass = switch ([string]$cs.Severity) {
+                'Critical' { 'critical' }
+                'High' { 'high' }
+                'Medium' { 'medium' }
+                default { '' }
+            }
+            $typeEncoded = [System.Web.HttpUtility]::HtmlEncode([string]($cs.Type -replace '^HybridCrossSurface_', ''))
+            $principal = [System.Web.HttpUtility]::HtmlEncode([string]$cs.Principal)
+            $desc = [System.Web.HttpUtility]::HtmlEncode([string]$cs.Description)
+            $rem = [System.Web.HttpUtility]::HtmlEncode([string]$cs.Remediation)
+            $crossBody += @"
+<tr class="$sevClass"><td>$sev</td><td>$typeEncoded</td><td>$principal</td><td>$desc<br/><em>Fix:</em> $rem</td></tr>
+
+"@
+        }
+    }
+    $crossSection = if ($crossBody) {
+        @"
+    <h3 style="margin-top: 28px;">Cross-surface findings (PR 5)</h3>
+    <p style="font-size: 0.85em; color: #605e5c;">Correlators emit these when on-prem AD exposure intersects cloud privilege, yielding a one-step hybrid takeover path. Each is higher-severity than its cloud or on-prem half alone.</p>
+    <table>
+        <thead><tr><th>Severity</th><th>Type</th><th>Principal</th><th>Detail</th></tr></thead>
+        <tbody>$crossBody</tbody>
+    </table>
+"@
+    }
+    else {
+        '<p class="compliance-fallback-note" style="margin-top: 28px;">No cross-surface (hybrid takeover) paths detected this run.</p>'
+    }
+
     return @"
 <section class="hybrid-correlation" id="hybrid-correlation">
     <h2 class="section-title">&#128279; Hybrid Correlation</h2>
@@ -1379,6 +1417,11 @@ function Get-HybridCorrelationSection {
             <div class="metric-label">Correlated principals</div>
             <div class="metric-value">$corrCount</div>
             <div>flagged in both planes</div>
+        </div>
+        <div class="metric-card $(if ($crossCount -gt 0) { 'critical' } else { '' })">
+            <div class="metric-label">Cross-surface paths</div>
+            <div class="metric-value">$crossCount</div>
+            <div>one-step hybrid takeover</div>
         </div>
         <div class="metric-card">
             <div class="metric-label">Cloud findings indexed</div>
@@ -1392,6 +1435,7 @@ function Get-HybridCorrelationSection {
         </div>
     </div>
     $table
+    $crossSection
 </section>
 "@
 }

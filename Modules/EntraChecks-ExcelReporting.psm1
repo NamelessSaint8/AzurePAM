@@ -338,6 +338,12 @@ function New-ExcelWorkbook {
         if ($hcRows.Count -gt 0) {
             $hcRows | Export-Excel -Path $OutputPath -WorksheetName 'Hybrid Correlation' -AutoSize -BoldTopRow -FreezeTopRow -AutoFilter
         }
+
+        # 13b. Hybrid Cross-Surface (PR 5) — one row per cross-surface finding.
+        $csRows = @(ConvertTo-HybridCrossSurfaceRows -HybridCorrelation $HybridCorrelation)
+        if ($csRows.Count -gt 0) {
+            $csRows | Export-Excel -Path $OutputPath -WorksheetName 'Hybrid Cross-Surface' -AutoSize -BoldTopRow -FreezeTopRow -AutoFilter
+        }
     }
 
     Write-Host "[OK] Excel workbook created: $OutputPath" -ForegroundColor Green
@@ -435,6 +441,31 @@ function ConvertTo-HybridCorrelationRows {
                 MaxOnPremSeverity = $c.MaxOnPremSeverity
                 CloudFindingsSummary = ($c.CloudFindings | ForEach-Object { $_.Description } | Select-Object -First 3) -join ' | '
                 OnPremFindingsSummary = ($c.OnPremFindings | ForEach-Object { $_.Description } | Select-Object -First 3) -join ' | '
+            }
+        }
+    }
+    return $rows
+}
+
+function ConvertTo-HybridCrossSurfaceRows {
+    <#
+    .SYNOPSIS
+        Flattens cross-surface findings (PR 5) into one row per correlator match.
+    #>
+    param([Parameter(Mandatory)] [object]$HybridCorrelation)
+
+    $rows = @()
+    if ($HybridCorrelation.CrossSurfaceFindings) {
+        foreach ($f in $HybridCorrelation.CrossSurfaceFindings) {
+            $rows += [PSCustomObject]@{
+                Severity = $f.Severity
+                Type = ($f.Type -replace '^HybridCrossSurface_', '')
+                Principal = $f.Principal
+                OnPremCheck = $f.OnPremCheck
+                CloudContext = $f.CloudContext
+                Description = $f.Description
+                Remediation = $f.Remediation
+                RiskScore = $f.RiskScore
             }
         }
     }
@@ -672,6 +703,10 @@ function New-CSVWorkbook {
         $hcRows = @(ConvertTo-HybridCorrelationRows -HybridCorrelation $HybridCorrelation)
         if ($hcRows.Count -gt 0) {
             $hcRows | Export-Csv -LiteralPath (Join-Path $csvDir '13-HybridCorrelation.csv') -NoTypeInformation -Encoding UTF8
+        }
+        $csRows = @(ConvertTo-HybridCrossSurfaceRows -HybridCorrelation $HybridCorrelation)
+        if ($csRows.Count -gt 0) {
+            $csRows | Export-Csv -LiteralPath (Join-Path $csvDir '14-HybridCrossSurface.csv') -NoTypeInformation -Encoding UTF8
         }
     }
 

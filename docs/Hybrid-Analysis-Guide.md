@@ -161,10 +161,40 @@ AD findings produced during a Hybrid Analysis run carry `ComplianceFrameworks` t
 
 ---
 
-## 9. What's next
+## 9. Cross-surface correlators (PR 5)
 
-PR 3 and beyond will expand on this foundation:
+The base correlator in §2 groups findings by principal. PR 5 adds a second pass — **cross-surface correlators** that specifically identify **hybrid takeover paths** where on-prem exposure intersects cloud privilege. Output is surfaced as a new `CrossSurfaceFindings` array on the correlation result, a new HTML subsection (inside `#hybrid-correlation`), a new Excel sheet (`Hybrid Cross-Surface`), and a new CSV (`14-HybridCrossSurface.csv`). Cross-surface findings also flow into the main risk score via the standard findings pool.
 
-- AD CS template vulnerabilities (ESC1-8) — whole-PR effort given depth of PKI analysis required.
-- BloodHound-style ACL abuse path enumeration — research-heavy; unclear ROI for this codebase.
-- Richer correlation heuristics — group-membership transitivity, device ownership chains, service principal overlap.
+### The 5 correlators
+
+| Correlator | Condition | Severity |
+|---|---|---|
+| `Find-DAExposureToCloudAdmin` | Direct-reach DACL exposure (`Test-AuthenticatedUsersDACLReach` / `Test-WritablePrivilegedACLs` FAIL with "DIRECT reach" or write-class rights) on a principal that also holds a privileged cloud role. | **Critical** — single ACE modification grants cloud tenant admin. |
+| `Find-DnsAdminsWithCloudPrivilege` | `Test-DNSAdminsPrivilege` member ∩ privileged cloud role. | **Critical** on legacy DCs (CVE-2021-40469 class); **High** on modern. |
+| `Find-ShadowCredentialsOnCloudSyncedAdmin` | `Test-ShadowCredentialsVulnerable` target is a synced cloud admin. | **Critical** — write msDS-KeyCredentialLink → PKINIT as admin → cloud session. |
+| `Find-RBCDOnPrivilegedTier0Targeting` | `Test-RBCDConfigured` source principal (the impersonator) holds a cloud privileged role. Applies to DC / Tier 0 RBCD only. | **High** — requires cloud-side compromise first to weaponize, but hybrid both ways. |
+| `Find-RiskyUserWithOnPremPrivilege` | IdentityProtection risky user (FAIL) is also a member of on-prem privileged groups. Severity floors at High when Domain/Enterprise/Schema Admins implicated. | Inherits IdentityProtection severity; floor High for Tier 0. |
+
+### How the cloud side participates
+
+The correlators depend on the **`PrivilegedRoleMember` inventory markers** emitted by `Test-DirectoryRolesAndMembers` (Core module). For every enabled non-guest member of a privileged directory role, the check emits an INFO finding with `Object = "upn@domain (RoleName)"` and `Description` starting with `PrivilegedRoleMember:`. Correlators index these markers via `New-PrincipalIndex` to answer "does this principal hold a cloud admin role?" in O(1).
+
+If `Test-DirectoryRolesAndMembers` is unauthorized or skipped, correlators 1-4 produce no findings (they need the marker). Correlator 5 still works because it reads IdentityProtection and on-prem privileged-group findings directly.
+
+### Identity mapping limitations (unchanged from §2)
+
+The base correlator uses UPN + SamAccountName matching with no SID / ObjectGUID reconciliation. If a user's on-prem SamAccountName doesn't prefix-match their cloud UPN (`jsmith` on-prem vs `john.smith@contoso.com` cloud), the cross-surface correlators will miss them too. Environments with this mismatch can inspect the `CloudOnlyPrincipals` + `OnPremOnlyPrincipals` buckets to spot the principals that would be caught if matching were strengthened.
+
+### Two-hop DACL indirect exposure is not escalated
+
+`Test-AuthenticatedUsersDACLReach` emits both direct (one-hop Critical) and indirect (two-hop High) findings. Correlator 1 only matches the **direct** variant — the indirect path already requires an intermediate on-prem step, and re-weighting it through cloud correlation produces too many false positives for the marginal signal gained.
+
+---
+
+## 10. What's next
+
+- Device-plane correlation (RBCD on member servers, Intune device ownership) — deferred to a future device-focused PR.
+- SID / ObjectGUID reconciliation for environments with name mismatch — requires exposing `onPremisesSid` per user from the cloud side.
+- AD CS template vulnerabilities (ESC1-13) — **shipped in PR 3 + PR 4b**.
+- BloodHound-style ACL abuse path enumeration — remains out of scope; separate tool, separate problem.
+- Richer correlation heuristics — group-membership transitivity, service-principal overlap, conditional-access scope intersection.

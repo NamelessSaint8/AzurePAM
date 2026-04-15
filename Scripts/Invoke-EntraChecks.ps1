@@ -1086,6 +1086,16 @@ function Test-DirectoryRolesAndMembers {
                             $enabled = if ($member.accountEnabled) { "Enabled" } else { "DISABLED" }
                             $userType = if ($member.userType) { $member.userType } else { "Member" }
                             $memberInfo += "$($member.userPrincipalName) [User, $enabled, $userType]"
+
+                            # PR 5: per-member INFO finding enables hybrid cross-surface correlation.
+                            # The correlators (Find-DAExposureToCloudAdmin, etc.) scan for findings with
+                            # this shape to link on-prem AD exposure to cloud privilege.
+                            if ($member.accountEnabled -ne $false -and $member.userType -ne "Guest" -and $member.userPrincipalName) {
+                                Add-Finding -Status "INFO" `
+                                    -Object "$($member.userPrincipalName) ($($role.displayName))" `
+                                    -Description "PrivilegedRoleMember: '$($member.userPrincipalName)' holds cloud role '$($role.displayName)'. Inventory marker for hybrid correlation — see the role summary finding for full context." `
+                                    -Remediation "No action required — this informational finding exists to support hybrid cross-surface correlation against on-prem AD findings."
+                            }
                         }
                         "servicePrincipal" {
                             Add-Finding -Status "WARNING" `
