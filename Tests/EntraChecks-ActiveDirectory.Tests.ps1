@@ -36,6 +36,7 @@ BeforeAll {
     function Global:Get-ADServiceAccount { param([Parameter(ValueFromRemainingArguments = $true)]$args) }
     function Global:Get-ADOrganizationalUnit { param([Parameter(ValueFromRemainingArguments = $true)]$args) }
     function Global:Get-ADDefaultDomainPasswordPolicy { param([Parameter(ValueFromRemainingArguments = $true)]$args) }
+    function Global:Get-ADRootDSE { param([Parameter(ValueFromRemainingArguments = $true)]$args) }
     function Global:Get-GPO { param([Parameter(ValueFromRemainingArguments = $true)]$args) }
 
     Import-Module (Join-Path $repoRoot 'Modules\EntraChecks-ActiveDirectory.psm1') -Force
@@ -507,6 +508,185 @@ Describe 'Test-ShadowGroupNames' {
             Test-ShadowGroupNames
             @($script:Findings | Where-Object { $_.Object -eq 'DomianAdmins' -and $_.Status -eq 'WARNING' }).Count | Should -Be 1
             @($script:Findings | Where-Object { $_.Object -eq 'HR Read Only' }).Count | Should -Be 0
+        }
+    }
+}
+
+# ============================================================================
+# PR 2 additions — LAPS, DCSecurity, Kerberoastable, DirSync
+# ============================================================================
+
+Describe 'Test-LAPSDeployment' {
+
+    It 'FAILs when neither legacy nor Windows LAPS schema is present' {
+        InModuleScope EntraChecks-ActiveDirectory {
+            $script:Findings = @()
+            Mock Get-ADRootDSE { [pscustomobject]@{ schemaNamingContext = 'CN=Schema, CN=Configuration, DC=test' } }
+            Mock Get-ADObject {
+                [pscustomobject]@{ mayContain = @('cn', 'dnsHostName'); systemMayContain = @('sAMAccountName') }
+            }
+            Test-LAPSDeployment
+            $fails = @($script:Findings | Where-Object { $_.Status -eq 'FAIL' })
+            $fails.Count | Should -BeGreaterThan 0
+            $fails[0].Description | Should -Match 'Neither legacy LAPS'
+        }
+    }
+
+    It 'PASSes when Windows LAPS schema is present and coverage is >=90%' {
+        InModuleScope EntraChecks-ActiveDirectory {
+            $script:Findings = @()
+            Mock Get-ADRootDSE { [pscustomobject]@{ schemaNamingContext = 'CN=Schema, CN=Configuration, DC=test' } }
+            Mock Get-ADObject {
+                [pscustomobject]@{ mayContain = @('msLAPS-Password', 'msLAPS-PasswordExpirationTime'); systemMayContain = @() }
+            }
+            # 10 computers, all with passwords, none expired.
+            $future = [DateTime]::UtcNow.AddDays(30).ToFileTimeUtc()
+            Mock Get-ADComputer {
+                1..10 | ForEach-Object {
+                    [pscustomobject]@{
+                        DNSHostName = "host$_.test.local"
+                        Enabled = $true
+                        'msLAPS-Password' = 'enc-blob'
+                        'msLAPS-PasswordExpirationTime' = $future
+                    }
+                }
+            }
+            Test-LAPSDeployment
+            @($script:Findings | Where-Object { $_.Status -eq 'PASS' -and $_.Object -eq 'LAPS Coverage' }).Count | Should -BeGreaterThan 0
+        }
+    }
+
+    It 'FAILs when coverage is below 50%' {
+        InModuleScope EntraChecks-ActiveDirectory {
+            $script:Findings = @()
+            Mock Get-ADRootDSE { [pscustomobject]@{ schemaNamingContext = 'CN=Schema, CN=Configuration, DC=test' } }
+            Mock Get-ADObject {
+                [pscustomobject]@{ mayContain = @('msLAPS-Password'); systemMayContain = @() }
+            }
+            # 10 computers, 2 have passwords.
+            Mock Get-ADComputer {
+                $list = @()
+                1..10 | ForEach-Object {
+                    $hasPwd = $_ -le 2
+                    $list += [pscustomobject]@{
+                        DNSHostName = "host$_.test.local"
+                        Enabled = $true
+                        'msLAPS-Password' = if ($hasPwd) { 'enc-blob' } else { $null }
+                        'msLAPS-PasswordExpirationTime' = $null
+                    }
+                }
+                $list
+            }
+            Test-LAPSDeployment
+            @($script:Findings | Where-Object { $_.Status -eq 'FAIL' -and $_.Object -eq 'LAPS Coverage' }).Count | Should -BeGreaterThan 0
+        }
+    }
+}
+
+Describe 'Test-KerberoastableAccounts' {
+
+    It 'escalates to Critical severity for privileged SPN-bearer with RC4-capable hash' {
+        InModuleScope EntraChecks-ActiveDirectory {
+            $script:Findings = @()
+            Mock Get-ADUser {
+                @([pscustomobject]@{
+                        SamAccountName = 'svcDA'
+                        Enabled = $true
+                        ServicePrincipalName = @('MSSQLSvc/app.test.local:1433')
+                        PasswordLastSet = (Get-Date).AddDays(-5)
+                        'msDS-SupportedEncryptionTypes' = 0  # no AES flags
+                        MemberOf = @('CN=Domain Admins, CN=Users, DC=test')
+                    })
+            }
+            Test-KerberoastableAccounts
+            $fails = @($script:Findings | Where-Object { $_.Status -eq 'FAIL' })
+            $fails.Count | Should -BeGreaterThan 0
+            $fails[0].Severity | Should -Be 'Critical'
+            $fails[0].Description | Should -Match 'Privileged'
+        }
+    }
+
+    It 'PASSes when all SPN-bearing accounts are AES-only' {
+        InModuleScope EntraChecks-ActiveDirectory {
+            $script:Findings = @()
+            Mock Get-ADUser {
+                @([pscustomobject]@{
+                        SamAccountName = 'svcAES'
+                        Enabled = $true
+                        ServicePrincipalName = @('HTTP/app.test.local')
+                        PasswordLastSet = (Get-Date).AddDays(-5)
+                        'msDS-SupportedEncryptionTypes' = 0x18  # AES128 + AES256
+                        MemberOf = @()
+                    })
+            }
+            Test-KerberoastableAccounts
+            @($script:Findings | Where-Object { $_.Status -eq 'PASS' }).Count | Should -BeGreaterThan 0
+        }
+    }
+
+    It 'FAILs on stale password + RC4 for non-privileged account' {
+        InModuleScope EntraChecks-ActiveDirectory {
+            $script:Findings = @()
+            Mock Get-ADUser {
+                @([pscustomobject]@{
+                        SamAccountName = 'svcStale'
+                        Enabled = $true
+                        ServicePrincipalName = @('HTTP/app.test.local')
+                        PasswordLastSet = (Get-Date).AddDays(-365)
+                        'msDS-SupportedEncryptionTypes' = 0
+                        MemberOf = @()
+                    })
+            }
+            Test-KerberoastableAccounts -PasswordAgeDays 90
+            @($script:Findings | Where-Object { $_.Status -eq 'FAIL' }).Count | Should -BeGreaterThan 0
+        }
+    }
+}
+
+Describe 'Test-DirSyncAccountSecurity' {
+
+    It 'FAILs when MSOL_ account is a member of a disallowed group' {
+        InModuleScope EntraChecks-ActiveDirectory {
+            $script:Findings = @()
+            Mock Get-ADUser {
+                @([pscustomobject]@{
+                        SamAccountName = 'MSOL_abc123'
+                        Enabled = $true
+                        MemberOf = @('CN=Domain Admins, CN=Users, DC=test')
+                        PasswordLastSet = (Get-Date).AddDays(-5)
+                        whenCreated = (Get-Date).AddYears(-2)
+                    })
+            }
+            Test-DirSyncAccountSecurity
+            $fails = @($script:Findings | Where-Object { $_.Status -eq 'FAIL' })
+            $fails.Count | Should -BeGreaterThan 0
+            $fails[0].Severity | Should -Be 'Critical'
+        }
+    }
+
+    It 'PASSes when MSOL_ account has no disallowed group memberships' {
+        InModuleScope EntraChecks-ActiveDirectory {
+            $script:Findings = @()
+            Mock Get-ADUser {
+                @([pscustomobject]@{
+                        SamAccountName = 'MSOL_abc123'
+                        Enabled = $true
+                        MemberOf = @()
+                        PasswordLastSet = (Get-Date).AddDays(-5)
+                        whenCreated = (Get-Date).AddYears(-2)
+                    })
+            }
+            Test-DirSyncAccountSecurity
+            @($script:Findings | Where-Object { $_.Status -eq 'PASS' }).Count | Should -BeGreaterThan 0
+        }
+    }
+
+    It 'emits INFO when no MSOL_ accounts are found' {
+        InModuleScope EntraChecks-ActiveDirectory {
+            $script:Findings = @()
+            Mock Get-ADUser { @() }
+            Test-DirSyncAccountSecurity
+            @($script:Findings | Where-Object { $_.Status -eq 'INFO' -and $_.Description -match 'MSOL_' }).Count | Should -Be 1
         }
     }
 }

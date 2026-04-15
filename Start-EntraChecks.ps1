@@ -96,7 +96,7 @@
 [CmdletBinding()]
 param(
     [Parameter()]
-    [ValidateSet("Interactive", "Quick", "Scheduled")]
+    [ValidateSet("Interactive", "Quick", "Scheduled", "Hybrid")]
     [string]$Mode = "Interactive",
 
     [Parameter()]
@@ -179,6 +179,7 @@ $script:LogsPath = Join-Path $PSScriptRoot "Logs"
 # Initialize data collection variables
 $script:Findings = @()
 $script:SecureScoreData = $null
+$script:HybridCorrelationData = $null
 $script:DefenderComplianceData = $null
 $script:AzurePolicyData = $null
 $script:PurviewComplianceData = $null
@@ -442,6 +443,7 @@ function Show-MainMenu {
     Write-Host "  �   [6] SOC 2 Readiness       - Internal SOC 2 TSC assessment   �" -ForegroundColor Yellow
     Write-Host "  �   [7] SOC 2 Type 2          - Period coverage from snapshots  �" -ForegroundColor Yellow
     Write-Host "  �   [8] Active Directory      - On-premises AD security audit  �" -ForegroundColor Yellow
+    Write-Host "  �   [Y] Hybrid Analysis       - Cloud + on-prem + correlation  �" -ForegroundColor Yellow
     Write-Host "  �                                                                 �" -ForegroundColor Gray
     Write-Host "  �   [A] Authentication        - Connect to Graph and Azure       �" -ForegroundColor Cyan
     Write-Host "  �   [D] Disconnect            - Sign out (switch tenant)         �" -ForegroundColor Cyan
@@ -1181,6 +1183,8 @@ function Invoke-ModuleAssessment {
                         if ($adConfig.UserLogonInactivityDays) { $adParams['UserLogonInactivityDays'] = [int]$adConfig.UserLogonInactivityDays }
                         if ($adConfig.UserPasswordAgeDays) { $adParams['UserPasswordAgeDays'] = [int]$adConfig.UserPasswordAgeDays }
                         if ($adConfig.RecentPrivilegedDays) { $adParams['RecentPrivilegedAccountDays'] = [int]$adConfig.RecentPrivilegedDays }
+                        if ($adConfig.KrbTgtPasswordAgeDays) { $adParams['KrbTgtPasswordAgeDays'] = [int]$adConfig.KrbTgtPasswordAgeDays }
+                        if ($adConfig.KerberoastPasswordAgeDays) { $adParams['KerberoastPasswordAgeDays'] = [int]$adConfig.KerberoastPasswordAgeDays }
 
                         $adFindings = Invoke-ActiveDirectoryAssessment @adParams
                         if ($adFindings -and $adFindings.Count -gt 0) {
@@ -1846,6 +1850,7 @@ function Export-AssessmentResult {
                     DefenderCompliance = $script:DefenderComplianceData
                     AzurePolicy = $script:AzurePolicyData
                     PurviewCompliance = $script:PurviewComplianceData
+                    HybridCorrelation = $script:HybridCorrelationData
                 }
 
                 # Include assessment errors in external data for the report
@@ -2113,6 +2118,14 @@ function Start-InteractiveMode {
                 Read-Host "`n  Press Enter to continue"
             }
 
+            "Y" {
+                # Hybrid Analysis — cloud + hybrid + on-prem with correlation.
+                $script:TenantName = if ($tenantName) { $tenantName } else { Read-Host "`n  Enter tenant name" }
+                $tenantName = $script:TenantName
+                Start-HybridMode
+                Read-Host "`n  Press Enter to continue"
+            }
+
             "A" {
                 # Authentication
                 Write-Host ""
@@ -2224,6 +2237,71 @@ function Start-QuickMode {
     Write-Host "    Reports: $reportDir" -ForegroundColor Cyan
 }
 
+function Start-HybridMode {
+    <#
+    .SYNOPSIS
+        Cloud + Hybrid + On-Prem AD assessment with cross-plane correlation.
+    .DESCRIPTION
+        PR 2 of the AD integration roadmap. Runs the cloud module set plus
+        the on-prem ActiveDirectory module, then correlates identity-bearing
+        findings across the two planes via Get-HybridIdentityCorrelation.
+        The unified report renders a new "Hybrid Correlation" section
+        highlighting principals flagged in both planes.
+    #>
+    Write-Host "`n[+] Hybrid Analysis Mode" -ForegroundColor Magenta
+
+    if (-not $TenantName) {
+        $TenantName = Read-Host "Enter tenant name"
+    }
+
+    if (-not $SkipAuthentication) {
+        Connect-EntraCheck
+    }
+
+    # Core cloud set + Hybrid (AD Connect health) + on-prem AD.
+    $hybridModules = @('Core', 'IdentityProtection', 'Devices', 'SecureScore', 'Defender', 'AzurePolicy', 'Purview', 'ActiveDirectory')
+
+    $results = Invoke-ModuleAssessment -SelectedModules $hybridModules -TenantName $TenantName -OutputDir $OutputDirectory
+
+    # Correlation pass. Script:Findings was populated by the module dispatcher.
+    $corrModule = Join-Path $script:ModulesPath "EntraChecks-HybridCorrelation.psm1"
+    $hybridCorrelation = $null
+    if (Test-Path $corrModule) {
+        Import-Module $corrModule -Force
+        try {
+            $hybridCorrelation = Get-HybridIdentityCorrelation -Findings $script:Findings
+            Write-Host "    [OK] Correlated $($hybridCorrelation.CorrelationCount) principals across cloud + on-prem." -ForegroundColor Green
+        }
+        catch {
+            Write-Host "    [!] Correlation pass failed: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
+    # Stash correlation output on a script-scope variable so Export-AssessmentResult can pick it up.
+    $script:HybridCorrelationData = $hybridCorrelation
+
+    $reportDir = Export-AssessmentResult -OutputDir $OutputDirectory -TenantName $TenantName -IncludeUnified -GenerateComprehensiveReport:$GenerateComprehensiveReport -GenerateExecutiveSummary:$GenerateExecutiveSummary -GenerateExcelReport:$GenerateExcelReport -GenerateRemediationScripts:$GenerateRemediationScripts
+
+    if ($SaveSnapshot) {
+        $deltaModule = Join-Path $script:ModulesPath "EntraChecks-DeltaReporting.psm1"
+        Import-Module $deltaModule -Force
+        Save-ComplianceSnapshot -OutputDirectory $script:SnapshotsPath -TenantName $TenantName `
+            -SecureScoreData $script:SecureScoreData `
+            -DefenderComplianceData $script:DefenderComplianceData `
+            -AzurePolicyData $script:AzurePolicyData `
+            -PurviewComplianceData $script:PurviewComplianceData
+    }
+
+    # Auto-run SOC 2 readiness when SOC2.Enabled = true in config.
+    Invoke-SOC2ReadinessIfEnabled -TenantName $TenantName -OutputDirectory $OutputDirectory -OpenBrowser $false
+
+    Write-Host "`n[+] Hybrid Analysis Complete" -ForegroundColor Green
+    Write-Host "    Duration: $($results.Duration.TotalMinutes.ToString('0.0')) minutes" -ForegroundColor Cyan
+    Write-Host "    Reports: $reportDir" -ForegroundColor Cyan
+    if ($hybridCorrelation -and $hybridCorrelation.CorrelationCount -gt 0) {
+        Write-Host "    [!] $($hybridCorrelation.CorrelationCount) principals are flagged in BOTH cloud and on-prem. See the Hybrid Correlation section of the report." -ForegroundColor Yellow
+    }
+}
+
 function Start-ScheduledMode {
     # Silent mode for automation
     $ErrorActionPreference = "Stop"
@@ -2290,6 +2368,9 @@ try {
         }
         "Scheduled" {
             Start-ScheduledMode
+        }
+        "Hybrid" {
+            Start-HybridMode
         }
     }
 }

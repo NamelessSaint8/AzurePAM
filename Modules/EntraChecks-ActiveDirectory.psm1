@@ -101,6 +101,11 @@ $script:CheckMetadata['Test-RecentPrivilegedAccounts'] = @{ Category = 'Privileg
 $script:CheckMetadata['Test-NestedGroupPrivilegePaths'] = @{ Category = 'Privileged Access'; Frameworks = @('CIS-AD', 'NIST-AC-6') }
 $script:CheckMetadata['Test-SensitiveObjectACLDrift'] = @{ Category = 'Privileged Access'; Frameworks = @('CIS-AD', 'NIST-AC-6', 'SOC2-CC6.1') }
 $script:CheckMetadata['Test-ShadowGroupNames'] = @{ Category = 'Privileged Access'; Frameworks = @('CIS-AD', 'NIST-AC-6') }
+# PR 2 additions — four new checks closing the highest-value coverage gaps.
+$script:CheckMetadata['Test-LAPSDeployment'] = @{ Category = 'Privileged Access'; Frameworks = @('CIS-AD', 'MCSB-PA-5', 'SOC2-CC6.1') }
+$script:CheckMetadata['Test-DCSecuritySettings'] = @{ Category = 'Infrastructure'; Frameworks = @('CIS-AD', 'NIST-CA-7', 'MCSB-PA-6', 'SOC2-CC6.1') }
+$script:CheckMetadata['Test-KerberoastableAccounts'] = @{ Category = 'Authentication'; Frameworks = @('CIS-AD', 'MCSB-IM', 'SOC2-CC6.2') }
+$script:CheckMetadata['Test-DirSyncAccountSecurity'] = @{ Category = 'Privileged Access'; Frameworks = @('MCSB-IM', 'NIST-AC-2', 'SOC2-CC6.1') }
 
 # Critical-by-nature checks — findings at FAIL status escalate to Critical severity
 # regardless of the default High-for-FAIL mapping.
@@ -109,7 +114,11 @@ $script:CriticalChecks = @(
     'Test-KrbTgtAccountAge',
     'Test-DangerousSIDsInPrivilegedGroups',
     'Test-GPPPasswords',
-    'Test-AdminSDHolderDrift'
+    'Test-AdminSDHolderDrift',
+    # PR 2: privileged SPN-bearing account with weak hash + stale password = domain-wide compromise risk.
+    'Test-KerberoastableAccounts',
+    # PR 2: DirSync account in Domain Admins is a serious Azure AD Connect install misconfiguration.
+    'Test-DirSyncAccountSecurity'
 )
 
 #endregion
@@ -1333,6 +1342,365 @@ function Test-ShadowGroupNames {
 
 #endregion
 
+#region ==================== PR 2 — HIGH-VALUE COVERAGE GAPS ====================
+
+function Test-LAPSDeployment {
+    <#
+    .SYNOPSIS
+        Checks Local Administrator Password Solution (LAPS) schema + coverage.
+    .DESCRIPTION
+        Detects whether the LAPS schema extensions are present (legacy
+        ms-Mcs-AdmPwd* or Windows LAPS msLAPS-*), samples domain-joined
+        computers, and reports coverage percentage. Missing schema, missing
+        computer-level population, or expired passwords are flagged.
+    .PARAMETER SampleSize
+        Maximum number of computers to sample. Default 200.
+    .PARAMETER CoverageGoalPercent
+        Pass threshold. Default 90.
+    #>
+    [CmdletBinding()]
+    param(
+        [int]$SampleSize = 200,
+        [int]$CoverageGoalPercent = 90
+    )
+
+    Write-Host "`n[+] Checking LAPS deployment..." -ForegroundColor Cyan
+    try {
+        # Schema probe — look for either legacy LAPS or Windows LAPS attributes on the computer schema.
+        $schemaDN = (Get-ADRootDSE).schemaNamingContext
+        $computerSchema = Get-ADObject -Identity "CN=Computer,$schemaDN" -Properties mayContain, systemMayContain -ErrorAction SilentlyContinue
+        $may = @()
+        if ($computerSchema.mayContain) { $may += $computerSchema.mayContain }
+        if ($computerSchema.systemMayContain) { $may += $computerSchema.systemMayContain }
+
+        $hasLegacyLAPS = $may -contains 'ms-Mcs-AdmPwd'
+        $hasWindowsLAPS = $may -contains 'msLAPS-Password' -or $may -contains 'msLAPS-EncryptedPassword'
+
+        if (-not $hasLegacyLAPS -and -not $hasWindowsLAPS) {
+            Add-ADFinding -CheckName 'Test-LAPSDeployment' -Status 'FAIL' -Object 'LAPS Schema' `
+                -Description 'Neither legacy LAPS (ms-Mcs-AdmPwd) nor Windows LAPS (msLAPS-Password) schema extensions are present in the domain.' `
+                -Remediation 'Deploy Windows LAPS via the Windows LAPS GPO templates + Update-LapsADSchema. Legacy LAPS can be installed with Import-Module AdmPwd.PS; Update-AdmPwdADSchema.'
+            return
+        }
+
+        $schemaVariant = if ($hasWindowsLAPS) { 'Windows LAPS' } else { 'Legacy LAPS (ms-Mcs-AdmPwd)' }
+
+        # Coverage sampling. We look at an enabled-computer sample and see how many have the password attribute populated + not expired.
+        $pwdAttr = if ($hasWindowsLAPS) { 'msLAPS-Password', 'msLAPS-PasswordExpirationTime' } else { 'ms-Mcs-AdmPwd', 'ms-Mcs-AdmPwdExpirationTime' }
+        $computers = @(Get-ADComputer -Filter 'Enabled -eq $true' -Properties $pwdAttr -ResultSetSize $SampleSize -ErrorAction Stop)
+
+        if ($computers.Count -eq 0) {
+            Add-ADFinding -CheckName 'Test-LAPSDeployment' -Status 'INFO' -Object 'LAPS Coverage' `
+                -Description 'No enabled computers found in the domain to sample.' `
+                -Remediation 'No action needed.'
+            return
+        }
+
+        $withPwd = @($computers | Where-Object {
+                $v = $_.($pwdAttr[0])
+                $null -ne $v -and $v -ne ''
+            })
+        $expAttr = $pwdAttr[1]
+        $now = [DateTime]::UtcNow
+        $expired = @($withPwd | Where-Object {
+                $rawExp = $_.$expAttr
+                if (-not $rawExp) { return $false }
+                try {
+                    $expTime = if ($rawExp -is [long] -or $rawExp -is [int64]) {
+                        [DateTime]::FromFileTimeUtc([long]$rawExp)
+                    }
+                    elseif ($rawExp -is [DateTime]) { $rawExp }
+                    else { [DateTime]$rawExp }
+                    $expTime -lt $now
+                }
+                catch { $false }
+            })
+
+        $coverage = [math]::Round(($withPwd.Count / $computers.Count) * 100, 1)
+        $summary = "Schema: $schemaVariant; coverage: $($withPwd.Count) of $($computers.Count) sampled computers have a LAPS password populated ($coverage%); $($expired.Count) expired."
+
+        if ($coverage -ge $CoverageGoalPercent -and $expired.Count -eq 0) {
+            Add-ADFinding -CheckName 'Test-LAPSDeployment' -Status 'PASS' -Object 'LAPS Coverage' `
+                -Description $summary `
+                -Remediation 'No action needed.'
+        }
+        elseif ($coverage -lt 50 -or $expired.Count -gt ($withPwd.Count * 0.25)) {
+            Add-ADFinding -CheckName 'Test-LAPSDeployment' -Status 'FAIL' -Object 'LAPS Coverage' `
+                -Description "$summary Coverage below 50% OR more than 25% of populated passwords are expired." `
+                -Remediation 'Investigate LAPS agent deployment and the targeting GPO. Confirm the computers in scope are receiving the LAPS password-rotation policy.'
+        }
+        else {
+            Add-ADFinding -CheckName 'Test-LAPSDeployment' -Status 'WARNING' -Object 'LAPS Coverage' `
+                -Description $summary `
+                -Remediation "Bring coverage above $CoverageGoalPercent%. Investigate the $($computers.Count - $withPwd.Count) computers without a populated password."
+        }
+
+        # Top missing computers, up to 20 for the remediation trail.
+        $missing = @($computers | Where-Object {
+                $v = $_.($pwdAttr[0])
+                $null -eq $v -or $v -eq ''
+            }) | Select-Object -First 20
+        foreach ($m in $missing) {
+            Add-ADFinding -CheckName 'Test-LAPSDeployment' -Status 'WARNING' -Object $m.DNSHostName `
+                -Description "Computer does not have a populated LAPS password ($schemaVariant)." `
+                -Remediation 'Verify LAPS agent installation and that the targeting GPO applies to this computer.'
+        }
+    }
+    catch {
+        Add-ADFinding -CheckName 'Test-LAPSDeployment' -Status 'WARNING' -Object 'LAPS' `
+            -Description "Unable to evaluate LAPS deployment: $($_.Exception.Message)" `
+            -Remediation 'Ensure the running user can read computer accounts and the LAPS schema attributes.'
+    }
+}
+
+function Test-DCSecuritySettings {
+    <#
+    .SYNOPSIS
+        Audits per-DC security settings (LDAP signing, channel binding, SMB signing, SMBv1, null sessions).
+    .DESCRIPTION
+        Iterates every DC and queries its registry via Invoke-Command for the
+        critical hardening settings. Failures are scoped to a single DC so a
+        locked-down DC doesn't poison the assessment for the rest.
+    #>
+    [CmdletBinding()]
+    param()
+
+    Write-Host "`n[+] Auditing DC security settings..." -ForegroundColor Cyan
+    try {
+        $dcs = Get-ADDomainController -Filter *
+    }
+    catch {
+        Add-ADFinding -CheckName 'Test-DCSecuritySettings' -Status 'WARNING' -Object 'Domain Controllers' `
+            -Description "Unable to enumerate DCs: $($_.Exception.Message)" `
+            -Remediation 'Check permissions.'
+        return
+    }
+
+    # Registry probes. Each entry: {Label; Hive; Path; Value; ExpectedValues (array of OK values); Remediation}.
+    $probes = @(
+        @{ Label = 'LDAP server signing'; Path = 'SYSTEM\CurrentControlSet\Services\NTDS\Parameters'; Value = 'LDAPServerIntegrity'; ExpectedValues = @(2); Remediation = 'Set HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters\LDAPServerIntegrity = 2 (Require signing). Enforce via GPO.' },
+        @{ Label = 'LDAP channel binding'; Path = 'SYSTEM\CurrentControlSet\Services\NTDS\Parameters'; Value = 'LdapEnforceChannelBinding'; ExpectedValues = @(2); Remediation = 'Set HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters\LdapEnforceChannelBinding = 2 (Always). See ADV190023.' },
+        @{ Label = 'SMB signing required'; Path = 'SYSTEM\CurrentControlSet\Services\LanManServer\Parameters'; Value = 'RequireSecuritySignature'; ExpectedValues = @(1); Remediation = 'Set HKLM:\SYSTEM\CurrentControlSet\Services\LanManServer\Parameters\RequireSecuritySignature = 1. Enforce via GPO: Microsoft network server: Digitally sign communications (always).' },
+        @{ Label = 'SMBv1 disabled'; Path = 'SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters'; Value = 'SMB1'; ExpectedValues = @(0, $null); Remediation = 'Disable SMBv1: Disable-WindowsOptionalFeature -Online -FeatureName SMB1Protocol.' },
+        @{ Label = 'Restrict anonymous'; Path = 'SYSTEM\CurrentControlSet\Control\Lsa'; Value = 'RestrictAnonymous'; ExpectedValues = @(1, 2); Remediation = 'Set HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\RestrictAnonymous = 1 (or 2). Restricts null-session access.' }
+    )
+
+    $anyFail = $false
+    foreach ($dc in $dcs) {
+        try {
+            $result = Invoke-Command -ComputerName $dc.HostName -ScriptBlock {
+                param($probes)
+                $out = @{}
+                foreach ($p in $probes) {
+                    try {
+                        $v = Get-ItemProperty -Path "HKLM:\$($p.Path)" -Name $p.Value -ErrorAction Stop
+                        $out[$p.Label] = $v.($p.Value)
+                    }
+                    catch {
+                        $out[$p.Label] = $null
+                    }
+                }
+                return $out
+            } -ArgumentList (, $probes) -ErrorAction Stop
+        }
+        catch {
+            Add-ADFinding -CheckName 'Test-DCSecuritySettings' -Status 'WARNING' -Object $dc.HostName `
+                -Description "PSRemoting / registry query unavailable on this DC: $($_.Exception.Message)" `
+                -Remediation 'Enable PSRemoting (Enable-PSRemoting) or run this check directly on the DC. Check is advisory until this resolves.'
+            continue
+        }
+
+        foreach ($p in $probes) {
+            $actual = $result[$p.Label]
+            $ok = $false
+            foreach ($expected in $p.ExpectedValues) {
+                if ($null -eq $expected -and $null -eq $actual) { $ok = $true; break }
+                if ($actual -eq $expected) { $ok = $true; break }
+            }
+            if ($ok) {
+                Add-ADFinding -CheckName 'Test-DCSecuritySettings' -Status 'PASS' -Object "$($dc.HostName) - $($p.Label)" `
+                    -Description "$($p.Label) on $($dc.HostName) is compliant (value: $actual)." `
+                    -Remediation 'No action needed.'
+            }
+            else {
+                $anyFail = $true
+                Add-ADFinding -CheckName 'Test-DCSecuritySettings' -Status 'FAIL' -Object "$($dc.HostName) - $($p.Label)" `
+                    -Description "$($p.Label) on $($dc.HostName) is not compliant (value: $actual; expected: $($p.ExpectedValues -join ' or '))." `
+                    -Remediation $p.Remediation
+            }
+        }
+    }
+
+    if (-not $anyFail) {
+        # Summary PASS for the check as a whole, makes filtering easier.
+        Add-ADFinding -CheckName 'Test-DCSecuritySettings' -Status 'INFO' -Object 'All DCs' `
+            -Description "All $($dcs.Count) DCs passed every probed hardening setting (LDAP signing, channel binding, SMB signing, SMBv1, null sessions)." `
+            -Remediation 'No action needed.'
+    }
+}
+
+function Test-KerberoastableAccounts {
+    <#
+    .SYNOPSIS
+        Extends Test-UserAccountsWithSPN with password-age + weak-hash correlation.
+    .DESCRIPTION
+        An account is Kerberoastable if it has an SPN, its password is
+        crackable in reasonable time (old + weak hash), and ideally it is
+        also privileged. Severity escalates accordingly.
+    .PARAMETER PasswordAgeDays
+        Flag SPN-bearing accounts whose password is older than this. Default 90.
+    #>
+    [CmdletBinding()]
+    param(
+        [int]$PasswordAgeDays = 90
+    )
+
+    Write-Host "`n[+] Checking Kerberoastable accounts (SPN + password age + hash support)..." -ForegroundColor Cyan
+    try {
+        $users = @(Get-ADUser -Filter { ServicePrincipalName -like '*' } `
+                -Properties ServicePrincipalName, PasswordLastSet, 'msDS-SupportedEncryptionTypes', MemberOf, Enabled |
+                Where-Object { $_.Enabled })
+        if ($users.Count -eq 0) {
+            Add-ADFinding -CheckName 'Test-KerberoastableAccounts' -Status 'PASS' -Object 'All Users' `
+                -Description 'No enabled user accounts with SPNs.' -Remediation 'No action needed.'
+            return
+        }
+
+        $now = Get-Date
+        # AES flag constants per MS-KILE: 0x8=AES128, 0x10=AES256. 0x18 = both.
+        $aesBits = 0x18
+        $privilegedNames = $script:PrivilegedGroups
+        $anyFail = $false
+
+        foreach ($u in $users) {
+            $days = if ($u.PasswordLastSet) { ($now - $u.PasswordLastSet).Days } else { 99999 }
+            $supportedEnc = if ($null -ne $u.'msDS-SupportedEncryptionTypes') { [int]$u.'msDS-SupportedEncryptionTypes' } else { 0 }
+            $aesOnly = (($supportedEnc -band $aesBits) -eq $aesBits) -and (($supportedEnc -band 0x4) -eq 0)
+            $isPrivileged = $false
+            if ($u.MemberOf) {
+                foreach ($dn in $u.MemberOf) {
+                    foreach ($p in $privilegedNames) {
+                        if ($dn -like "CN=$p,*") { $isPrivileged = $true; break }
+                    }
+                    if ($isPrivileged) { break }
+                }
+            }
+
+            $label = if ($isPrivileged) { "$($u.SamAccountName) [PRIVILEGED]" } else { $u.SamAccountName }
+            $detail = "PasswordAge=${days}d; SupportedEnc=0x$([Convert]::ToString($supportedEnc, 16)); AES-only=$aesOnly; Privileged=$isPrivileged"
+
+            if ($isPrivileged -and -not $aesOnly) {
+                $anyFail = $true
+                Add-ADFinding -CheckName 'Test-KerberoastableAccounts' -Status 'FAIL' -Object $label `
+                    -Description "Privileged SPN-bearing account with RC4-capable hash: $detail" `
+                    -Remediation 'Migrate to a gMSA. If that is impossible, set msDS-SupportedEncryptionTypes to AES-only (0x18) and rotate the password. Privileged SPN accounts are domain-wide compromise targets.'
+            }
+            elseif (-not $aesOnly -and $days -gt $PasswordAgeDays) {
+                $anyFail = $true
+                Add-ADFinding -CheckName 'Test-KerberoastableAccounts' -Status 'FAIL' -Object $label `
+                    -Description "SPN-bearing account with RC4-capable hash and password age > ${PasswordAgeDays}d: $detail" `
+                    -Remediation 'Rotate the password and set msDS-SupportedEncryptionTypes to AES-only (0x18). Prefer migrating to a gMSA.'
+            }
+            elseif (-not $aesOnly) {
+                Add-ADFinding -CheckName 'Test-KerberoastableAccounts' -Status 'WARNING' -Object $label `
+                    -Description "SPN-bearing account with RC4-capable hash (password is fresh): $detail" `
+                    -Remediation 'Set msDS-SupportedEncryptionTypes to AES-only (0x18) to eliminate the RC4 Kerberoast surface. Prefer gMSA.'
+            }
+            else {
+                Add-ADFinding -CheckName 'Test-KerberoastableAccounts' -Status 'INFO' -Object $label `
+                    -Description "SPN-bearing account, AES-only hash: $detail" `
+                    -Remediation 'Acceptable. Consider gMSA migration for additional protection.'
+            }
+        }
+
+        if (-not $anyFail) {
+            Add-ADFinding -CheckName 'Test-KerberoastableAccounts' -Status 'PASS' -Object 'All SPN Accounts' `
+                -Description "All $($users.Count) SPN-bearing accounts are either AES-only or have fresh passwords." `
+                -Remediation 'No action needed.'
+        }
+    }
+    catch {
+        Add-ADFinding -CheckName 'Test-KerberoastableAccounts' -Status 'WARNING' -Object 'Kerberoast' `
+            -Description "Unable to enumerate: $($_.Exception.Message)" `
+            -Remediation 'Check permissions.'
+    }
+}
+
+function Test-DirSyncAccountSecurity {
+    <#
+    .SYNOPSIS
+        Audits Azure AD Connect service account privilege and password age.
+    .DESCRIPTION
+        Azure AD Connect's default service account is named "MSOL_*". It must
+        NOT be a member of Domain Admins, Enterprise Admins, Account Operators,
+        or Backup Operators. Its password should be rotated regularly by Azure
+        AD Connect; staleness is a hint the install is broken.
+    #>
+    [CmdletBinding()]
+    param()
+
+    Write-Host "`n[+] Checking Azure AD Connect service account..." -ForegroundColor Cyan
+    try {
+        $accounts = @(Get-ADUser -Filter { Name -like 'MSOL_*' } `
+                -Properties MemberOf, PasswordLastSet, whenCreated, Enabled)
+        if ($accounts.Count -eq 0) {
+            Add-ADFinding -CheckName 'Test-DirSyncAccountSecurity' -Status 'INFO' -Object 'DirSync Account' `
+                -Description 'No accounts matching "MSOL_*" found. Either Azure AD Connect is not installed, or its service account was renamed from the default.' `
+                -Remediation 'If your tenant uses Azure AD Connect but the service account was renamed, manually verify its group membership + password hygiene.'
+            return
+        }
+
+        $disallowedGroups = @('Domain Admins', 'Enterprise Admins', 'Account Operators', 'Backup Operators', 'Schema Admins', 'Administrators')
+        $now = Get-Date
+        $anyFail = $false
+
+        foreach ($a in $accounts) {
+            $days = if ($a.PasswordLastSet) { ($now - $a.PasswordLastSet).Days } else { 99999 }
+            $offending = @()
+            foreach ($dn in $a.MemberOf) {
+                foreach ($g in $disallowedGroups) {
+                    if ($dn -like "CN=$g,*") { $offending += $g }
+                }
+            }
+
+            if ($offending.Count -gt 0) {
+                $anyFail = $true
+                Add-ADFinding -CheckName 'Test-DirSyncAccountSecurity' -Status 'FAIL' -Object $a.SamAccountName `
+                    -Description "Azure AD Connect service account is a member of disallowed group(s): $($offending -join ', '). This violates the Azure AD Connect permissions model and is a significant risk." `
+                    -Remediation 'Remove this account from the listed groups. The Azure AD Connect wizard only needs the Directory Synchronization Account role plus specific replication rights on the domain root.'
+            }
+            else {
+                Add-ADFinding -CheckName 'Test-DirSyncAccountSecurity' -Status 'PASS' -Object $a.SamAccountName `
+                    -Description 'Azure AD Connect service account is not a member of any disallowed privileged group.' `
+                    -Remediation 'No action needed.'
+            }
+
+            if ($days -gt 365) {
+                Add-ADFinding -CheckName 'Test-DirSyncAccountSecurity' -Status 'WARNING' -Object $a.SamAccountName `
+                    -Description "Azure AD Connect service account password is $days days old. Azure AD Connect typically rotates this automatically; staleness suggests the install is broken." `
+                    -Remediation 'Investigate the Azure AD Connect installation health. Consider running the wizard again to re-register the service account.'
+            }
+
+            Add-ADFinding -CheckName 'Test-DirSyncAccountSecurity' -Status 'INFO' -Object $a.SamAccountName `
+                -Description "Enabled=$($a.Enabled); PasswordLastSet=$($a.PasswordLastSet) ($days days ago); whenCreated=$($a.whenCreated)" `
+                -Remediation 'Reference only.'
+        }
+
+        if (-not $anyFail) {
+            Add-ADFinding -CheckName 'Test-DirSyncAccountSecurity' -Status 'PASS' -Object 'DirSync Accounts' `
+                -Description "All $($accounts.Count) MSOL_* accounts pass the disallowed-group check." `
+                -Remediation 'No action needed.'
+        }
+    }
+    catch {
+        Add-ADFinding -CheckName 'Test-DirSyncAccountSecurity' -Status 'WARNING' -Object 'DirSync' `
+            -Description "Unable to enumerate: $($_.Exception.Message)" `
+            -Remediation 'Check permissions.'
+    }
+}
+
+#endregion
+
 #region ==================== MAIN ENTRY POINT ====================
 
 <#
@@ -1360,6 +1728,7 @@ function Invoke-ActiveDirectoryAssessment {
         [int]$UserPasswordAgeDays = $script:DefaultUserPasswordAgeDays,
         [int]$RecentPrivilegedAccountDays = $script:DefaultRecentPrivilegedAccountDays,
         [int]$KrbTgtPasswordAgeDays = $script:DefaultKrbTgtPasswordAgeDays,
+        [int]$KerberoastPasswordAgeDays = 90,
         [string[]]$IncludeChecks,
         [string[]]$ExcludeChecks
     )
@@ -1390,7 +1759,10 @@ function Invoke-ActiveDirectoryAssessment {
         'Test-PrivilegedSmartcardRequirement', 'Test-PrivilegedGroupCreep', 'Test-AdminSDHolderDrift',
         'Test-DangerousSIDsInPrivilegedGroups', 'Test-PasswordsInDescription', 'Test-UserAccountsWithSPN',
         'Test-OUAndGPODelegation', 'Test-RecentPrivilegedAccounts', 'Test-NestedGroupPrivilegePaths',
-        'Test-SensitiveObjectACLDrift', 'Test-ShadowGroupNames'
+        'Test-SensitiveObjectACLDrift', 'Test-ShadowGroupNames',
+        # PR 2 additions
+        'Test-LAPSDeployment', 'Test-DCSecuritySettings', 'Test-KerberoastableAccounts',
+        'Test-DirSyncAccountSecurity'
     )
 
     $toRun = if ($IncludeChecks) {
@@ -1414,6 +1786,9 @@ function Invoke-ActiveDirectoryAssessment {
                 }
                 'Test-RecentPrivilegedAccounts' {
                     & $check -RecentDays $RecentPrivilegedAccountDays
+                }
+                'Test-KerberoastableAccounts' {
+                    & $check -PasswordAgeDays $KerberoastPasswordAgeDays
                 }
                 default {
                     & $check
@@ -1466,7 +1841,12 @@ Export-ModuleMember -Function @(
     'Test-RecentPrivilegedAccounts',
     'Test-NestedGroupPrivilegePaths',
     'Test-SensitiveObjectACLDrift',
-    'Test-ShadowGroupNames'
+    'Test-ShadowGroupNames',
+    # PR 2 additions
+    'Test-LAPSDeployment',
+    'Test-DCSecuritySettings',
+    'Test-KerberoastableAccounts',
+    'Test-DirSyncAccountSecurity'
 )
 
 #endregion

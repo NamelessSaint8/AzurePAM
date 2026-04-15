@@ -543,6 +543,7 @@ try {
         -SecureScore $secureScoreForReport `
         -AzurePolicy $externalData.AzurePolicy `
         -PurviewCompliance $externalData.PurviewCompliance `
+        -HybridCorrelation $externalData.HybridCorrelation `
         -IncludeSections @('All')
 
     Write-Host "    HTML report generated successfully" -ForegroundColor Green
@@ -772,6 +773,7 @@ if ($GenerateExcelReport) {
                 -SecureScore $ssForExcel `
                 -AzurePolicy $externalData.AzurePolicy `
                 -PurviewCompliance $externalData.PurviewCompliance `
+                -HybridCorrelation $externalData.HybridCorrelation `
                 -UseImportExcel
 
             Write-Host "    [OK] Excel workbook generated: $excelPath" -ForegroundColor Green

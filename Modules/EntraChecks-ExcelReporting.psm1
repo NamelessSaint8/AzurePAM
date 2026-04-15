@@ -73,6 +73,9 @@ function New-EnhancedExcelReport {
 
         [object]$PurviewCompliance,
 
+        # PR 2 (AD-Hybrid): output of Get-HybridIdentityCorrelation.
+        [object]$HybridCorrelation,
+
         [switch]$UseImportExcel
     )
 
@@ -101,13 +104,15 @@ function New-EnhancedExcelReport {
         # Use ImportExcel module for multi-sheet Excel workbook
         Write-Verbose "Generating Excel workbook with ImportExcel module..."
         New-ExcelWorkbook -Findings $enhancedFindings -OutputPath $OutputPath -TenantInfo $TenantInfo `
-            -SecureScore $SecureScore -AzurePolicy $AzurePolicy -PurviewCompliance $PurviewCompliance
+            -SecureScore $SecureScore -AzurePolicy $AzurePolicy -PurviewCompliance $PurviewCompliance `
+            -HybridCorrelation $HybridCorrelation
     }
     else {
         # Fall back to multiple CSV files
         Write-Verbose "Generating CSV files (ImportExcel not available)..."
         New-CSVWorkbook -Findings $enhancedFindings -OutputPath $OutputPath -TenantInfo $TenantInfo `
-            -SecureScore $SecureScore -AzurePolicy $AzurePolicy -PurviewCompliance $PurviewCompliance
+            -SecureScore $SecureScore -AzurePolicy $AzurePolicy -PurviewCompliance $PurviewCompliance `
+            -HybridCorrelation $HybridCorrelation
     }
 
     return $OutputPath
@@ -128,7 +133,9 @@ function New-ExcelWorkbook {
 
         [object]$AzurePolicy,
 
-        [object]$PurviewCompliance
+        [object]$PurviewCompliance,
+
+        [object]$HybridCorrelation
     )
 
     # Calculate summaries
@@ -324,6 +331,15 @@ function New-ExcelWorkbook {
         }
     }
 
+    # 13. Hybrid Correlation (PR 2 — AD integration)
+    if ($HybridCorrelation) {
+        Write-Verbose "Creating Hybrid Correlation sheet..."
+        $hcRows = @(ConvertTo-HybridCorrelationRows -HybridCorrelation $HybridCorrelation)
+        if ($hcRows.Count -gt 0) {
+            $hcRows | Export-Excel -Path $OutputPath -WorksheetName 'Hybrid Correlation' -AutoSize -BoldTopRow -FreezeTopRow -AutoFilter
+        }
+    }
+
     Write-Host "[OK] Excel workbook created: $OutputPath" -ForegroundColor Green
 }
 
@@ -398,6 +414,33 @@ function ConvertTo-AzurePolicyRows {
     return $rows
 }
 
+function ConvertTo-HybridCorrelationRows {
+    <#
+    .SYNOPSIS
+        Flattens Get-HybridIdentityCorrelation output into one row per
+        correlated principal (PR 2 — AD integration).
+    #>
+    param([Parameter(Mandatory)] [object]$HybridCorrelation)
+
+    $rows = @()
+    if ($HybridCorrelation.CorrelatedPrincipals) {
+        foreach ($c in $HybridCorrelation.CorrelatedPrincipals) {
+            $rows += [PSCustomObject]@{
+                Principal = $c.Principal
+                Confidence = $c.Confidence
+                MatchKey = $c.MatchKey
+                CloudFindingCount = $c.CloudCount
+                OnPremFindingCount = $c.OnPremCount
+                MaxCloudSeverity = $c.MaxCloudSeverity
+                MaxOnPremSeverity = $c.MaxOnPremSeverity
+                CloudFindingsSummary = ($c.CloudFindings | ForEach-Object { $_.Description } | Select-Object -First 3) -join ' | '
+                OnPremFindingsSummary = ($c.OnPremFindings | ForEach-Object { $_.Description } | Select-Object -First 3) -join ' | '
+            }
+        }
+    }
+    return $rows
+}
+
 function ConvertTo-PurviewRows {
     <#
     .SYNOPSIS
@@ -432,7 +475,7 @@ function New-CSVWorkbook {
         CSV fallback for environments without the ImportExcel module.
 
     .DESCRIPTION
-        Mirrors the 9-sheet (now 12-sheet when the new optional inputs are
+        Mirrors the 9-sheet (now up to 13-sheet when all optional inputs are
         provided) structure of New-ExcelWorkbook, one CSV per sheet, in a
         sibling directory next to the would-be .xlsx. Each CSV carries the
         same columns as its Excel counterpart so users can re-combine them via
@@ -452,7 +495,9 @@ function New-CSVWorkbook {
 
         [object]$AzurePolicy,
 
-        [object]$PurviewCompliance
+        [object]$PurviewCompliance,
+
+        [object]$HybridCorrelation
     )
 
     # Create directory for CSV files
@@ -621,6 +666,12 @@ function New-CSVWorkbook {
         $pvRows = @(ConvertTo-PurviewRows -PurviewCompliance $PurviewCompliance)
         if ($pvRows.Count -gt 0) {
             $pvRows | Export-Csv -LiteralPath (Join-Path $csvDir '12-Purview.csv') -NoTypeInformation -Encoding UTF8
+        }
+    }
+    if ($HybridCorrelation) {
+        $hcRows = @(ConvertTo-HybridCorrelationRows -HybridCorrelation $HybridCorrelation)
+        if ($hcRows.Count -gt 0) {
+            $hcRows | Export-Csv -LiteralPath (Join-Path $csvDir '13-HybridCorrelation.csv') -NoTypeInformation -Encoding UTF8
         }
     }
 

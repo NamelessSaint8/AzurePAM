@@ -89,6 +89,11 @@ function New-EnhancedHTMLReport {
 
         [object]$PurviewCompliance,
 
+        # PR 2 (AD-Hybrid): output of Get-HybridIdentityCorrelation. When
+        # provided, a new "Hybrid Correlation" section renders showing
+        # principals flagged in BOTH cloud and on-prem findings.
+        [object]$HybridCorrelation,
+
         # PR 3 backports.
         # Branding context (Get-ReportBrandingContext output). When provided,
         # overrides report title, header gradient, organization name, and logo.
@@ -222,6 +227,7 @@ function New-EnhancedHTMLReport {
     $htmlSecureScore = Get-SecureScoreSection -SecureScore $SecureScore
     $htmlAzurePolicy = Get-AzurePolicySection -AzurePolicy $AzurePolicy
     $htmlPurview = Get-PurviewSection -PurviewCompliance $PurviewCompliance
+    $htmlHybridCorr = Get-HybridCorrelationSection -HybridCorrelation $HybridCorrelation
     $htmlDetailed = Get-DetailedFindingsSection -Findings $enhancedFindings -LowConfidenceCheckNames $effectiveLowConfidence
     $htmlJavaScript = Get-HTMLJavaScript
 
@@ -258,6 +264,7 @@ function New-EnhancedHTMLReport {
         $htmlSecureScore
         $htmlAzurePolicy
         $htmlPurview
+        $htmlHybridCorr
         $htmlDetailed
         $integrityBlock
     </div>
@@ -1046,6 +1053,7 @@ function Get-HTMLNavigation {
         <li><a href="#secure-score">Secure Score</a></li>
         <li><a href="#azure-policy">Azure Policy</a></li>
         <li><a href="#purview">Purview</a></li>
+        <li><a href="#hybrid-correlation">Hybrid Correlation</a></li>
         <li><a href="#detailed">Detailed Findings</a></li>
     </ul>
 </nav>
@@ -1305,6 +1313,85 @@ function Get-PurviewSection {
             <div>configured</div>
         </div>
     </div>
+</section>
+"@
+}
+
+function Get-HybridCorrelationSection {
+    <#
+    .SYNOPSIS
+        Renders the Hybrid Correlation section (PR 2 — AD integration).
+    .DESCRIPTION
+        Accepts output of Get-HybridIdentityCorrelation from
+        EntraChecks-HybridCorrelation.psm1. Shows principals flagged in BOTH
+        cloud (Entra) and on-prem (AD) findings.
+    #>
+    param([object]$HybridCorrelation)
+
+    $hint = 'This section populates only when a Hybrid Analysis run has executed (menu [Y] or -Mode Hybrid). Cloud-only runs skip correlation.'
+    if (-not $HybridCorrelation) {
+        return @"
+<section class="hybrid-correlation" id="hybrid-correlation">
+    <h2 class="section-title">&#128279; Hybrid Correlation</h2>
+    $(Get-NotCollectedPlaceholder -SectionName 'Hybrid Correlation' -Hint $hint)
+</section>
+"@
+    }
+
+    $corrCount = if ($HybridCorrelation.CorrelationCount) { $HybridCorrelation.CorrelationCount } else { 0 }
+    $cloudTotal = if ($HybridCorrelation.TotalCloudFindings) { $HybridCorrelation.TotalCloudFindings } else { 0 }
+    $onPremTotal = if ($HybridCorrelation.TotalOnPremFindings) { $HybridCorrelation.TotalOnPremFindings } else { 0 }
+
+    $bodyRows = ''
+    if ($HybridCorrelation.CorrelatedPrincipals -and $HybridCorrelation.CorrelatedPrincipals.Count -gt 0) {
+        $top = $HybridCorrelation.CorrelatedPrincipals |
+            Sort-Object { $_.CloudCount + $_.OnPremCount } -Descending |
+            Select-Object -First 10
+        foreach ($c in $top) {
+            $principal = [System.Web.HttpUtility]::HtmlEncode([string]$c.Principal)
+            $conf = [System.Web.HttpUtility]::HtmlEncode([string]$c.Confidence)
+            $matchKey = [System.Web.HttpUtility]::HtmlEncode([string]$c.MatchKey)
+            $cloudSev = [System.Web.HttpUtility]::HtmlEncode([string]$c.MaxCloudSeverity)
+            $onPremSev = [System.Web.HttpUtility]::HtmlEncode([string]$c.MaxOnPremSeverity)
+            $bodyRows += "<tr><td>$principal</td><td>$conf / $matchKey</td><td>$($c.CloudCount) ($cloudSev)</td><td>$($c.OnPremCount) ($onPremSev)</td></tr>`n"
+        }
+    }
+
+    $table = if ($bodyRows) {
+        @"
+    <h3 style="margin-top: 24px;">Top correlated principals</h3>
+    <p style="font-size: 0.85em; color: #605e5c;">Principals flagged in BOTH cloud (Entra) and on-prem (Active Directory) findings. <code>Exact</code> = UPN match; <code>Inferred</code> = sAMAccountName match with no UPN-level confirmation.</p>
+    <table>
+        <thead><tr><th>Principal</th><th>Match</th><th>Cloud findings (max severity)</th><th>On-prem findings (max severity)</th></tr></thead>
+        <tbody>$bodyRows</tbody>
+    </table>
+"@
+    }
+    else {
+        '<p class="compliance-fallback-note">No principals were flagged in both planes during this run.</p>'
+    }
+
+    return @"
+<section class="hybrid-correlation" id="hybrid-correlation">
+    <h2 class="section-title">&#128279; Hybrid Correlation</h2>
+    <div class="dashboard-grid">
+        <div class="metric-card $(if ($corrCount -gt 0) { 'high' } else { '' })">
+            <div class="metric-label">Correlated principals</div>
+            <div class="metric-value">$corrCount</div>
+            <div>flagged in both planes</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-label">Cloud findings indexed</div>
+            <div class="metric-value">$cloudTotal</div>
+            <div>identity-bearing</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-label">On-prem findings indexed</div>
+            <div class="metric-value">$onPremTotal</div>
+            <div>identity-bearing</div>
+        </div>
+    </div>
+    $table
 </section>
 "@
 }

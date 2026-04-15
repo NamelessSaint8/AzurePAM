@@ -1,8 +1,8 @@
 # Active Directory (On-Prem) Module Guide
 
 **Module:** `EntraChecks-ActiveDirectory.psm1`
-**Status:** Shipping in v1.5.1 (this PR migrated the stand-alone `ad/ActiveDirectoryv3.ps1` script into a first-class EntraChecks module.)
-**Coverage:** 29 read-only checks against on-premises Active Directory covering privileged access, authentication, delegation, account lifecycle, and infrastructure.
+**Status:** Shipping in v1.6.0 (PR 2 adds four new checks — LAPS, DC security settings, Kerberoastable correlation, DirSync account audit — plus the Hybrid Analysis mode).
+**Coverage:** 33 read-only checks against on-premises Active Directory covering privileged access, authentication, delegation, account lifecycle, and infrastructure.
 
 This guide covers: prerequisites, how to run the module, graceful degradation behavior, permission model, finding schema, and a full list of the 29 checks with their Trust Service Criteria / CIS / NIST mappings.
 
@@ -145,11 +145,11 @@ Optional block in `config/entrachecks.config.json`:
 
 ---
 
-## 7. The 29 checks
+## 7. The 33 checks
 
 Grouped by Category. Each row shows the CheckName (callable individually), its escalation ceiling (max Severity when it FAILs), and compliance mappings.
 
-### Privileged Access (10 checks)
+### Privileged Access (12 checks)
 
 | CheckName | Max Severity | Frameworks |
 |---|---|---|
@@ -166,8 +166,10 @@ Grouped by Category. Each row shows the CheckName (callable individually), its e
 | `Test-SIDHistory` | Medium | CIS-AD, NIST-AC-6 |
 | `Test-SensitiveObjectACLDrift` | High | CIS-AD, NIST-AC-6, SOC2-CC6.1 |
 | `Test-ShadowGroupNames` | Medium | CIS-AD, NIST-AC-6 |
+| `Test-LAPSDeployment` (**PR 2**) | High | CIS-AD, MCSB-PA-5, SOC2-CC6.1 |
+| `Test-DirSyncAccountSecurity` (**PR 2**) | **Critical** | MCSB-IM, NIST-AC-2, SOC2-CC6.1 |
 
-### Authentication (6 checks)
+### Authentication (7 checks)
 
 | CheckName | Max Severity | Frameworks |
 |---|---|---|
@@ -177,6 +179,7 @@ Grouped by Category. Each row shows the CheckName (callable individually), its e
 | `Test-DuplicateSPNs` | High | CIS-AD, MCSB-IM |
 | `Test-UserAccountsWithSPN` | Medium | CIS-AD, MCSB-IM, SOC2-CC6.2 |
 | `Test-GPPPasswords` | **Critical** | CIS-AD, NIST-IA-5, SOC2-CC6.1, PCI-DSS-3.5 |
+| `Test-KerberoastableAccounts` (**PR 2**) | **Critical** | CIS-AD, MCSB-IM, SOC2-CC6.2 |
 
 ### Delegation (2 checks)
 
@@ -194,7 +197,7 @@ Grouped by Category. Each row shows the CheckName (callable individually), its e
 | `Test-ADServiceAccounts` | Medium (INFO-only) | CIS-AD, NIST-IA-5 |
 | `Test-PasswordsInDescription` | High | CIS-AD, NIST-IA-5 |
 
-### Infrastructure (4 checks)
+### Infrastructure (5 checks)
 
 | CheckName | Max Severity | Frameworks |
 |---|---|---|
@@ -202,6 +205,7 @@ Grouped by Category. Each row shows the CheckName (callable individually), its e
 | `Test-DomainControllers` | Low (INFO-only) | CIS-AD, NIST-CM-8, SOC2-CC6.1 |
 | `Test-DomainTrusts` | Medium | CIS-AD, NIST-AC-3 |
 | `Test-GPOInventory` | Low (INFO-only) | CIS-AD |
+| `Test-DCSecuritySettings` (**PR 2**) | High | CIS-AD, NIST-CA-7, MCSB-PA-6, SOC2-CC6.1 |
 
 ---
 
@@ -245,19 +249,78 @@ Individual `Test-*` calls append findings to `$script:Findings` inside the modul
 
 ---
 
-## 10. What's next (PR 2)
+## 10. PR 2 additions — the four new checks
 
-PR 2 will add:
+PR 2 shipped four new checks that close the highest-value coverage gaps from the initial audit.
 
-- **Four new checks** — `Test-LAPSDeployment`, `Test-DCSecuritySettings` (LDAP signing / channel binding, SMB signing), `Test-KerberoastableAccounts` (password-age correlation on top of `Test-UserAccountsWithSPN`), `Test-DirSyncAccountSecurity` (Azure AD Connect service account privilege audit).
-- **New `[H] Hybrid Analysis` menu item** that runs cloud + hybrid + AD checks in one invocation and produces a **correlation report** (users flagged in both Entra Identity Protection AND on-prem AD).
-- **SOC 2 CC6 evidence section** — AD findings flow into the SOC 2 report's control-evidence tables automatically.
+### `Test-LAPSDeployment`
 
-Deferred to future PRs:
+Detects whether the Local Administrator Password Solution schema extensions are present (legacy `ms-Mcs-AdmPwd*` or Windows LAPS `msLAPS-*`), samples up to 200 enabled computers, and reports coverage percentage + expired-password count.
+
+- **PASS** when schema is extended AND >=90% of sampled computers have a populated, non-expired LAPS password.
+- **FAIL** when the schema is missing, coverage <50%, or >25% of populated passwords are expired.
+- **WARNING** for the band in between.
+- Per-computer WARNING for the first 20 missing hosts so you can trace the gap.
+
+Tuning: `LAPSCoverageGoalPercent` (default 90) and `LAPSSampleSize` (default 200) in `config/entrachecks.config.json`.
+
+### `Test-DCSecuritySettings`
+
+Probes each DC's registry via PSRemoting for five hardening settings:
+1. **LDAP server signing** — `LDAPServerIntegrity = 2`
+2. **LDAP channel binding** — `LdapEnforceChannelBinding = 2` (ADV190023)
+3. **SMB signing required** — `RequireSecuritySignature = 1`
+4. **SMBv1 disabled** — `SMB1` absent or `0`
+5. **Restrict anonymous** — `RestrictAnonymous` in `{1, 2}`
+
+One finding per (DC, setting) pair. DCs that block PSRemoting emit a WARNING scoped to that DC without failing the rest of the assessment.
+
+### `Test-KerberoastableAccounts`
+
+Extends `Test-UserAccountsWithSPN` with password-age + weak-hash correlation. Severity escalates in a four-tier matrix:
+
+| Context | Status | Severity |
+|---|---|---|
+| Privileged SPN-bearer + RC4-capable hash | FAIL | **Critical** (domain-wide compromise target) |
+| Non-privileged SPN-bearer + RC4 + password >90 days | FAIL | High |
+| Non-privileged SPN-bearer + RC4 + fresh password | WARNING | Medium |
+| AES-only SPN-bearer | INFO | Low |
+
+Tuning: `KerberoastPasswordAgeDays` (default 90).
+
+### `Test-DirSyncAccountSecurity`
+
+Audits Azure AD Connect service accounts (default naming pattern `MSOL_*`). FAILs if the service account is in Domain Admins, Enterprise Admins, Account Operators, Backup Operators, Schema Admins, or local Administrators. WARNs if password age exceeds 365 days (Azure AD Connect rotates automatically; staleness suggests a broken install).
+
+Emits INFO when no `MSOL_*` accounts are found — meaning either Azure AD Connect isn't in use or the service account was renamed from the default. In the latter case, verify manually.
+
+---
+
+## 11. Hybrid Analysis mode (PR 2)
+
+The new `[Y] Hybrid Analysis` main-menu item (`-Mode Hybrid` on the CLI) runs cloud + hybrid + on-prem AD checks in sequence, then correlates identity-bearing findings across the two identity planes.
+
+```powershell
+# Interactive
+.\Start-EntraChecks.ps1
+# Select [Y] Hybrid Analysis
+
+# CLI
+.\Start-EntraChecks.ps1 -Mode Hybrid -TenantName "Contoso"
+```
+
+The unified report gains a **Hybrid Correlation** section showing principals flagged in BOTH planes with a Confidence flag:
+
+- **Exact** — UPN match (e.g., a user flagged risky in Entra Identity Protection AND a Domain Admin in on-prem AD).
+- **Inferred** — sAMAccountName match only (cloud UPN's left-hand side matches the on-prem sAMAccountName, but no UPN-level confirmation appeared).
+
+See [docs/Hybrid-Analysis-Guide.md](Hybrid-Analysis-Guide.md) for the full workflow including the Excel sheet + CSV file formats.
+
+---
+
+## 12. Deferred to future PRs
 
 - AD CS template vulnerabilities (ESC1-8).
 - BloodHound-style ACL abuse path enumeration.
 - SMBv1 / NetBIOS / LLMNR host enumeration.
 - Reversible-encryption audit (low finding count in practice).
-
-See [plans/AD-PR2-HybridAnalysis-Plan.md](../plans/AD-PR2-HybridAnalysis-Plan.md) for details.

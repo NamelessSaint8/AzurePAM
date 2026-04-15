@@ -178,12 +178,15 @@
     }
   },
   "ActiveDirectory": {
-    "_comment": "On-premises AD assessment module (PR 1). Disabled by default — opt in by setting Enabled=true or by selecting Module [8] / -Modules ActiveDirectory at runtime. Requires RSAT + a domain-joined Windows host.",
+    "_comment": "On-premises AD assessment module. Disabled by default — opt in by selecting Module [8] / -Modules ActiveDirectory, or invoke via [Y] Hybrid Analysis / -Mode Hybrid to run alongside the cloud checks with correlation. Requires RSAT + a domain-joined Windows host.",
     "Enabled": false,
     "UserLogonInactivityDays": 180,
     "UserPasswordAgeDays": 180,
     "RecentPrivilegedDays": 30,
     "KrbTgtPasswordAgeDays": 180,
+    "KerberoastPasswordAgeDays": 90,
+    "LAPSCoverageGoalPercent": 90,
+    "LAPSSampleSize": 200,
     "IncludeComputers": true,
     "PrivilegedGroupWhitelist": {}
   }
