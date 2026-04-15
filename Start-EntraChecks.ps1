@@ -1185,6 +1185,9 @@ function Invoke-ModuleAssessment {
                         if ($adConfig.RecentPrivilegedDays) { $adParams['RecentPrivilegedAccountDays'] = [int]$adConfig.RecentPrivilegedDays }
                         if ($adConfig.KrbTgtPasswordAgeDays) { $adParams['KrbTgtPasswordAgeDays'] = [int]$adConfig.KrbTgtPasswordAgeDays }
                         if ($adConfig.KerberoastPasswordAgeDays) { $adParams['KerberoastPasswordAgeDays'] = [int]$adConfig.KerberoastPasswordAgeDays }
+                        if ($adConfig.ParallelDCProbing) { $adParams['ParallelDCProbing'] = [bool]$adConfig.ParallelDCProbing }
+                        if ($adConfig.Tier0OUDNs) { $adParams['Tier0OUDNs'] = @($adConfig.Tier0OUDNs) }
+                        if ($adConfig.AuthorizedPrincipalsExtra) { $adParams['AuthorizedPrincipalsExtra'] = @($adConfig.AuthorizedPrincipalsExtra) }
 
                         $adFindings = Invoke-ActiveDirectoryAssessment @adParams
                         if ($adFindings -and $adFindings.Count -gt 0) {

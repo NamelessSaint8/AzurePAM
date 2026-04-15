@@ -69,6 +69,10 @@ $script:AdminPrincipals = @(
     'SYSTEM'
 )
 
+# PR 4a: extended authorized-principals list, set per-invocation via
+# Invoke-ActiveDirectoryAssessment -AuthorizedPrincipalsExtra.
+$script:AuthorizedPrincipalsExtra = @()
+
 # Per-check metadata: Category + ComplianceFrameworks. Indexed by the CheckName
 # passed to Add-ADFinding. Drives unified-report grouping and SOC 2 mapping.
 $script:CheckMetadata = @{}
@@ -106,6 +110,17 @@ $script:CheckMetadata['Test-LAPSDeployment'] = @{ Category = 'Privileged Access'
 $script:CheckMetadata['Test-DCSecuritySettings'] = @{ Category = 'Infrastructure'; Frameworks = @('CIS-AD', 'NIST-CA-7', 'MCSB-PA-6', 'SOC2-CC6.1') }
 $script:CheckMetadata['Test-KerberoastableAccounts'] = @{ Category = 'Authentication'; Frameworks = @('CIS-AD', 'MCSB-IM', 'SOC2-CC6.2') }
 $script:CheckMetadata['Test-DirSyncAccountSecurity'] = @{ Category = 'Privileged Access'; Frameworks = @('MCSB-IM', 'NIST-AC-2', 'SOC2-CC6.1') }
+# PR 4a Group A - credential hygiene
+$script:CheckMetadata['Test-LMHashStorage'] = @{ Category = 'Authentication'; Frameworks = @('CIS-AD', 'NIST-IA-5', 'MCSB-IM-4', 'SOC2-CC6.1') }
+$script:CheckMetadata['Test-NTLMv1Allowed'] = @{ Category = 'Authentication'; Frameworks = @('CIS-AD', 'NIST-IA-2', 'SOC2-CC6.2') }
+$script:CheckMetadata['Test-DCLegacyEncryption'] = @{ Category = 'Authentication'; Frameworks = @('CIS-AD', 'NIST-SC-13', 'MCSB-IM-4', 'SOC2-CC6.2') }
+$script:CheckMetadata['Test-NullSessionShares'] = @{ Category = 'Authentication'; Frameworks = @('CIS-AD', 'NIST-AC-3', 'SOC2-CC6.1') }
+$script:CheckMetadata['Test-DomainEncryptionTypesPolicy'] = @{ Category = 'Authentication'; Frameworks = @('CIS-AD', 'NIST-SC-13', 'SOC2-CC6.2') }
+# PR 4a Group B - ACL abuse paths
+$script:CheckMetadata['Test-WritablePrivilegedACLs'] = @{ Category = 'Privileged Access'; Frameworks = @('CIS-AD', 'NIST-AC-6', 'MCSB-PA-5', 'SOC2-CC6.1') }
+$script:CheckMetadata['Test-ShadowCredentialsVulnerable'] = @{ Category = 'Privileged Access'; Frameworks = @('CIS-AD', 'NIST-AC-6', 'MCSB-IM-3', 'SOC2-CC6.1') }
+$script:CheckMetadata['Test-RBCDConfigured'] = @{ Category = 'Delegation'; Frameworks = @('CIS-AD', 'NIST-AC-6', 'MCSB-IM', 'SOC2-CC6.1') }
+$script:CheckMetadata['Test-GenericWriteToSensitive'] = @{ Category = 'Privileged Access'; Frameworks = @('CIS-AD', 'NIST-AC-6', 'SOC2-CC6.1') }
 
 # Critical-by-nature checks — findings at FAIL status escalate to Critical severity
 # regardless of the default High-for-FAIL mapping.
@@ -118,7 +133,12 @@ $script:CriticalChecks = @(
     # PR 2: privileged SPN-bearing account with weak hash + stale password = domain-wide compromise risk.
     'Test-KerberoastableAccounts',
     # PR 2: DirSync account in Domain Admins is a serious Azure AD Connect install misconfiguration.
-    'Test-DirSyncAccountSecurity'
+    'Test-DirSyncAccountSecurity',
+    # PR 4a: single-step domain-compromise paths.
+    'Test-WritablePrivilegedACLs',
+    'Test-ShadowCredentialsVulnerable',
+    'Test-GenericWriteToSensitive',
+    'Test-RBCDConfigured'
 )
 
 #endregion
@@ -1701,6 +1721,701 @@ function Test-DirSyncAccountSecurity {
 
 #endregion
 
+#region ==================== PR 4a GROUP A - CREDENTIAL HYGIENE ====================
+
+function Invoke-DCRegistryProbe {
+    <#
+    .SYNOPSIS
+        Shared helper: runs a script block on every DC and returns a hashtable keyed by HostName.
+    .DESCRIPTION
+        Sequential by default; parallel fan-out when -Parallel is $true. Per-DC
+        failures produce a hashtable entry with a __Error member instead of
+        the normal probe result.
+    #>
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter(Mandatory)] [object[]]$DCs,
+        [Parameter(Mandatory)] [scriptblock]$ProbeBlock,
+        [bool]$Parallel = $false
+    )
+
+    $results = @{}
+    if ($Parallel -and $DCs.Count -gt 1) {
+        try {
+            $dcNames = $DCs | ForEach-Object { $_.HostName }
+            $outputs = Invoke-Command -ComputerName $dcNames -ScriptBlock $ProbeBlock -ErrorAction Continue
+            foreach ($out in $outputs) {
+                $results[$out.PSComputerName] = $out
+            }
+        }
+        catch {
+            Write-Verbose "Parallel DC probe failed; falling through to sequential: $($_.Exception.Message)"
+        }
+    }
+
+    foreach ($dc in $DCs) {
+        if ($results.ContainsKey($dc.HostName)) { continue }
+        try {
+            $results[$dc.HostName] = Invoke-Command -ComputerName $dc.HostName -ScriptBlock $ProbeBlock -ErrorAction Stop
+        }
+        catch {
+            $results[$dc.HostName] = [pscustomobject]@{ __Error = $_.Exception.Message }
+        }
+    }
+    return $results
+}
+
+function Test-LMHashStorage {
+    <#
+    .SYNOPSIS
+        Confirms LM hash storage is disabled (NoLMHash = 1) on every DC.
+    #>
+    [CmdletBinding()]
+    param([bool]$Parallel = $false)
+
+    Write-Host "`n[+] Checking LM hash storage policy (NoLMHash)..." -ForegroundColor Cyan
+    try {
+        $dcs = Get-ADDomainController -Filter *
+    }
+    catch {
+        Add-ADFinding -CheckName 'Test-LMHashStorage' -Status 'WARNING' -Object 'NoLMHash' `
+            -Description "Unable to enumerate DCs: $($_.Exception.Message)" -Remediation 'Check permissions.'
+        return
+    }
+
+    $probe = {
+        try { (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -Name NoLMHash -ErrorAction Stop).NoLMHash }
+        catch { $null }
+    }
+
+    $results = Invoke-DCRegistryProbe -DCs $dcs -ProbeBlock $probe -Parallel:$Parallel
+
+    $anyFail = $false
+    foreach ($dc in $dcs) {
+        $r = $results[$dc.HostName]
+        if ($r.PSObject.Properties['__Error']) {
+            Add-ADFinding -CheckName 'Test-LMHashStorage' -Status 'WARNING' -Object $dc.HostName `
+                -Description "Unable to read NoLMHash: $($r.__Error)" `
+                -Remediation 'Enable PSRemoting to the DC or run this check locally on the DC.'
+            continue
+        }
+        if ($r -eq 1) {
+            Add-ADFinding -CheckName 'Test-LMHashStorage' -Status 'PASS' -Object $dc.HostName `
+                -Description 'LM hash storage disabled (NoLMHash = 1).' -Remediation 'No action needed.'
+        }
+        else {
+            $anyFail = $true
+            Add-ADFinding -CheckName 'Test-LMHashStorage' -Status 'FAIL' -Object $dc.HostName `
+                -Description "NoLMHash on '$($dc.HostName)' is $r (expected 1). LM hashes may be stored and are cracked within minutes." `
+                -Remediation "Set HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\NoLMHash = 1 via GPO (Default Domain Controllers Policy -> Security Options -> Network security: Do not store LAN Manager hash value on next password change)."
+        }
+    }
+    if (-not $anyFail) {
+        Add-ADFinding -CheckName 'Test-LMHashStorage' -Status 'INFO' -Object 'All DCs' `
+            -Description "All $($dcs.Count) DCs enforce NoLMHash = 1." -Remediation 'No action needed.'
+    }
+}
+
+function Test-NTLMv1Allowed {
+    <#
+    .SYNOPSIS
+        Probes LmCompatibilityLevel on each DC. NTLMv1 must be refused (value 5).
+    #>
+    [CmdletBinding()]
+    param([bool]$Parallel = $false)
+
+    Write-Host "`n[+] Checking NTLMv1 acceptance (LmCompatibilityLevel)..." -ForegroundColor Cyan
+    try {
+        $dcs = Get-ADDomainController -Filter *
+    }
+    catch {
+        Add-ADFinding -CheckName 'Test-NTLMv1Allowed' -Status 'WARNING' -Object 'LmCompatibilityLevel' `
+            -Description "Unable to enumerate DCs: $($_.Exception.Message)" -Remediation 'Check permissions.'
+        return
+    }
+
+    $probe = {
+        try { (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -Name LmCompatibilityLevel -ErrorAction Stop).LmCompatibilityLevel }
+        catch { $null }
+    }
+
+    $results = Invoke-DCRegistryProbe -DCs $dcs -ProbeBlock $probe -Parallel:$Parallel
+
+    foreach ($dc in $dcs) {
+        $r = $results[$dc.HostName]
+        if ($r.PSObject.Properties['__Error']) {
+            Add-ADFinding -CheckName 'Test-NTLMv1Allowed' -Status 'WARNING' -Object $dc.HostName `
+                -Description "Unable to read LmCompatibilityLevel: $($r.__Error)" `
+                -Remediation 'Enable PSRemoting to the DC or run this check locally on the DC.'
+            continue
+        }
+
+        if ($null -eq $r -or $r -lt 3) {
+            Add-ADFinding -CheckName 'Test-NTLMv1Allowed' -Status 'FAIL' -Object $dc.HostName `
+                -Description "LmCompatibilityLevel = $r on '$($dc.HostName)'. NTLMv1 is accepted; hash is relay-vulnerable." `
+                -Remediation 'Set LmCompatibilityLevel to 5 via GPO (Network security: LAN Manager authentication level -> Send NTLMv2 response only. Refuse LM & NTLM).'
+        }
+        elseif ($r -in 3, 4) {
+            Add-ADFinding -CheckName 'Test-NTLMv1Allowed' -Status 'WARNING' -Object $dc.HostName `
+                -Description "LmCompatibilityLevel = $r on '$($dc.HostName)'. Partial NTLMv1 refusal; legacy clients can still use NTLMv1 inbound." `
+                -Remediation 'Move to LmCompatibilityLevel = 5 once legacy clients are identified and remediated.'
+        }
+        else {
+            Add-ADFinding -CheckName 'Test-NTLMv1Allowed' -Status 'PASS' -Object $dc.HostName `
+                -Description "LmCompatibilityLevel = $r (NTLMv1 fully refused)." -Remediation 'No action needed.'
+        }
+    }
+}
+
+function Test-DCLegacyEncryption {
+    <#
+    .SYNOPSIS
+        Flags DCs advertising DES or RC4 Kerberos encryption. AES-only is the goal.
+    #>
+    [CmdletBinding()]
+    param([bool]$Parallel = $false)
+
+    Write-Host "`n[+] Checking DC Kerberos encryption types..." -ForegroundColor Cyan
+    try {
+        $dcs = Get-ADDomainController -Filter *
+    }
+    catch {
+        Add-ADFinding -CheckName 'Test-DCLegacyEncryption' -Status 'WARNING' -Object 'KDCEnabledEtypes' `
+            -Description "Unable to enumerate DCs: $($_.Exception.Message)" -Remediation 'Check permissions.'
+        return
+    }
+
+    $probe = {
+        try {
+            (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Kerberos\Parameters' -Name SupportedEncryptionTypes -ErrorAction Stop).SupportedEncryptionTypes
+        }
+        catch {
+            try {
+                (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Kdc\Parameters' -Name KDCEnabledEtypes -ErrorAction Stop).KDCEnabledEtypes
+            }
+            catch { $null }
+        }
+    }
+
+    $results = Invoke-DCRegistryProbe -DCs $dcs -ProbeBlock $probe -Parallel:$Parallel
+
+    $desBits = 0x3
+    $rc4Bit = 0x4
+    $aesBits = 0x18
+
+    foreach ($dc in $dcs) {
+        $r = $results[$dc.HostName]
+        if ($r.PSObject.Properties['__Error']) {
+            Add-ADFinding -CheckName 'Test-DCLegacyEncryption' -Status 'WARNING' -Object $dc.HostName `
+                -Description "Unable to read encryption-type registry values: $($r.__Error)" `
+                -Remediation 'Enable PSRemoting to the DC or verify via certutil on the DC.'
+            continue
+        }
+
+        if ($null -eq $r) {
+            Add-ADFinding -CheckName 'Test-DCLegacyEncryption' -Status 'WARNING' -Object $dc.HostName `
+                -Description "No explicit Kerberos encryption policy on '$($dc.HostName)'. Default negotiation includes RC4." `
+                -Remediation "Configure SupportedEncryptionTypes via GPO to AES-only: Network security: Configure encryption types allowed for Kerberos -> AES128 + AES256."
+            continue
+        }
+
+        $r = [int]$r
+        $hasDes = ($r -band $desBits) -ne 0
+        $hasRc4 = ($r -band $rc4Bit) -ne 0
+        $hasAes = ($r -band $aesBits) -ne 0
+
+        if ($hasDes) {
+            Add-ADFinding -CheckName 'Test-DCLegacyEncryption' -Status 'FAIL' -Object $dc.HostName `
+                -Description "DC '$($dc.HostName)' advertises DES Kerberos encryption (value = 0x$($r.ToString('X'))). DES is cryptographically broken." `
+                -Remediation 'Remove DES bits from the encryption-types policy.'
+        }
+        elseif ($hasRc4 -and -not $hasAes) {
+            Add-ADFinding -CheckName 'Test-DCLegacyEncryption' -Status 'FAIL' -Object $dc.HostName `
+                -Description "DC '$($dc.HostName)' advertises RC4 only (value = 0x$($r.ToString('X'))). RC4 is deprecated and the Kerberoast attack surface." `
+                -Remediation 'Enable AES128 + AES256 and remove RC4 in the encryption-types policy.'
+        }
+        elseif ($hasRc4) {
+            Add-ADFinding -CheckName 'Test-DCLegacyEncryption' -Status 'WARNING' -Object $dc.HostName `
+                -Description "DC '$($dc.HostName)' supports RC4 alongside AES (value = 0x$($r.ToString('X')))." `
+                -Remediation 'Confirm no services require RC4; then remove RC4 from the encryption-types policy.'
+        }
+        else {
+            Add-ADFinding -CheckName 'Test-DCLegacyEncryption' -Status 'PASS' -Object $dc.HostName `
+                -Description "DC '$($dc.HostName)' uses AES-only Kerberos encryption (value = 0x$($r.ToString('X')))." `
+                -Remediation 'No action needed.'
+        }
+    }
+}
+
+function Test-NullSessionShares {
+    <#
+    .SYNOPSIS
+        Verifies DC anonymous-session hardening (five registry values).
+    #>
+    [CmdletBinding()]
+    param([bool]$Parallel = $false)
+
+    Write-Host "`n[+] Checking null-session / anonymous-access configuration..." -ForegroundColor Cyan
+    try {
+        $dcs = Get-ADDomainController -Filter *
+    }
+    catch {
+        Add-ADFinding -CheckName 'Test-NullSessionShares' -Status 'WARNING' -Object 'NullSessions' `
+            -Description "Unable to enumerate DCs: $($_.Exception.Message)" -Remediation 'Check permissions.'
+        return
+    }
+
+    $probe = {
+        $o = [ordered]@{}
+        try { $o['NullSessionPipes'] = (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\LanManServer\Parameters' -Name NullSessionPipes -ErrorAction Stop).NullSessionPipes } catch { $o['NullSessionPipes'] = $null }
+        try { $o['NullSessionShares'] = (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\LanManServer\Parameters' -Name NullSessionShares -ErrorAction Stop).NullSessionShares } catch { $o['NullSessionShares'] = $null }
+        try { $o['RestrictAnonymous'] = (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -Name RestrictAnonymous -ErrorAction Stop).RestrictAnonymous } catch { $o['RestrictAnonymous'] = $null }
+        try { $o['RestrictAnonymousSAM'] = (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -Name RestrictAnonymousSAM -ErrorAction Stop).RestrictAnonymousSAM } catch { $o['RestrictAnonymousSAM'] = $null }
+        try { $o['EveryoneIncludesAnonymous'] = (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -Name EveryoneIncludesAnonymous -ErrorAction Stop).EveryoneIncludesAnonymous } catch { $o['EveryoneIncludesAnonymous'] = $null }
+        [pscustomobject]$o
+    }
+
+    $results = Invoke-DCRegistryProbe -DCs $dcs -ProbeBlock $probe -Parallel:$Parallel
+
+    foreach ($dc in $dcs) {
+        $r = $results[$dc.HostName]
+        if ($r.PSObject.Properties['__Error']) {
+            Add-ADFinding -CheckName 'Test-NullSessionShares' -Status 'WARNING' -Object $dc.HostName `
+                -Description "Unable to read anonymous-session values: $($r.__Error)" `
+                -Remediation 'Enable PSRemoting to the DC or run this check locally.'
+            continue
+        }
+
+        $issues = @()
+        if ($r.NullSessionPipes -and @($r.NullSessionPipes | Where-Object { $_ }).Count -gt 0) { $issues += "NullSessionPipes populated: $($r.NullSessionPipes -join ',')" }
+        if ($r.NullSessionShares -and @($r.NullSessionShares | Where-Object { $_ }).Count -gt 0) { $issues += "NullSessionShares populated: $($r.NullSessionShares -join ',')" }
+        if ($null -eq $r.RestrictAnonymous -or $r.RestrictAnonymous -lt 1) { $issues += "RestrictAnonymous = $($r.RestrictAnonymous) (expected >= 1)" }
+        if ($null -eq $r.RestrictAnonymousSAM -or $r.RestrictAnonymousSAM -ne 1) { $issues += "RestrictAnonymousSAM = $($r.RestrictAnonymousSAM) (expected 1)" }
+        if ($r.EveryoneIncludesAnonymous -eq 1) { $issues += 'EveryoneIncludesAnonymous = 1 (expected 0)' }
+
+        if ($issues.Count -gt 0) {
+            Add-ADFinding -CheckName 'Test-NullSessionShares' -Status 'FAIL' -Object $dc.HostName `
+                -Description "Null-session misconfiguration on '$($dc.HostName)': $($issues -join '; ')" `
+                -Remediation 'Enforce via GPO: Network access: Do not allow anonymous enumeration of SAM accounts and shares -> Enabled; Network access: Let Everyone permissions apply to anonymous users -> Disabled. Clear NullSessionPipes / NullSessionShares.'
+        }
+        else {
+            Add-ADFinding -CheckName 'Test-NullSessionShares' -Status 'PASS' -Object $dc.HostName `
+                -Description "Null-session configuration compliant on '$($dc.HostName)'." -Remediation 'No action needed.'
+        }
+    }
+}
+
+function Test-DomainEncryptionTypesPolicy {
+    <#
+    .SYNOPSIS
+        Checks msDS-SupportedEncryptionTypes on the domain + every trust object.
+    #>
+    [CmdletBinding()]
+    param()
+
+    Write-Host "`n[+] Checking domain + trust encryption-types policy..." -ForegroundColor Cyan
+    $aesBits = 0x18
+    $desBits = 0x3
+    $rc4Bit = 0x4
+
+    try {
+        $domain = Get-ADDomain -Properties 'msDS-SupportedEncryptionTypes'
+        $domainEtypes = $domain.'msDS-SupportedEncryptionTypes'
+    }
+    catch {
+        Add-ADFinding -CheckName 'Test-DomainEncryptionTypesPolicy' -Status 'WARNING' -Object 'Domain' `
+            -Description "Unable to read domain encryption-types attribute: $($_.Exception.Message)" `
+            -Remediation 'Check permissions.'
+        return
+    }
+
+    if ($null -eq $domainEtypes) {
+        Add-ADFinding -CheckName 'Test-DomainEncryptionTypesPolicy' -Status 'WARNING' -Object 'Domain' `
+            -Description 'Domain msDS-SupportedEncryptionTypes is not set. Default Windows negotiation includes RC4.' `
+            -Remediation 'Set msDS-SupportedEncryptionTypes = 0x18 (AES128 + AES256) on the domain object to pin AES-only.'
+    }
+    else {
+        $v = [int]$domainEtypes
+        if (($v -band $desBits) -ne 0) {
+            Add-ADFinding -CheckName 'Test-DomainEncryptionTypesPolicy' -Status 'FAIL' -Object 'Domain' `
+                -Description "Domain msDS-SupportedEncryptionTypes = 0x$($v.ToString('X')) includes DES." `
+                -Remediation 'Remove DES bits from msDS-SupportedEncryptionTypes on the domain object.'
+        }
+        elseif (($v -band $rc4Bit) -ne 0 -and ($v -band $aesBits) -eq 0) {
+            Add-ADFinding -CheckName 'Test-DomainEncryptionTypesPolicy' -Status 'FAIL' -Object 'Domain' `
+                -Description "Domain msDS-SupportedEncryptionTypes = 0x$($v.ToString('X')) is RC4-only." `
+                -Remediation 'Set msDS-SupportedEncryptionTypes = 0x18 on the domain object.'
+        }
+        elseif (($v -band $rc4Bit) -ne 0) {
+            Add-ADFinding -CheckName 'Test-DomainEncryptionTypesPolicy' -Status 'WARNING' -Object 'Domain' `
+                -Description "Domain msDS-SupportedEncryptionTypes = 0x$($v.ToString('X')) includes RC4 alongside AES." `
+                -Remediation 'Move to AES-only (0x18) once no services depend on RC4.'
+        }
+        else {
+            Add-ADFinding -CheckName 'Test-DomainEncryptionTypesPolicy' -Status 'PASS' -Object 'Domain' `
+                -Description "Domain msDS-SupportedEncryptionTypes = 0x$($v.ToString('X')) (AES-only)." `
+                -Remediation 'No action needed.'
+        }
+    }
+
+    try {
+        $trusts = @(Get-ADTrust -Filter * -Properties 'msDS-SupportedEncryptionTypes')
+    }
+    catch {
+        return
+    }
+    foreach ($t in $trusts) {
+        $tv = $t.'msDS-SupportedEncryptionTypes'
+        if ($null -eq $tv) {
+            Add-ADFinding -CheckName 'Test-DomainEncryptionTypesPolicy' -Status 'WARNING' -Object $t.Name `
+                -Description "Trust '$($t.Name)' has no msDS-SupportedEncryptionTypes (defaults allow RC4)." `
+                -Remediation 'Set msDS-SupportedEncryptionTypes = 0x18 on the trust object.'
+            continue
+        }
+        $tv = [int]$tv
+        if (($tv -band $rc4Bit) -ne 0 -and ($tv -band $aesBits) -eq 0) {
+            Add-ADFinding -CheckName 'Test-DomainEncryptionTypesPolicy' -Status 'FAIL' -Object $t.Name `
+                -Description "Trust '$($t.Name)' msDS-SupportedEncryptionTypes = 0x$($tv.ToString('X')) is RC4-only." `
+                -Remediation 'Reconfigure the trust with AES-only encryption types.'
+        }
+    }
+}
+
+#endregion
+
+#region ==================== PR 4a GROUP B - ACL ABUSE PATHS ====================
+
+function Test-IsAuthorizedPrincipal {
+    <#
+    .SYNOPSIS
+        Returns $true if the ACE's IdentityReference is in the authorized-principals allow-list.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param([Parameter(Mandatory)] [string]$IdentityReference)
+
+    $auth = @(
+        'Domain Admins', 'Enterprise Admins', 'Administrators', 'SYSTEM',
+        'Schema Admins', 'BUILTIN\Administrators', 'NT AUTHORITY\SYSTEM',
+        'Enterprise Read-only Domain Controllers', 'Cert Publishers',
+        'Enterprise Domain Controllers'
+    )
+    if ($script:AuthorizedPrincipalsExtra) {
+        $auth += $script:AuthorizedPrincipalsExtra
+    }
+    foreach ($a in $auth) {
+        if ($IdentityReference -eq $a) { return $true }
+        if ($IdentityReference -like "*\$a") { return $true }
+    }
+    return $false
+}
+
+function Test-WritablePrivilegedACLs {
+    <#
+    .SYNOPSIS
+        Scans privileged AD objects for non-admin write-class ACEs.
+    #>
+    [CmdletBinding()]
+    param()
+
+    Write-Host "`n[+] Scanning privileged objects for non-admin write-class ACLs..." -ForegroundColor Cyan
+    try {
+        $dn = (Get-ADDomain).DistinguishedName
+    }
+    catch {
+        Add-ADFinding -CheckName 'Test-WritablePrivilegedACLs' -Status 'WARNING' -Object 'Domain' `
+            -Description "Unable to determine domain DN: $($_.Exception.Message)" -Remediation 'Check permissions.'
+        return
+    }
+
+    $targets = @(
+        "CN=Domain Admins,CN=Users,$dn",
+        "CN=Enterprise Admins,CN=Users,$dn",
+        "CN=Schema Admins,CN=Users,$dn",
+        "CN=Administrators,CN=Builtin,$dn",
+        "CN=Account Operators,CN=Users,$dn",
+        "CN=Backup Operators,CN=Users,$dn",
+        "CN=AdminSDHolder,CN=System,$dn",
+        "CN=krbtgt,CN=Users,$dn",
+        "OU=Domain Controllers,$dn"
+    )
+
+    try {
+        $dcs = Get-ADDomainController -Filter *
+        foreach ($dc in $dcs) {
+            $targets += "CN=$($dc.Name),OU=Domain Controllers,$dn"
+        }
+    }
+    catch {
+        Write-Verbose "Could not enumerate DCs for additional targets: $($_.Exception.Message)"
+    }
+
+    $writeRights = 'GenericAll|GenericWrite|WriteProperty|WriteDacl|WriteOwner|AllExtendedRights'
+    $anyFail = $false
+    foreach ($t in $targets) {
+        try {
+            $acl = Get-Acl -Path ("AD:\$t") -ErrorAction Stop
+        }
+        catch {
+            Add-ADFinding -CheckName 'Test-WritablePrivilegedACLs' -Status 'WARNING' -Object $t `
+                -Description "Unable to read ACL: $($_.Exception.Message)" `
+                -Remediation 'Run with Domain Admin or verify the object exists.'
+            continue
+        }
+        foreach ($ace in $acl.Access) {
+            if ($ace.ActiveDirectoryRights -match $writeRights) {
+                $id = [string]$ace.IdentityReference
+                if (-not (Test-IsAuthorizedPrincipal -IdentityReference $id)) {
+                    $anyFail = $true
+                    Add-ADFinding -CheckName 'Test-WritablePrivilegedACLs' -Status 'FAIL' -Object $t `
+                        -Description "Non-admin principal '$id' holds '$($ace.ActiveDirectoryRights)' on '$t'. Direct privilege-escalation path." `
+                        -Remediation 'Remove the ACE. Only Domain Admins / Enterprise Admins / SYSTEM should hold write-class rights on privileged objects.'
+                }
+            }
+        }
+    }
+    if (-not $anyFail) {
+        Add-ADFinding -CheckName 'Test-WritablePrivilegedACLs' -Status 'PASS' -Object 'Privileged Objects' `
+            -Description "No non-admin write-class ACEs detected across $($targets.Count) sensitive objects." `
+            -Remediation 'No action needed.'
+    }
+}
+
+function Test-ShadowCredentialsVulnerable {
+    <#
+    .SYNOPSIS
+        Flags non-admin WriteProperty on msDS-KeyCredentialLink for privileged accounts.
+    #>
+    [CmdletBinding()]
+    param()
+
+    Write-Host "`n[+] Checking for Shadow Credentials (msDS-KeyCredentialLink) exposure..." -ForegroundColor Cyan
+
+    $targets = [System.Collections.Generic.List[string]]::new()
+    foreach ($g in @('Domain Admins', 'Enterprise Admins', 'Schema Admins', 'Account Operators')) {
+        try {
+            $members = Get-ADGroupMember -Identity $g -Recursive -ErrorAction Stop | Where-Object { $_.objectClass -eq 'user' }
+            foreach ($m in $members) { $null = $targets.Add($m.DistinguishedName) }
+        }
+        catch {
+            Write-Verbose "Get-ADGroupMember $g failed: $($_.Exception.Message)"
+        }
+    }
+    try {
+        $k = Get-ADUser -Identity 'krbtgt' -ErrorAction Stop
+        $null = $targets.Add($k.DistinguishedName)
+    }
+    catch {
+        Write-Verbose "krbtgt lookup failed: $($_.Exception.Message)"
+    }
+    try {
+        $dcs = Get-ADDomainController -Filter *
+        foreach ($dc in $dcs) {
+            $dcComputer = Get-ADComputer -Identity $dc.Name -ErrorAction SilentlyContinue
+            if ($dcComputer) { $null = $targets.Add($dcComputer.DistinguishedName) }
+        }
+    }
+    catch {
+        Write-Verbose "DC enumeration failed: $($_.Exception.Message)"
+    }
+
+    $anyFail = $false
+    foreach ($t in ($targets | Select-Object -Unique)) {
+        try {
+            $acl = Get-Acl -Path ("AD:\$t") -ErrorAction Stop
+        }
+        catch {
+            Write-Verbose "ACL read failed for $t"
+            continue
+        }
+
+        foreach ($ace in $acl.Access) {
+            $isWrite = $ace.ActiveDirectoryRights -match 'GenericAll|GenericWrite|WriteProperty'
+            if (-not $isWrite) { continue }
+            $objType = if ($ace.ObjectType) { [string]$ace.ObjectType } else { '' }
+            $targetsKeyCred = $objType -eq '00000000-0000-0000-0000-000000000000' -or $objType -eq '5b47d60f-6090-40b2-9f37-2a4de88f3063'
+            if (-not $targetsKeyCred) { continue }
+
+            $id = [string]$ace.IdentityReference
+            if (-not (Test-IsAuthorizedPrincipal -IdentityReference $id)) {
+                $anyFail = $true
+                Add-ADFinding -CheckName 'Test-ShadowCredentialsVulnerable' -Status 'FAIL' -Object $t `
+                    -Description "Non-admin '$id' has '$($ace.ActiveDirectoryRights)' on '$t' with object-type scope including msDS-KeyCredentialLink. Can install a PKINIT public key and impersonate this account." `
+                    -Remediation 'Remove the ACE. If WriteProperty on the full object is required, scope it to attributes other than msDS-KeyCredentialLink via the ObjectType GUID.'
+            }
+        }
+    }
+    if (-not $anyFail) {
+        Add-ADFinding -CheckName 'Test-ShadowCredentialsVulnerable' -Status 'PASS' -Object 'Privileged Accounts' `
+            -Description "No non-admin WriteProperty rights on msDS-KeyCredentialLink detected across $($targets.Count) targets." `
+            -Remediation 'No action needed.'
+    }
+}
+
+function Test-RBCDConfigured {
+    <#
+    .SYNOPSIS
+        Inventory + risk audit of msDS-AllowedToActOnBehalfOfOtherIdentity (RBCD).
+    #>
+    [CmdletBinding()]
+    param(
+        [string[]]$Tier0OUDNs = @()
+    )
+
+    Write-Host "`n[+] Checking Resource-Based Constrained Delegation (RBCD)..." -ForegroundColor Cyan
+    try {
+        $dcs = Get-ADDomainController -Filter *
+        $dcNames = $dcs | ForEach-Object { $_.Name }
+    }
+    catch {
+        $dcNames = @()
+    }
+
+    try {
+        $computersWithRBCD = @(Get-ADComputer -Filter { msDS-AllowedToActOnBehalfOfOtherIdentity -like '*' } `
+                -Properties msDS-AllowedToActOnBehalfOfOtherIdentity, DistinguishedName)
+    }
+    catch {
+        Add-ADFinding -CheckName 'Test-RBCDConfigured' -Status 'WARNING' -Object 'RBCD' `
+            -Description "Unable to enumerate computers with RBCD: $($_.Exception.Message)" `
+            -Remediation 'Check permissions.'
+        return
+    }
+
+    foreach ($c in $computersWithRBCD) {
+        $isDC = $dcNames -contains $c.Name
+        $isTier0 = $false
+        foreach ($ou in $Tier0OUDNs) {
+            if ($c.DistinguishedName -like "*,$ou") { $isTier0 = $true; break }
+        }
+
+        $sidList = @()
+        if ($c.'msDS-AllowedToActOnBehalfOfOtherIdentity') {
+            try {
+                $sd = [System.Security.AccessControl.RawSecurityDescriptor]::new(
+                    [byte[]]$c.'msDS-AllowedToActOnBehalfOfOtherIdentity', 0)
+                foreach ($ace in $sd.DiscretionaryAcl) {
+                    $sidList += $ace.SecurityIdentifier.ToString()
+                }
+            }
+            catch {
+                $sidList = @('(unparseable)')
+            }
+        }
+
+        if ($isDC) {
+            Add-ADFinding -CheckName 'Test-RBCDConfigured' -Status 'FAIL' -Object $c.Name `
+                -Description "RBCD set on DOMAIN CONTROLLER '$($c.Name)'. Any principal in the SID list can impersonate any user to this DC. Allowed SIDs: $($sidList -join ', ')" `
+                -Remediation 'Clear msDS-AllowedToActOnBehalfOfOtherIdentity on this DC immediately.'
+        }
+        elseif ($isTier0) {
+            Add-ADFinding -CheckName 'Test-RBCDConfigured' -Status 'FAIL' -Object $c.Name `
+                -Description "RBCD set on Tier 0 asset '$($c.Name)'. Allowed SIDs: $($sidList -join ', ')" `
+                -Remediation 'Review whether RBCD is required on this Tier 0 asset. If not, clear the attribute.'
+        }
+        else {
+            Add-ADFinding -CheckName 'Test-RBCDConfigured' -Status 'INFO' -Object $c.Name `
+                -Description "RBCD configured on '$($c.Name)'. Allowed SIDs: $($sidList -join ', ')" `
+                -Remediation 'Confirm this RBCD delegation is authorized for the application running on this host.'
+        }
+    }
+
+    $scanTargets = @()
+    foreach ($dc in $dcs) {
+        try {
+            $comp = Get-ADComputer -Identity $dc.Name -ErrorAction SilentlyContinue
+            if ($comp) { $scanTargets += $comp.DistinguishedName }
+        }
+        catch {
+            Write-Verbose "DC computer object lookup failed: $($_.Exception.Message)"
+        }
+    }
+    foreach ($ou in $Tier0OUDNs) {
+        try {
+            $ouComps = @(Get-ADComputer -SearchBase $ou -Filter * -ErrorAction SilentlyContinue)
+            foreach ($c in $ouComps) { $scanTargets += $c.DistinguishedName }
+        }
+        catch {
+            Write-Verbose "Tier0 OU enumeration failed: $($_.Exception.Message)"
+        }
+    }
+
+    $writeRights = 'GenericAll|GenericWrite|WriteProperty'
+    foreach ($dn in ($scanTargets | Select-Object -Unique)) {
+        try {
+            $acl = Get-Acl -Path ("AD:\$dn") -ErrorAction Stop
+        }
+        catch {
+            Write-Verbose "ACL read failed for $dn"
+            continue
+        }
+        foreach ($ace in $acl.Access) {
+            if (-not ($ace.ActiveDirectoryRights -match $writeRights)) { continue }
+            $id = [string]$ace.IdentityReference
+            if (Test-IsAuthorizedPrincipal -IdentityReference $id) { continue }
+            Add-ADFinding -CheckName 'Test-RBCDConfigured' -Status 'FAIL' -Object $dn `
+                -Description "Non-admin '$id' has '$($ace.ActiveDirectoryRights)' on sensitive computer '$dn'. Can plant RBCD to impersonate any user." `
+                -Remediation 'Remove the ACE. Only Domain Admins / Enterprise Admins should hold write rights on sensitive computer accounts.'
+        }
+    }
+
+    if ($computersWithRBCD.Count -eq 0) {
+        Add-ADFinding -CheckName 'Test-RBCDConfigured' -Status 'PASS' -Object 'All Computers' `
+            -Description 'No RBCD configurations detected in the domain.' -Remediation 'No action needed.'
+    }
+}
+
+function Test-GenericWriteToSensitive {
+    <#
+    .SYNOPSIS
+        Flags non-admin GenericWrite on members of Domain Admins / Enterprise Admins / Schema Admins.
+    #>
+    [CmdletBinding()]
+    param()
+
+    Write-Host "`n[+] Scanning privileged-group MEMBERS for non-admin GenericWrite..." -ForegroundColor Cyan
+
+    $memberDNs = @()
+    foreach ($g in @('Domain Admins', 'Enterprise Admins', 'Schema Admins')) {
+        try {
+            $members = Get-ADGroupMember -Identity $g -Recursive -ErrorAction Stop | Where-Object { $_.objectClass -eq 'user' }
+            foreach ($m in $members) { $memberDNs += $m.DistinguishedName }
+        }
+        catch {
+            Write-Verbose "Get-ADGroupMember $g failed: $($_.Exception.Message)"
+        }
+    }
+
+    $anyFail = $false
+    foreach ($dn in ($memberDNs | Select-Object -Unique)) {
+        try {
+            $acl = Get-Acl -Path ("AD:\$dn") -ErrorAction Stop
+        }
+        catch {
+            Write-Verbose "ACL read failed for $dn"
+            continue
+        }
+        foreach ($ace in $acl.Access) {
+            if ($ace.ActiveDirectoryRights -notmatch 'GenericWrite|GenericAll|WriteDacl|WriteOwner|AllExtendedRights') { continue }
+            $id = [string]$ace.IdentityReference
+            if (Test-IsAuthorizedPrincipal -IdentityReference $id) { continue }
+            $anyFail = $true
+            Add-ADFinding -CheckName 'Test-GenericWriteToSensitive' -Status 'FAIL' -Object $dn `
+                -Description "Non-admin '$id' holds '$($ace.ActiveDirectoryRights)' directly on privileged user '$dn'. Can reset password or install shadow credentials." `
+                -Remediation 'Remove the ACE. Privileged user accounts should inherit protection from AdminSDHolder only.'
+        }
+    }
+
+    if (-not $anyFail -and $memberDNs.Count -gt 0) {
+        Add-ADFinding -CheckName 'Test-GenericWriteToSensitive' -Status 'PASS' -Object 'Privileged Members' `
+            -Description "No non-admin write rights on $((@($memberDNs | Select-Object -Unique)).Count) privileged-group user objects." `
+            -Remediation 'No action needed.'
+    }
+}
+
+#endregion
+
 #region ==================== MAIN ENTRY POINT ====================
 
 <#
@@ -1729,9 +2444,15 @@ function Invoke-ActiveDirectoryAssessment {
         [int]$RecentPrivilegedAccountDays = $script:DefaultRecentPrivilegedAccountDays,
         [int]$KrbTgtPasswordAgeDays = $script:DefaultKrbTgtPasswordAgeDays,
         [int]$KerberoastPasswordAgeDays = 90,
+        # PR 4a knobs
+        [bool]$ParallelDCProbing = $false,
+        [string[]]$Tier0OUDNs = @(),
+        [string[]]$AuthorizedPrincipalsExtra = @(),
         [string[]]$IncludeChecks,
         [string[]]$ExcludeChecks
     )
+
+    $script:AuthorizedPrincipalsExtra = $AuthorizedPrincipalsExtra
 
     $script:Findings = @()
 
@@ -1762,7 +2483,13 @@ function Invoke-ActiveDirectoryAssessment {
         'Test-SensitiveObjectACLDrift', 'Test-ShadowGroupNames',
         # PR 2 additions
         'Test-LAPSDeployment', 'Test-DCSecuritySettings', 'Test-KerberoastableAccounts',
-        'Test-DirSyncAccountSecurity'
+        'Test-DirSyncAccountSecurity',
+        # PR 4a - credential hygiene (Group A)
+        'Test-LMHashStorage', 'Test-NTLMv1Allowed', 'Test-DCLegacyEncryption',
+        'Test-NullSessionShares', 'Test-DomainEncryptionTypesPolicy',
+        # PR 4a - ACL abuse paths (Group B)
+        'Test-WritablePrivilegedACLs', 'Test-ShadowCredentialsVulnerable',
+        'Test-RBCDConfigured', 'Test-GenericWriteToSensitive'
     )
 
     $toRun = if ($IncludeChecks) {
@@ -1804,6 +2531,11 @@ function Invoke-ActiveDirectoryAssessment {
                 'Test-KerberoastableAccounts' {
                     & $check -PasswordAgeDays $KerberoastPasswordAgeDays
                 }
+                'Test-LMHashStorage' { & $check -Parallel:$ParallelDCProbing }
+                'Test-NTLMv1Allowed' { & $check -Parallel:$ParallelDCProbing }
+                'Test-DCLegacyEncryption' { & $check -Parallel:$ParallelDCProbing }
+                'Test-NullSessionShares' { & $check -Parallel:$ParallelDCProbing }
+                'Test-RBCDConfigured' { & $check -Tier0OUDNs $Tier0OUDNs }
                 default {
                     & $check
                 }
@@ -1874,7 +2606,18 @@ Export-ModuleMember -Function @(
     'Test-LAPSDeployment',
     'Test-DCSecuritySettings',
     'Test-KerberoastableAccounts',
-    'Test-DirSyncAccountSecurity'
+    'Test-DirSyncAccountSecurity',
+    # PR 4a - credential hygiene (Group A)
+    'Test-LMHashStorage',
+    'Test-NTLMv1Allowed',
+    'Test-DCLegacyEncryption',
+    'Test-NullSessionShares',
+    'Test-DomainEncryptionTypesPolicy',
+    # PR 4a - ACL abuse paths (Group B)
+    'Test-WritablePrivilegedACLs',
+    'Test-ShadowCredentialsVulnerable',
+    'Test-RBCDConfigured',
+    'Test-GenericWriteToSensitive'
 )
 
 #endregion

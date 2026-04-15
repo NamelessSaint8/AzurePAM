@@ -189,6 +189,10 @@
     "LAPSSampleSize": 200,
     "IncludeComputers": true,
     "PrivilegedGroupWhitelist": {},
+    "_pr4aComment": "PR 4a config knobs. ParallelDCProbing fans out Group A registry probes across all DCs concurrently (faster in large forests, noisier on failure). Tier0OUDNs marks extra OUs whose computers are treated as Tier 0 by Test-RBCDConfigured (DCs are always Tier 0). AuthorizedPrincipalsExtra extends the Group B allow-list beyond the default six admin groups.",
+    "ParallelDCProbing": false,
+    "Tier0OUDNs": [],
+    "AuthorizedPrincipalsExtra": [],
     "ADCS": {
       "_comment": "AD CS ESC1-8 audit. Runs as part of the ActiveDirectory module when an Enterprise CA is detected. ProbeHTTP enables the ESC8 web-enrollment reachability probe (disable in air-gapped or heavily-firewalled environments).",
       "Enabled": true,

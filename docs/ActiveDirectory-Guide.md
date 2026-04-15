@@ -1,8 +1,8 @@
 # Active Directory (On-Prem) Module Guide
 
 **Module:** `EntraChecks-ActiveDirectory.psm1`
-**Status:** v1.7.0 ships the AD CS ESC1-8 audit — one environment probe, one inventory check, and eight ESC-class vulnerability checks. 42 total AD checks now.
-**Coverage:** 42 read-only checks against on-premises Active Directory covering privileged access, authentication, delegation, account lifecycle, infrastructure, and AD CS.
+**Status:** v1.8.0 adds PR 4a — credential hygiene (LM hash, NTLMv1, DC Kerberos encryption, null sessions, domain encryption policy) and ACL abuse path detection (writable privileged objects, Shadow Credentials, RBCD, GenericWrite on privileged members). 51 total AD checks now.
+**Coverage:** 51 read-only checks against on-premises Active Directory covering privileged access, authentication, delegation, account lifecycle, infrastructure, and AD CS.
 
 This guide covers: prerequisites, how to run the module, graceful degradation behavior, permission model, finding schema, and a full list of the 29 checks with their Trust Service Criteria / CIS / NIST mappings.
 
@@ -343,9 +343,62 @@ Deep-dive with remediation references: [docs/ADCS-Guide.md](ADCS-Guide.md).
 
 ---
 
-## 13. Deferred to future PRs
+## 13. Credential hygiene + ACL abuse paths (PR 4a)
+
+Five credential-hygiene checks (protocol-level defaults) and four ACL-abuse-path checks (single-step privilege escalation routes). All run automatically as part of `-Modules ActiveDirectory` / `-Mode Hybrid`; no new menu item.
+
+### Credential hygiene (5 checks)
+
+| CheckName | Max Severity | What it probes |
+|---|---|---|
+| `Test-LMHashStorage` | High | `NoLMHash` registry value on every DC (LM hashes must not be stored). |
+| `Test-NTLMv1Allowed` | High | `LmCompatibilityLevel` on each DC (value must be `5` to refuse NTLMv1 inbound + outbound). |
+| `Test-DCLegacyEncryption` | High | Kerberos encryption types on each DC (DES bits forbidden, RC4 should be off or at least paired with AES). |
+| `Test-NullSessionShares` | High | `NullSessionPipes`, `NullSessionShares`, `RestrictAnonymous`, `RestrictAnonymousSAM`, `EveryoneIncludesAnonymous` on each DC. |
+| `Test-DomainEncryptionTypesPolicy` | High | `msDS-SupportedEncryptionTypes` on the domain object and every cross-forest trust. |
+
+All five fan out to every DC via PSRemoting. Sequential by default; flip `ActiveDirectory.ParallelDCProbing = true` in config to parallelise in large forests.
+
+### ACL abuse paths (4 checks)
+
+| CheckName | Max Severity | Detection |
+|---|---|---|
+| `Test-WritablePrivilegedACLs` | **Critical** | Non-admin principals with `GenericAll` / `GenericWrite` / `WriteDacl` / `WriteOwner` / `WriteProperty` / `AllExtendedRights` on Domain Admins / Enterprise Admins / Schema Admins / Account Operators / Backup Operators / Administrators / AdminSDHolder / krbtgt / Domain Controllers OU / each DC computer account. |
+| `Test-ShadowCredentialsVulnerable` | **Critical** | Non-admin WriteProperty on `msDS-KeyCredentialLink` (attribute GUID `5b47d60f-6090-40b2-9f37-2a4de88f3063`) for privileged-group members + krbtgt + DC computer accounts. Enables Shadow Credentials (Whisker) attack — attacker installs a PKINIT public key and impersonates the target. |
+| `Test-RBCDConfigured` | **Critical** (DC) / High (Tier 0) / INFO (other) | Triple-pass: (1) inventory of `msDS-AllowedToActOnBehalfOfOtherIdentity` across all computer accounts; (2) FAIL when RBCD is set on a DC or configured Tier 0 computer; (3) FAIL when a non-admin has write rights on the attribute itself (lets them plant RBCD). |
+| `Test-GenericWriteToSensitive` | **Critical** | Non-admin `GenericWrite` / `GenericAll` / `WriteDacl` / `WriteOwner` / `AllExtendedRights` directly on Domain Admins / Enterprise Admins / Schema Admins **member user objects**. Complements `Test-WritablePrivilegedACLs` which scans group objects. |
+
+### Configuration
+
+Extending the `ActiveDirectory` block:
+
+```json
+{
+  "ActiveDirectory": {
+    "ParallelDCProbing": false,
+    "Tier0OUDNs": [],
+    "AuthorizedPrincipalsExtra": []
+  }
+}
+```
+
+- **`ParallelDCProbing`** — `true` fans out Group A registry probes across all DCs simultaneously via native `Invoke-Command -ComputerName <array>`. Default `false` (sequential, slower but safer on failure semantics).
+- **`Tier0OUDNs`** — optional array of OU distinguished names whose computer members should be treated as Tier 0 by `Test-RBCDConfigured`. DCs are *always* Tier 0; this config only adds additional sensitive computer groupings.
+- **`AuthorizedPrincipalsExtra`** — extends the Group B allow-list beyond the default 10 admin principals. Use when your environment has custom legitimate admin groups (e.g., `Contoso-ADAdmins`).
+
+### Graceful degradation
+
+- RSAT missing / not domain-joined: existing `Test-ADEnvironment` gate catches these; none of the new checks run.
+- PSRemoting blocked to individual DCs: scoped WARNING per DC, rest of the assessment continues.
+- Running as Domain User (not Admin): ACL-read failures on sensitive objects emit per-object WARNING; checks still run for the objects that ARE readable. A single top-level WARNING from the environment probe already tells the user to re-run as admin.
+
+---
+
+## 14. Deferred to future PRs
 
 - ESC9-16 (more recent ADCS additions).
-- BloodHound-style ACL abuse path enumeration.
+- BloodHound-style ACL abuse path enumeration (bounded attack-path discovery).
 - SMBv1 / NetBIOS / LLMNR host enumeration.
-- Reversible-encryption audit (low finding count in practice).
+- Event log / audit policy hygiene.
+- DFSR SYSVOL health.
+- `DNSAdmins` / `DHCP Administrators` escalation vectors.

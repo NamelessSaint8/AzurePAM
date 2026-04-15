@@ -690,3 +690,428 @@ Describe 'Test-DirSyncAccountSecurity' {
         }
     }
 }
+
+# ============================================================================
+# PR 4a additions - Credential Hygiene (Group A) + ACL Abuse Paths (Group B)
+# ============================================================================
+
+Describe 'Test-LMHashStorage' {
+
+    It 'FAILs when NoLMHash is 0 on a DC' {
+        InModuleScope EntraChecks-ActiveDirectory {
+            $script:Findings = @()
+            Mock Get-ADDomainController { @([pscustomobject]@{ HostName = 'dc1.test.local'; Name = 'dc1' }) }
+            Mock Invoke-Command { 0 }
+            Test-LMHashStorage
+            $fails = @($script:Findings | Where-Object { $_.Status -eq 'FAIL' })
+            $fails.Count | Should -BeGreaterThan 0
+            $fails[0].Severity | Should -Be 'High'
+        }
+    }
+
+    It 'PASSes when NoLMHash is 1 on every DC' {
+        InModuleScope EntraChecks-ActiveDirectory {
+            $script:Findings = @()
+            Mock Get-ADDomainController { @([pscustomobject]@{ HostName = 'dc1.test.local'; Name = 'dc1' }) }
+            Mock Invoke-Command { 1 }
+            Test-LMHashStorage
+            @($script:Findings | Where-Object { $_.Status -eq 'PASS' }).Count | Should -BeGreaterThan 0
+        }
+    }
+
+    It 'WARNs when PSRemoting fails' {
+        InModuleScope EntraChecks-ActiveDirectory {
+            $script:Findings = @()
+            Mock Get-ADDomainController { @([pscustomobject]@{ HostName = 'dc1.test.local'; Name = 'dc1' }) }
+            Mock Invoke-Command { throw 'Access denied' }
+            Test-LMHashStorage
+            @($script:Findings | Where-Object { $_.Status -eq 'WARNING' }).Count | Should -BeGreaterThan 0
+        }
+    }
+}
+
+Describe 'Test-NTLMv1Allowed' {
+
+    It 'FAILs when LmCompatibilityLevel is 2' {
+        InModuleScope EntraChecks-ActiveDirectory {
+            $script:Findings = @()
+            Mock Get-ADDomainController { @([pscustomobject]@{ HostName = 'dc1.test.local'; Name = 'dc1' }) }
+            Mock Invoke-Command { 2 }
+            Test-NTLMv1Allowed
+            @($script:Findings | Where-Object { $_.Status -eq 'FAIL' }).Count | Should -BeGreaterThan 0
+        }
+    }
+
+    It 'WARNs when LmCompatibilityLevel is 3 (partial refusal)' {
+        InModuleScope EntraChecks-ActiveDirectory {
+            $script:Findings = @()
+            Mock Get-ADDomainController { @([pscustomobject]@{ HostName = 'dc1.test.local'; Name = 'dc1' }) }
+            Mock Invoke-Command { 3 }
+            Test-NTLMv1Allowed
+            @($script:Findings | Where-Object { $_.Status -eq 'WARNING' }).Count | Should -BeGreaterThan 0
+        }
+    }
+
+    It 'PASSes when LmCompatibilityLevel is 5' {
+        InModuleScope EntraChecks-ActiveDirectory {
+            $script:Findings = @()
+            Mock Get-ADDomainController { @([pscustomobject]@{ HostName = 'dc1.test.local'; Name = 'dc1' }) }
+            Mock Invoke-Command { 5 }
+            Test-NTLMv1Allowed
+            @($script:Findings | Where-Object { $_.Status -eq 'PASS' }).Count | Should -BeGreaterThan 0
+        }
+    }
+}
+
+Describe 'Test-DCLegacyEncryption' {
+
+    It 'FAILs when DES bits are set in the encryption-types mask' {
+        InModuleScope EntraChecks-ActiveDirectory {
+            $script:Findings = @()
+            Mock Get-ADDomainController { @([pscustomobject]@{ HostName = 'dc1.test.local'; Name = 'dc1' }) }
+            Mock Invoke-Command { 0x3 }  # DES bits only
+            Test-DCLegacyEncryption
+            @($script:Findings | Where-Object { $_.Status -eq 'FAIL' -and $_.Description -match 'DES' }).Count | Should -BeGreaterThan 0
+        }
+    }
+
+    It 'FAILs when mask is RC4-only' {
+        InModuleScope EntraChecks-ActiveDirectory {
+            $script:Findings = @()
+            Mock Get-ADDomainController { @([pscustomobject]@{ HostName = 'dc1.test.local'; Name = 'dc1' }) }
+            Mock Invoke-Command { 0x4 }  # RC4 only
+            Test-DCLegacyEncryption
+            @($script:Findings | Where-Object { $_.Status -eq 'FAIL' }).Count | Should -BeGreaterThan 0
+        }
+    }
+
+    It 'WARNs when RC4 is set alongside AES' {
+        InModuleScope EntraChecks-ActiveDirectory {
+            $script:Findings = @()
+            Mock Get-ADDomainController { @([pscustomobject]@{ HostName = 'dc1.test.local'; Name = 'dc1' }) }
+            Mock Invoke-Command { 0x1C }  # RC4 + AES128 + AES256
+            Test-DCLegacyEncryption
+            @($script:Findings | Where-Object { $_.Status -eq 'WARNING' }).Count | Should -BeGreaterThan 0
+        }
+    }
+
+    It 'PASSes when AES-only' {
+        InModuleScope EntraChecks-ActiveDirectory {
+            $script:Findings = @()
+            Mock Get-ADDomainController { @([pscustomobject]@{ HostName = 'dc1.test.local'; Name = 'dc1' }) }
+            Mock Invoke-Command { 0x18 }  # AES128 + AES256 only
+            Test-DCLegacyEncryption
+            @($script:Findings | Where-Object { $_.Status -eq 'PASS' }).Count | Should -BeGreaterThan 0
+        }
+    }
+}
+
+Describe 'Test-NullSessionShares' {
+
+    It 'FAILs when RestrictAnonymous is 0 on a DC' {
+        InModuleScope EntraChecks-ActiveDirectory {
+            $script:Findings = @()
+            Mock Get-ADDomainController { @([pscustomobject]@{ HostName = 'dc1.test.local'; Name = 'dc1' }) }
+            Mock Invoke-Command {
+                [pscustomobject]@{
+                    NullSessionPipes = @()
+                    NullSessionShares = @()
+                    RestrictAnonymous = 0
+                    RestrictAnonymousSAM = 1
+                    EveryoneIncludesAnonymous = 0
+                }
+            }
+            Test-NullSessionShares
+            @($script:Findings | Where-Object { $_.Status -eq 'FAIL' }).Count | Should -BeGreaterThan 0
+        }
+    }
+
+    It 'PASSes when all five settings are compliant' {
+        InModuleScope EntraChecks-ActiveDirectory {
+            $script:Findings = @()
+            Mock Get-ADDomainController { @([pscustomobject]@{ HostName = 'dc1.test.local'; Name = 'dc1' }) }
+            Mock Invoke-Command {
+                [pscustomobject]@{
+                    NullSessionPipes = @()
+                    NullSessionShares = @()
+                    RestrictAnonymous = 1
+                    RestrictAnonymousSAM = 1
+                    EveryoneIncludesAnonymous = 0
+                }
+            }
+            Test-NullSessionShares
+            @($script:Findings | Where-Object { $_.Status -eq 'PASS' }).Count | Should -BeGreaterThan 0
+        }
+    }
+}
+
+Describe 'Test-DomainEncryptionTypesPolicy' {
+
+    It 'FAILs when domain msDS-SupportedEncryptionTypes is RC4-only' {
+        InModuleScope EntraChecks-ActiveDirectory {
+            $script:Findings = @()
+            Mock Get-ADDomain {
+                [pscustomobject]@{
+                    DistinguishedName = 'DC=test,DC=local'
+                    'msDS-SupportedEncryptionTypes' = 0x4
+                }
+            }
+            Mock Get-ADTrust { @() }
+            Test-DomainEncryptionTypesPolicy
+            @($script:Findings | Where-Object { $_.Status -eq 'FAIL' -and $_.Object -eq 'Domain' }).Count | Should -BeGreaterThan 0
+        }
+    }
+
+    It 'PASSes when domain policy is AES-only' {
+        InModuleScope EntraChecks-ActiveDirectory {
+            $script:Findings = @()
+            Mock Get-ADDomain {
+                [pscustomobject]@{
+                    DistinguishedName = 'DC=test,DC=local'
+                    'msDS-SupportedEncryptionTypes' = 0x18
+                }
+            }
+            Mock Get-ADTrust { @() }
+            Test-DomainEncryptionTypesPolicy
+            @($script:Findings | Where-Object { $_.Status -eq 'PASS' }).Count | Should -BeGreaterThan 0
+        }
+    }
+}
+
+Describe 'Test-IsAuthorizedPrincipal' {
+
+    It 'returns $true for Domain Admins' {
+        InModuleScope EntraChecks-ActiveDirectory {
+            Test-IsAuthorizedPrincipal -IdentityReference 'TEST\Domain Admins' | Should -Be $true
+        }
+    }
+
+    It 'returns $false for an arbitrary non-admin' {
+        InModuleScope EntraChecks-ActiveDirectory {
+            Test-IsAuthorizedPrincipal -IdentityReference 'TEST\helpdesk' | Should -Be $false
+        }
+    }
+
+    It 'honors AuthorizedPrincipalsExtra' {
+        InModuleScope EntraChecks-ActiveDirectory {
+            $script:AuthorizedPrincipalsExtra = @('ContosoADAdmins')
+            Test-IsAuthorizedPrincipal -IdentityReference 'TEST\ContosoADAdmins' | Should -Be $true
+            $script:AuthorizedPrincipalsExtra = @()
+        }
+    }
+}
+
+Describe 'Test-WritablePrivilegedACLs' {
+
+    It 'FAILs when a non-admin has GenericAll on a privileged container' {
+        InModuleScope EntraChecks-ActiveDirectory {
+            $script:Findings = @()
+            Mock Get-ADDomain { [pscustomobject]@{ DistinguishedName = 'DC=test,DC=local' } }
+            Mock Get-ADDomainController { @() }
+            Mock Get-Acl {
+                [pscustomobject]@{
+                    Access = @(
+                        [pscustomobject]@{
+                            IdentityReference = 'TEST\helpdesk'
+                            ActiveDirectoryRights = 'GenericAll'
+                        }
+                    )
+                }
+            }
+            Test-WritablePrivilegedACLs
+            $fails = @($script:Findings | Where-Object { $_.Status -eq 'FAIL' })
+            $fails.Count | Should -BeGreaterThan 0
+            $fails[0].Severity | Should -Be 'Critical'
+        }
+    }
+
+    It 'PASSes when only admins hold write rights' {
+        InModuleScope EntraChecks-ActiveDirectory {
+            $script:Findings = @()
+            Mock Get-ADDomain { [pscustomobject]@{ DistinguishedName = 'DC=test,DC=local' } }
+            Mock Get-ADDomainController { @() }
+            Mock Get-Acl {
+                [pscustomobject]@{
+                    Access = @(
+                        [pscustomobject]@{
+                            IdentityReference = 'TEST\Domain Admins'
+                            ActiveDirectoryRights = 'GenericAll'
+                        }
+                    )
+                }
+            }
+            Test-WritablePrivilegedACLs
+            @($script:Findings | Where-Object { $_.Status -eq 'PASS' }).Count | Should -BeGreaterThan 0
+        }
+    }
+}
+
+Describe 'Test-ShadowCredentialsVulnerable' {
+
+    It 'FAILs when a non-admin has WriteProperty on a privileged user (all-properties scope)' {
+        InModuleScope EntraChecks-ActiveDirectory {
+            $script:Findings = @()
+            Mock Get-ADGroupMember {
+                @([pscustomobject]@{
+                        SamAccountName = 'da1'
+                        DistinguishedName = 'CN=da1,CN=Users,DC=test,DC=local'
+                        objectClass = 'user'
+                    })
+            }
+            Mock Get-ADUser {
+                [pscustomobject]@{
+                    SamAccountName = 'krbtgt'
+                    DistinguishedName = 'CN=krbtgt,CN=Users,DC=test,DC=local'
+                }
+            }
+            Mock Get-ADDomainController { @() }
+            Mock Get-Acl {
+                [pscustomobject]@{
+                    Access = @(
+                        [pscustomobject]@{
+                            IdentityReference = 'TEST\helpdesk'
+                            ActiveDirectoryRights = 'WriteProperty'
+                            ObjectType = [Guid]::Empty  # all-properties scope
+                        }
+                    )
+                }
+            }
+            Test-ShadowCredentialsVulnerable
+            $fails = @($script:Findings | Where-Object { $_.Status -eq 'FAIL' })
+            $fails.Count | Should -BeGreaterThan 0
+            $fails[0].Severity | Should -Be 'Critical'
+        }
+    }
+
+    It 'PASSes when no non-admin write rights exist on msDS-KeyCredentialLink' {
+        InModuleScope EntraChecks-ActiveDirectory {
+            $script:Findings = @()
+            Mock Get-ADGroupMember { @() }
+            Mock Get-ADUser { $null }
+            Mock Get-ADDomainController { @() }
+            Mock Get-Acl { [pscustomobject]@{ Access = @() } }
+            Test-ShadowCredentialsVulnerable
+            @($script:Findings | Where-Object { $_.Status -eq 'PASS' }).Count | Should -BeGreaterThan 0
+        }
+    }
+}
+
+Describe 'Test-RBCDConfigured' {
+
+    It 'FAILs when RBCD is set on a DC' {
+        InModuleScope EntraChecks-ActiveDirectory {
+            $script:Findings = @()
+            # Create a minimal self-relative security descriptor. SID S-1-5-32-544 (Administrators)
+            # allowed. The binary format is well-defined; easier to just craft an empty DACL SD.
+            $sd = [System.Security.AccessControl.RawSecurityDescriptor]::new(
+                'O:BAG:BAD:(A;;GA;;;BA)')
+            $sdBytes = New-Object byte[] $sd.BinaryLength
+            $sd.GetBinaryForm($sdBytes, 0)
+
+            Mock Get-ADDomainController { @([pscustomobject]@{ HostName = 'dc1.test.local'; Name = 'dc1' }) }
+            # Default mock returns the fixture. Pass 3 also calls Get-ADComputer
+            # with -Identity, but since our Tier0OUDNs is empty and Pass 3 only
+            # iterates DCs (which we already returned), the extra calls don't
+            # produce additional findings we care about here.
+            Mock Get-ADComputer {
+                [pscustomobject]@{
+                    Name = 'dc1'
+                    DistinguishedName = 'CN=dc1,OU=Domain Controllers,DC=test,DC=local'
+                    'msDS-AllowedToActOnBehalfOfOtherIdentity' = $sdBytes
+                }
+            }
+            Mock Get-Acl { [pscustomobject]@{ Access = @() } }
+            Test-RBCDConfigured
+            $fails = @($script:Findings | Where-Object { $_.Status -eq 'FAIL' -and $_.Severity -eq 'Critical' })
+            $fails.Count | Should -BeGreaterThan 0
+        }
+    }
+
+    It 'emits INFO for RBCD on a non-DC, non-Tier0 computer' {
+        InModuleScope EntraChecks-ActiveDirectory {
+            $script:Findings = @()
+            $sd = [System.Security.AccessControl.RawSecurityDescriptor]::new(
+                'O:BAG:BAD:(A;;GA;;;BA)')
+            $sdBytes = New-Object byte[] $sd.BinaryLength
+            $sd.GetBinaryForm($sdBytes, 0)
+
+            Mock Get-ADDomainController { @([pscustomobject]@{ HostName = 'dc1.test.local'; Name = 'dc1' }) }
+            Mock Get-ADComputer {
+                [pscustomobject]@{
+                    Name = 'app01'
+                    DistinguishedName = 'CN=app01,OU=Servers,DC=test,DC=local'
+                    'msDS-AllowedToActOnBehalfOfOtherIdentity' = $sdBytes
+                }
+            }
+            Mock Get-Acl { [pscustomobject]@{ Access = @() } }
+            Test-RBCDConfigured
+            @($script:Findings | Where-Object { $_.Status -eq 'INFO' }).Count | Should -BeGreaterThan 0
+        }
+    }
+
+    It 'PASSes when no RBCD is configured anywhere' {
+        InModuleScope EntraChecks-ActiveDirectory {
+            $script:Findings = @()
+            Mock Get-ADDomainController { @([pscustomobject]@{ HostName = 'dc1.test.local'; Name = 'dc1' }) }
+            Mock Get-ADComputer { @() }
+            Mock Get-Acl { [pscustomobject]@{ Access = @() } }
+            Test-RBCDConfigured
+            @($script:Findings | Where-Object { $_.Status -eq 'PASS' }).Count | Should -BeGreaterThan 0
+        }
+    }
+}
+
+Describe 'Test-GenericWriteToSensitive' {
+
+    It 'FAILs when a non-admin has GenericWrite on a Domain Admin user' {
+        InModuleScope EntraChecks-ActiveDirectory {
+            $script:Findings = @()
+            Mock Get-ADGroupMember {
+                @([pscustomobject]@{
+                        SamAccountName = 'da1'
+                        DistinguishedName = 'CN=da1,CN=Users,DC=test,DC=local'
+                        objectClass = 'user'
+                    })
+            }
+            Mock Get-Acl {
+                [pscustomobject]@{
+                    Access = @(
+                        [pscustomobject]@{
+                            IdentityReference = 'TEST\helpdesk'
+                            ActiveDirectoryRights = 'GenericWrite'
+                        }
+                    )
+                }
+            }
+            Test-GenericWriteToSensitive
+            $fails = @($script:Findings | Where-Object { $_.Status -eq 'FAIL' })
+            $fails.Count | Should -BeGreaterThan 0
+            $fails[0].Severity | Should -Be 'Critical'
+        }
+    }
+
+    It 'PASSes when no non-admin write rights on privileged-group members' {
+        InModuleScope EntraChecks-ActiveDirectory {
+            $script:Findings = @()
+            Mock Get-ADGroupMember {
+                @([pscustomobject]@{
+                        SamAccountName = 'da1'
+                        DistinguishedName = 'CN=da1,CN=Users,DC=test,DC=local'
+                        objectClass = 'user'
+                    })
+            }
+            Mock Get-Acl {
+                [pscustomobject]@{
+                    Access = @(
+                        [pscustomobject]@{
+                            IdentityReference = 'TEST\Domain Admins'
+                            ActiveDirectoryRights = 'GenericWrite'
+                        }
+                    )
+                }
+            }
+            Test-GenericWriteToSensitive
+            @($script:Findings | Where-Object { $_.Status -eq 'PASS' }).Count | Should -BeGreaterThan 0
+        }
+    }
+}
