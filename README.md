@@ -1,6 +1,6 @@
 # EntraChecks — Microsoft Cloud Compliance Assessment Toolkit
 
-**Version 1.5.0** · PowerShell 5.1+ · Windows 10/11 or Server 2016+
+**Version 1.6.0** · PowerShell 5.1+ · Windows 10/11 or Server 2016+
 **Author:** David Stells
 
 EntraChecks runs read-only security and compliance checks across your Microsoft 365
@@ -21,8 +21,18 @@ hand to auditors, leadership, or your remediation team.
 | **AzurePolicy**      | Azure Policy compliance state across subscriptions                    | Any Azure subscription    |
 | **Purview**          | Compliance Manager assessment scores and improvement actions           | M365 E5 Compliance        |
 | **SOC 2**            | AICPA TSC 2017 (revised 2022) readiness — Type 1 + Type 2 period coverage, evidence bundle with SHA-256 chain-of-custody, PII redaction, white-label branding | Any M365 plan (Premium tier unlocks more controls) |
+| **Active Directory** | **On-premises AD** — 33 checks covering privileged access (including LAPS, DirSync account audit), authentication (KRBTGT, Kerberos pre-auth, Kerberoastable accounts with password-age correlation), delegation, account lifecycle, and DC security settings (LDAP signing, channel binding, SMB signing) | Domain-joined Windows + RSAT |
 
 > **All checks are read-only.** EntraChecks never modifies your tenant.
+
+### Running modes
+
+| Mode | What runs | When to use |
+|---|---|---|
+| `-Mode Interactive` (default) | Menu-driven | Ad-hoc exploration |
+| `-Mode Quick` | All cloud modules | Fast full cloud assessment |
+| `-Mode Scheduled` | All cloud modules, silent | CI/CD, scheduled tasks |
+| `-Mode Hybrid` | Cloud + on-prem AD + cross-plane correlation | Hybrid-identity environments; see [docs/Hybrid-Analysis-Guide.md](docs/Hybrid-Analysis-Guide.md) |
 
 ---
 
@@ -197,6 +207,8 @@ EntraChecks/
 │   ├── EntraChecks-SOC2.psm1               # SOC 2 TSC catalog + assessment engine
 │   ├── EntraChecks-SOC2Reporting.psm1      # SOC 2 HTML/Excel/CSV renderer
 │   ├── EntraChecks-SOC2TypeTwo.psm1        # SOC 2 Type 2 period coverage
+│   ├── EntraChecks-ActiveDirectory.psm1    # On-prem AD (33 checks, 5 categories)
+│   ├── EntraChecks-HybridCorrelation.psm1  # Cross-plane principal correlation
 │   └── EntraChecks-Branding.psm1           # White-label branding helper
 ├── config/                        # Configuration files
 │   ├── entrachecks.config.json             # Default configuration
@@ -417,6 +429,8 @@ For detailed documentation, see the `docs/` folder:
 - [Getting Started](docs/GETTING-STARTED.md) — Beginner's guide
 - [User Guide](docs/USER-GUIDE.md) — Complete reference
 - [SOC 2 Guide](docs/SOC2-Guide.md) — TSC coverage, redaction, evidence bundle, Type 2 period coverage
+- [Active Directory Guide](docs/ActiveDirectory-Guide.md) — on-prem AD checks, permission model, all 33 checks with framework mappings
+- [Hybrid Analysis Guide](docs/Hybrid-Analysis-Guide.md) — cloud + on-prem correlation, Confidence flags, report layout
 - [Configuration Guide](docs/Configuration-Guide.md) — Config file reference
 - [Troubleshooting](docs/TROUBLESHOOTING.md) — Extended problem solving
 - [API Reference](docs/API-REFERENCE.md) — Function reference
