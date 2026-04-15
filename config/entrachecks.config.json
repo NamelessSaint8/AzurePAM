@@ -188,6 +188,12 @@
     "LAPSCoverageGoalPercent": 90,
     "LAPSSampleSize": 200,
     "IncludeComputers": true,
-    "PrivilegedGroupWhitelist": {}
+    "PrivilegedGroupWhitelist": {},
+    "ADCS": {
+      "_comment": "AD CS ESC1-8 audit. Runs as part of the ActiveDirectory module when an Enterprise CA is detected. ProbeHTTP enables the ESC8 web-enrollment reachability probe (disable in air-gapped or heavily-firewalled environments).",
+      "Enabled": true,
+      "ProbeHTTP": true,
+      "HTTPProbeTimeoutSeconds": 10
+    }
   }
 }

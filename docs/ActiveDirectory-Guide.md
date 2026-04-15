@@ -1,8 +1,8 @@
 # Active Directory (On-Prem) Module Guide
 
 **Module:** `EntraChecks-ActiveDirectory.psm1`
-**Status:** Shipping in v1.6.0 (PR 2 adds four new checks — LAPS, DC security settings, Kerberoastable correlation, DirSync account audit — plus the Hybrid Analysis mode).
-**Coverage:** 33 read-only checks against on-premises Active Directory covering privileged access, authentication, delegation, account lifecycle, and infrastructure.
+**Status:** v1.7.0 ships the AD CS ESC1-8 audit — one environment probe, one inventory check, and eight ESC-class vulnerability checks. 42 total AD checks now.
+**Coverage:** 42 read-only checks against on-premises Active Directory covering privileged access, authentication, delegation, account lifecycle, infrastructure, and AD CS.
 
 This guide covers: prerequisites, how to run the module, graceful degradation behavior, permission model, finding schema, and a full list of the 29 checks with their Trust Service Criteria / CIS / NIST mappings.
 
@@ -318,9 +318,34 @@ See [docs/Hybrid-Analysis-Guide.md](Hybrid-Analysis-Guide.md) for the full workf
 
 ---
 
-## 12. Deferred to future PRs
+## 12. AD CS (ESC1-8) audit (PR 3)
 
-- AD CS template vulnerabilities (ESC1-8).
+v1.7.0 adds nine checks that run automatically when an Enterprise Certificate Authority is detected in the forest. No new menu item or CLI flag — they ride along with the AD module.
+
+| CheckName | ESC | Max Severity | Detection |
+|---|---|---|---|
+| `Test-ADCSInventory` | — | Low (INFO) | Lists CAs + template count |
+| `Test-ADCSEscalation1` | ESC1 | **Critical** | SAN-supplying client-auth template enrollable by non-admins |
+| `Test-ADCSEscalation2` | ESC2 | High | Any-Purpose / SubCA templates enrollable by non-admins |
+| `Test-ADCSEscalation3` | ESC3 | High | Enrollment Agent template enrollable by non-admins |
+| `Test-ADCSEscalation4` | ESC4 | **Critical** | Non-admin has write on template (can create ESC1) |
+| `Test-ADCSEscalation5` | ESC5 | High | Non-admin has write on PKI containers |
+| `Test-ADCSEscalation6` | ESC6 | **Critical** | `EDITF_ATTRIBUTESUBJECTALTNAME2` flag set on CA |
+| `Test-ADCSEscalation7` | ESC7 | High | Broad principal has ManageCA / ManageCertificates rights |
+| `Test-ADCSEscalation8` | ESC8 | **Critical** | Web enrollment reachable over plain HTTP (NTLM relay target) |
+
+Graceful degradation:
+- **No Enterprise CA detected** → single INFO finding, other AD checks proceed normally.
+- **ESC6 / ESC7 require PSRemoting to the CA server.** When unavailable, scoped WARNING per CA ("check is advisory for this CA") rather than FAIL.
+- **ESC8 HTTP probe** can be disabled via `ActiveDirectory.ADCS.ProbeHTTP = false` in config.
+
+Deep-dive with remediation references: [docs/ADCS-Guide.md](ADCS-Guide.md).
+
+---
+
+## 13. Deferred to future PRs
+
+- ESC9-16 (more recent ADCS additions).
 - BloodHound-style ACL abuse path enumeration.
 - SMBv1 / NetBIOS / LLMNR host enumeration.
 - Reversible-encryption audit (low finding count in practice).

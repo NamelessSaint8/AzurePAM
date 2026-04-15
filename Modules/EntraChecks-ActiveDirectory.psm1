@@ -1775,6 +1775,20 @@ function Invoke-ActiveDirectoryAssessment {
         $toRun = $toRun | Where-Object { $ExcludeChecks -notcontains $_ }
     }
 
+    # PR 3: import the ADCS submodule if present. ADCS checks run at the end of
+    # the AD assessment and gracefully no-op when no Enterprise CA is deployed.
+    $adcsModulePath = Join-Path (Split-Path -Parent $PSCommandPath) 'EntraChecks-ADCS.psm1'
+    $adcsAvailable = $false
+    if (Test-Path -LiteralPath $adcsModulePath) {
+        try {
+            Import-Module -Name $adcsModulePath -Force -ErrorAction Stop
+            $adcsAvailable = $true
+        }
+        catch {
+            Write-Verbose "AD CS submodule import failed: $($_.Exception.Message)"
+        }
+    }
+
     foreach ($check in $toRun) {
         try {
             switch ($check) {
@@ -1799,6 +1813,20 @@ function Invoke-ActiveDirectoryAssessment {
             Add-ADFinding -CheckName $check -Status 'WARNING' -Object $check `
                 -Description "Check failed unexpectedly: $($_.Exception.Message)" `
                 -Remediation 'Inspect the module source or report this failure; the assessment continued with the remaining checks.'
+        }
+    }
+
+    # PR 3: run ADCS checks as the final phase. Appends to $script:Findings of
+    # the ADCS module, which we then merge back into this module's findings.
+    if ($adcsAvailable) {
+        try {
+            $adcsFindings = Invoke-ADCSAssessment
+            if ($adcsFindings) {
+                $script:Findings += $adcsFindings
+            }
+        }
+        catch {
+            Write-Verbose "Invoke-ADCSAssessment failed: $($_.Exception.Message)"
         }
     }
 
