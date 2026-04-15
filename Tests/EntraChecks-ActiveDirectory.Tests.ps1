@@ -1115,3 +1115,197 @@ Describe 'Test-GenericWriteToSensitive' {
         }
     }
 }
+
+# ---------------------------------------------------------------------------
+# PR 4b additions - Attack path lite + DnsAdmins + audit hygiene + DFSR
+# ---------------------------------------------------------------------------
+
+Describe 'Test-AuthenticatedUsersDACLReach' {
+
+    It 'FAILs Critical on direct (1-hop) non-admin write rights to a DA member' {
+        InModuleScope EntraChecks-ActiveDirectory {
+            $script:Findings = @()
+            Mock Get-ADGroupMember {
+                @([pscustomobject]@{
+                        SamAccountName = 'da1'
+                        DistinguishedName = 'CN=da1,CN=Users,DC=test,DC=local'
+                        objectClass = 'user'
+                    })
+            }
+            Mock Get-Acl {
+                [pscustomobject]@{
+                    Access = @(
+                        [pscustomobject]@{
+                            IdentityReference = 'TEST\helpdesk'
+                            ActiveDirectoryRights = 'GenericAll'
+                        }
+                    )
+                }
+            }
+            Test-AuthenticatedUsersDACLReach -MaxDepth 1
+            $fails = @($script:Findings | Where-Object { $_.Status -eq 'FAIL' })
+            $fails.Count | Should -BeGreaterThan 0
+            $fails[0].Severity | Should -Be 'Critical'
+            $fails[0].Description | Should -Match 'DIRECT reach'
+        }
+    }
+
+    It 'PASSes when only authorized principals hold write rights' {
+        InModuleScope EntraChecks-ActiveDirectory {
+            $script:Findings = @()
+            Mock Get-ADGroupMember {
+                @([pscustomobject]@{
+                        SamAccountName = 'da1'
+                        DistinguishedName = 'CN=da1,CN=Users,DC=test,DC=local'
+                        objectClass = 'user'
+                    })
+            }
+            Mock Get-Acl {
+                [pscustomobject]@{
+                    Access = @(
+                        [pscustomobject]@{
+                            IdentityReference = 'TEST\Domain Admins'
+                            ActiveDirectoryRights = 'GenericAll'
+                        }
+                    )
+                }
+            }
+            Test-AuthenticatedUsersDACLReach -MaxDepth 1
+            @($script:Findings | Where-Object { $_.Status -eq 'PASS' }).Count | Should -BeGreaterThan 0
+            @($script:Findings | Where-Object { $_.Status -eq 'FAIL' }).Count | Should -Be 0
+        }
+    }
+
+    It 'PASSes (no privileged members enumerated) when DA group resolution fails' {
+        InModuleScope EntraChecks-ActiveDirectory {
+            $script:Findings = @()
+            Mock Get-ADGroupMember { throw 'no group' }
+            Test-AuthenticatedUsersDACLReach -MaxDepth 1
+            @($script:Findings | Where-Object { $_.Status -eq 'PASS' }).Count | Should -BeGreaterThan 0
+        }
+    }
+}
+
+Describe 'Test-DNSAdminsPrivilege' {
+
+    It 'PASSes when DnsAdmins has no members' {
+        InModuleScope EntraChecks-ActiveDirectory {
+            $script:Findings = @()
+            Mock Get-ADGroupMember { @() }
+            Test-DNSAdminsPrivilege
+            @($script:Findings | Where-Object { $_.Status -eq 'PASS' }).Count | Should -BeGreaterThan 0
+        }
+    }
+
+    It 'FAILs Critical when a legacy DC OS is present and DnsAdmins is populated' {
+        InModuleScope EntraChecks-ActiveDirectory {
+            $script:Findings = @()
+            Mock Get-ADGroupMember {
+                @([pscustomobject]@{ Name = 'helpdesk_user'; objectClass = 'user' })
+            }
+            Mock Get-ADDomainController {
+                @([pscustomobject]@{ HostName = 'dc1.test.local'; OperatingSystem = 'Windows Server 2016 Standard' })
+            }
+            Test-DNSAdminsPrivilege
+            $fails = @($script:Findings | Where-Object { $_.Status -eq 'FAIL' })
+            $fails.Count | Should -BeGreaterThan 0
+            $fails[0].Severity | Should -Match 'Critical'
+        }
+    }
+
+    It 'WARNs (not Critical) when only modern DCs are present' {
+        InModuleScope EntraChecks-ActiveDirectory {
+            $script:Findings = @()
+            Mock Get-ADGroupMember {
+                @([pscustomobject]@{ Name = 'helpdesk_user'; objectClass = 'user' })
+            }
+            Mock Get-ADDomainController {
+                @([pscustomobject]@{ HostName = 'dc1.test.local'; OperatingSystem = 'Windows Server 2022 Standard' })
+            }
+            Test-DNSAdminsPrivilege
+            @($script:Findings | Where-Object { $_.Status -eq 'WARNING' }).Count | Should -BeGreaterThan 0
+            @($script:Findings | Where-Object { $_.Status -eq 'FAIL' }).Count | Should -Be 0
+        }
+    }
+
+    It 'INFOs when the DnsAdmins group does not exist' {
+        InModuleScope EntraChecks-ActiveDirectory {
+            $script:Findings = @()
+            Mock Get-ADGroupMember { throw 'group not found' }
+            Test-DNSAdminsPrivilege
+            @($script:Findings | Where-Object { $_.Status -eq 'INFO' }).Count | Should -BeGreaterThan 0
+        }
+    }
+}
+
+Describe 'Test-EventAuditPolicy' {
+
+    It 'PASSes when every required subcategory is enabled' {
+        InModuleScope EntraChecks-ActiveDirectory {
+            $script:Findings = @()
+            Mock Get-ADDomainController { @([pscustomobject]@{ HostName = 'dc1.test.local' }) }
+            $csv = @(
+                '"Machine Name","Policy Target","Subcategory","Subcategory GUID","Inclusion Setting","Exclusion Setting"'
+                '"DC1","System","Kerberos Authentication Service","{0CCE9242-69AE-11D9-BED3-505054503030}","Success and Failure",""'
+                '"DC1","System","Kerberos Service Ticket Operations","{0CCE9240-69AE-11D9-BED3-505054503030}","Success and Failure",""'
+                '"DC1","System","Credential Validation","{0CCE923F-69AE-11D9-BED3-505054503030}","Success and Failure",""'
+                '"DC1","System","Directory Service Access","{0CCE923B-69AE-11D9-BED3-505054503030}","Success and Failure",""'
+                '"DC1","System","Directory Service Changes","{0CCE923C-69AE-11D9-BED3-505054503030}","Success",""'
+                '"DC1","System","User Account Management","{0CCE9235-69AE-11D9-BED3-505054503030}","Success",""'
+                '"DC1","System","Security Group Management","{0CCE9237-69AE-11D9-BED3-505054503030}","Success",""'
+            )
+            Mock Invoke-Command { $csv }
+            Test-EventAuditPolicy
+            @($script:Findings | Where-Object { $_.Status -eq 'PASS' }).Count | Should -BeGreaterThan 0
+        }
+    }
+
+    It 'FAILs when a required subcategory is missing' {
+        InModuleScope EntraChecks-ActiveDirectory {
+            $script:Findings = @()
+            Mock Get-ADDomainController { @([pscustomobject]@{ HostName = 'dc1.test.local' }) }
+            $csv = @(
+                '"Machine Name","Policy Target","Subcategory","Subcategory GUID","Inclusion Setting","Exclusion Setting"'
+                '"DC1","System","Kerberos Authentication Service","{0CCE9242-69AE-11D9-BED3-505054503030}","No Auditing",""'
+            )
+            Mock Invoke-Command { $csv }
+            Test-EventAuditPolicy
+            @($script:Findings | Where-Object { $_.Status -eq 'FAIL' }).Count | Should -BeGreaterThan 0
+        }
+    }
+
+    It 'WARNs when PSRemoting fails' {
+        InModuleScope EntraChecks-ActiveDirectory {
+            $script:Findings = @()
+            Mock Get-ADDomainController { @([pscustomobject]@{ HostName = 'dc1.test.local' }) }
+            Mock Invoke-Command { throw 'Access denied' }
+            Test-EventAuditPolicy
+            @($script:Findings | Where-Object { $_.Status -eq 'WARNING' }).Count | Should -BeGreaterThan 0
+        }
+    }
+}
+
+Describe 'Test-DFSRSYSVOLHealth' {
+
+    It 'INFOs when the DFSR module is not available' {
+        InModuleScope EntraChecks-ActiveDirectory {
+            $script:Findings = @()
+            Mock Get-Module { $null } -ParameterFilter { $ListAvailable -and $Name -eq 'DFSR' }
+            Test-DFSRSYSVOLHealth
+            @($script:Findings | Where-Object { $_.Status -eq 'INFO' }).Count | Should -BeGreaterThan 0
+        }
+    }
+
+    It 'INFOs when SYSVOL is on legacy FRS (Get-DfsrMembership unavailable)' {
+        InModuleScope EntraChecks-ActiveDirectory {
+            $script:Findings = @()
+            Mock Get-Module { [pscustomobject]@{ Name = 'DFSR' } } -ParameterFilter { $ListAvailable -and $Name -eq 'DFSR' }
+            Mock Import-Module { }
+            Mock Get-ADDomainController { @([pscustomobject]@{ Name = 'dc1'; HostName = 'dc1.test.local' }) }
+            function Global:Get-DfsrMembership { param([Parameter(ValueFromRemainingArguments = $true)]$args) }
+            Mock Get-DfsrMembership { throw 'No replication group' }
+            Test-DFSRSYSVOLHealth
+            @($script:Findings | Where-Object { $_.Status -eq 'INFO' }).Count | Should -BeGreaterThan 0
+        }
+    }
+}

@@ -74,13 +74,22 @@ $script:CheckMetadata['Test-ADCSEscalation5'] = @{ Category = 'Privileged Access
 $script:CheckMetadata['Test-ADCSEscalation6'] = @{ Category = 'Authentication'; Frameworks = @('CIS-AD-CS', 'NIST-SC-17', 'SOC2-CC6.1') }
 $script:CheckMetadata['Test-ADCSEscalation7'] = @{ Category = 'Privileged Access'; Frameworks = @('CIS-AD-CS', 'NIST-AC-6') }
 $script:CheckMetadata['Test-ADCSEscalation8'] = @{ Category = 'Authentication'; Frameworks = @('CIS-AD-CS', 'NIST-SC-17', 'SOC2-CC6.8') }
+# PR 4b - newer ESC family members
+$script:CheckMetadata['Test-ADCSEscalation9'] = @{ Category = 'Authentication'; Frameworks = @('CIS-AD-CS', 'NIST-SC-17', 'SOC2-CC6.2') }
+$script:CheckMetadata['Test-ADCSEscalation10'] = @{ Category = 'Authentication'; Frameworks = @('CIS-AD-CS', 'NIST-SC-17', 'MCSB-IM', 'SOC2-CC6.1') }
+$script:CheckMetadata['Test-ADCSEscalation11'] = @{ Category = 'Authentication'; Frameworks = @('CIS-AD-CS', 'NIST-SC-17', 'SOC2-CC6.8') }
+$script:CheckMetadata['Test-ADCSEscalation13'] = @{ Category = 'Privileged Access'; Frameworks = @('CIS-AD-CS', 'NIST-AC-6', 'MCSB-IM', 'SOC2-CC6.1') }
 
 # Critical-severity escalation list (FAIL -> Critical, not High).
 $script:CriticalChecks = @(
-    'Test-ADCSEscalation1',  # SAN abuse = instant domain admin
-    'Test-ADCSEscalation4',  # Template ACL abuse = create your own ESC1
-    'Test-ADCSEscalation6',  # CA-wide EDITF_ATTRIBUTESUBJECTALTNAME2
-    'Test-ADCSEscalation8'   # NTLM relay to HTTP enrollment
+    'Test-ADCSEscalation1',   # SAN abuse = instant domain admin
+    'Test-ADCSEscalation4',   # Template ACL abuse = create your own ESC1
+    'Test-ADCSEscalation6',   # CA-wide EDITF_ATTRIBUTESUBJECTALTNAME2
+    'Test-ADCSEscalation8',   # NTLM relay to HTTP enrollment
+    # PR 4b
+    'Test-ADCSEscalation10',  # Weak cert mapping = domain-wide PKINIT impersonation
+    'Test-ADCSEscalation11',  # NTLM relay to CA RPC
+    'Test-ADCSEscalation13'   # OID group link = DA via PAC
 )
 
 # Findings accumulator - produced via the parent AD module's Add-ADFinding when available.
@@ -661,6 +670,253 @@ function Test-ADCSEscalation8 {
 
 #endregion
 
+#region ==================== ESC9 - NO SECURITY EXTENSION ====================
+
+function Test-ADCSEscalation9 {
+    <#
+    .SYNOPSIS
+        ESC9: templates with CT_FLAG_NO_SECURITY_EXTENSION set + non-admin enrollment.
+    .DESCRIPTION
+        msPKI-Enrollment-Flag bit 0x80000 (CT_FLAG_NO_SECURITY_EXTENSION) disables
+        the SID security extension that Microsoft added in KB5014754 to prevent
+        certificate-mapping abuse. Templates with this flag enrollable by non-
+        admins can be paired with weak cert mapping (ESC10) for impersonation.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [object]$Environment)
+
+    $anyFail = $false
+    foreach ($t in $Environment.Templates) {
+        $enrollFlag = [int]([int]$t.'msPKI-Enrollment-Flag')
+        if (($enrollFlag -band $script:CT_FLAG_NO_SECURITY_EXTENSION) -eq 0) { continue }
+        if (-not (Test-TemplateAllowsClientAuth -Template $t)) { continue }
+
+        $unauthEnroll = Get-UnauthorizedACEs -DistinguishedName $t.DistinguishedName `
+            -RightsPattern @('ExtendedRight', 'GenericAll', 'GenericWrite', 'WriteProperty')
+        if ($unauthEnroll.Count -eq 0) { continue }
+        $anyFail = $true
+
+        Add-ADCSFinding -CheckName 'Test-ADCSEscalation9' -Status 'FAIL' -Object $t.cn `
+            -Description "ESC9: Template '$($t.cn)' has CT_FLAG_NO_SECURITY_EXTENSION set (msPKI-Enrollment-Flag = 0x$($enrollFlag.ToString('X'))) and is enrollable by non-admin principal(s): $($unauthEnroll.IdentityReference -join ', '). Combined with weak certificate mapping (see ESC10), this allows authentication as arbitrary accounts via altSecurityIdentities manipulation." `
+            -Remediation 'Remove the CT_FLAG_NO_SECURITY_EXTENSION flag from the template (uncheck "Do not include sid security extension" in template properties), OR restrict enrollment to privileged groups only. The security extension is what KB5014754 added to prevent certificate-mapping abuse.'
+    }
+
+    if (-not $anyFail) {
+        Add-ADCSFinding -CheckName 'Test-ADCSEscalation9' -Status 'PASS' -Object 'All Templates' `
+            -Description 'No templates with CT_FLAG_NO_SECURITY_EXTENSION enrollable by non-admins.' `
+            -Remediation 'No action needed.'
+    }
+}
+
+#endregion
+
+#region ==================== ESC10 - WEAK CERT MAPPING ====================
+
+function Test-ADCSEscalation10 {
+    <#
+    .SYNOPSIS
+        ESC10: DCs with weak certificate binding enforcement (KB5014754).
+    .DESCRIPTION
+        Every DC must have StrongCertificateBindingEnforcement = 2 (full
+        enforcement) under HKLM:\SYSTEM\CurrentControlSet\Services\Kdc.
+        Values 0 (disabled) or 1 (compatibility) allow ESC9-class impersonation
+        via altSecurityIdentities manipulation. Also checks
+        CertificateMappingMethods - legacy implicit UPN / CN mapping should
+        not be enabled.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [object]$Environment)
+
+    try {
+        $dcs = Get-ADDomainController -Filter *
+    }
+    catch {
+        Add-ADCSFinding -CheckName 'Test-ADCSEscalation10' -Status 'WARNING' -Object 'DCs' `
+            -Description "Unable to enumerate DCs: $($_.Exception.Message)" -Remediation 'Check permissions.'
+        return
+    }
+
+    foreach ($dc in $dcs) {
+        try {
+            $result = Invoke-Command -ComputerName $dc.HostName -ScriptBlock {
+                $out = [ordered]@{}
+                try { $out['StrongCertificateBindingEnforcement'] = (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Kdc' -Name StrongCertificateBindingEnforcement -ErrorAction Stop).StrongCertificateBindingEnforcement } catch { $out['StrongCertificateBindingEnforcement'] = $null }
+                try { $out['CertificateMappingMethods'] = (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\Schannel' -Name CertificateMappingMethods -ErrorAction Stop).CertificateMappingMethods } catch { $out['CertificateMappingMethods'] = $null }
+                [pscustomobject]$out
+            } -ErrorAction Stop
+        }
+        catch {
+            Add-ADCSFinding -CheckName 'Test-ADCSEscalation10' -Status 'WARNING' -Object $dc.HostName `
+                -Description "Unable to read cert-mapping registry values on '$($dc.HostName)': $($_.Exception.Message)" `
+                -Remediation 'Enable PSRemoting or run this check locally on the DC.'
+            continue
+        }
+
+        $sbe = $result.StrongCertificateBindingEnforcement
+        if ($null -eq $sbe -or $sbe -eq 0) {
+            Add-ADCSFinding -CheckName 'Test-ADCSEscalation10' -Status 'FAIL' -Object $dc.HostName `
+                -Description "ESC10: DC '$($dc.HostName)' has StrongCertificateBindingEnforcement = $sbe (disabled). Certificate-based authentication accepts weak mappings; an attacker with ESC9-vulnerable template enrollment can impersonate any account." `
+                -Remediation "Set HKLM:\SYSTEM\CurrentControlSet\Services\Kdc\StrongCertificateBindingEnforcement = 2 on every DC. Microsoft's KB5014754 schedule enforces this by default from Feb 2025. Validate no legacy apps depend on weak mapping before enforcing."
+        }
+        elseif ($sbe -eq 1) {
+            Add-ADCSFinding -CheckName 'Test-ADCSEscalation10' -Status 'WARNING' -Object $dc.HostName `
+                -Description "DC '$($dc.HostName)' has StrongCertificateBindingEnforcement = 1 (compatibility mode). Strong mapping is attempted first, but falls back to weak when it fails. Intermediate state before full enforcement." `
+                -Remediation 'Move to StrongCertificateBindingEnforcement = 2 (full enforcement) once any weak-mapping dependencies are remediated.'
+        }
+        else {
+            Add-ADCSFinding -CheckName 'Test-ADCSEscalation10' -Status 'PASS' -Object $dc.HostName `
+                -Description "DC '$($dc.HostName)' has StrongCertificateBindingEnforcement = $sbe (full enforcement)." `
+                -Remediation 'No action needed.'
+        }
+
+        $cmm = $result.CertificateMappingMethods
+        # 0x04 = UPN-only, 0x08 = S4U2Self - these are the legacy weak methods.
+        if ($null -ne $cmm -and ([int]$cmm -band 0x1F) -ne 0) {
+            Add-ADCSFinding -CheckName 'Test-ADCSEscalation10' -Status 'WARNING' -Object $dc.HostName `
+                -Description "DC '$($dc.HostName)' has legacy CertificateMappingMethods enabled (value = 0x$(([int]$cmm).ToString('X'))). Weak mapping methods (UPN / implicit) should be disabled in favor of explicit strong mapping." `
+                -Remediation 'Set HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\Schannel\CertificateMappingMethods to disable legacy methods. Consult KB5014754 for the exact target value for your environment.'
+        }
+    }
+}
+
+#endregion
+
+#region ==================== ESC11 - NTLM RELAY TO CA RPC ====================
+
+function Test-ADCSEscalation11 {
+    <#
+    .SYNOPSIS
+        ESC11: CA missing IF_ENFORCEENCRYPTICERTREQUEST in EditFlags.
+    .DESCRIPTION
+        Without the IF_ENFORCEENCRYPTICERTREQUEST flag (0x00000100) set on the
+        CA policy module's EditFlags, the CA accepts RPC requests without
+        requiring packet integrity / encryption. Attackers with NTLM relay
+        position can relay machine-account NTLM to the CA's RPC endpoint and
+        request a client-auth certificate as the relayed machine account.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [object]$Environment)
+
+    $IF_ENFORCEENCRYPTICERTREQUEST = 0x00000100
+
+    foreach ($ca in $Environment.CAs) {
+        $caHost = $ca.dNSHostName
+        $caName = $ca.cn
+        try {
+            $editFlags = Invoke-Command -ComputerName $caHost -ScriptBlock {
+                param($name)
+                $path = "HKLM:\SYSTEM\CurrentControlSet\Services\CertSvc\Configuration\$name\PolicyModules\CertificateAuthority_MicrosoftDefault.Policy"
+                (Get-ItemProperty -Path $path -Name EditFlags -ErrorAction Stop).EditFlags
+            } -ArgumentList $caName -ErrorAction Stop
+        }
+        catch {
+            Add-ADCSFinding -CheckName 'Test-ADCSEscalation11' -Status 'WARNING' -Object $caName `
+                -Description "Unable to read EditFlags on CA '$caName' ($caHost): $($_.Exception.Message)." `
+                -Remediation "Run the check locally on the CA or enable PSRemoting to '$caHost'. Verify manually: 'certutil -getreg policy\EditFlags'."
+            continue
+        }
+
+        if (($editFlags -band $IF_ENFORCEENCRYPTICERTREQUEST) -eq 0) {
+            Add-ADCSFinding -CheckName 'Test-ADCSEscalation11' -Status 'FAIL' -Object $caName `
+                -Description "ESC11: CA '$caName' does not enforce packet encryption / integrity on RPC requests (EditFlags = 0x$($editFlags.ToString('X'))). NTLM-relay-over-RPC to the CA can request client-auth certs as the relayed machine account, bypassing the HTTPS/EPA protections for the web endpoint covered by ESC8." `
+                -Remediation "On the CA, run: certutil -setreg policy\EditFlags +EDITF_ENFORCEENCRYPTICERTREQUEST ; net stop certsvc ; net start certsvc. Then audit certs issued while the flag was off."
+        }
+        else {
+            Add-ADCSFinding -CheckName 'Test-ADCSEscalation11' -Status 'PASS' -Object $caName `
+                -Description "CA '$caName' enforces packet encryption on RPC requests (EditFlags = 0x$($editFlags.ToString('X')))." `
+                -Remediation 'No action needed.'
+        }
+    }
+}
+
+#endregion
+
+#region ==================== ESC13 - OID GROUP LINK ABUSE ====================
+
+function Test-ADCSEscalation13 {
+    <#
+    .SYNOPSIS
+        ESC13: certificate-issuance policy OIDs linked to privileged groups via msDS-OIDToGroupLink.
+    .DESCRIPTION
+        When a certificate's issuance policy list contains an OID with
+        msDS-OIDToGroupLink pointing at a group, the Kerberos service adds
+        that group to the authenticating user's PAC. An attacker who can
+        enroll in a template carrying such an OID gains the linked group's
+        privileges on their next authentication.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [object]$Environment)
+
+    $privilegedGroupNames = @('Domain Admins', 'Enterprise Admins', 'Schema Admins', 'Account Operators', 'Backup Operators', 'Administrators')
+
+    try {
+        $configNC = (Get-ADRootDSE).configurationNamingContext
+        $oidContainer = "CN=OID,CN=Public Key Services,CN=Services,$configNC"
+        $oids = @(Get-ADObject -SearchBase $oidContainer -LDAPFilter '(&(objectClass=msPKI-Enterprise-Oid)(msDS-OIDToGroupLink=*))' `
+                -Properties 'msDS-OIDToGroupLink', 'msPKI-Cert-Template-OID', 'displayName' -ErrorAction SilentlyContinue)
+    }
+    catch {
+        Add-ADCSFinding -CheckName 'Test-ADCSEscalation13' -Status 'WARNING' -Object 'OID' `
+            -Description "Unable to enumerate policy OIDs with group links: $($_.Exception.Message)" `
+            -Remediation 'Check permissions on the Public Key Services OID container.'
+        return
+    }
+
+    if ($oids.Count -eq 0) {
+        Add-ADCSFinding -CheckName 'Test-ADCSEscalation13' -Status 'PASS' -Object 'OID Policies' `
+            -Description 'No certificate-issuance policy OIDs are linked to AD groups via msDS-OIDToGroupLink.' `
+            -Remediation 'No action needed.'
+        return
+    }
+
+    $anyFail = $false
+    foreach ($oid in $oids) {
+        $linkedGroupDN = [string]$oid.'msDS-OIDToGroupLink'
+        if ([string]::IsNullOrWhiteSpace($linkedGroupDN)) { continue }
+
+        # Resolve the linked group - is it privileged?
+        $isPrivLinked = $false
+        foreach ($g in $privilegedGroupNames) {
+            if ($linkedGroupDN -like "CN=$g,*") { $isPrivLinked = $true; break }
+        }
+
+        $policyOid = [string]$oid.'msPKI-Cert-Template-OID'
+        if (-not $policyOid) { continue }
+
+        # Find templates referencing this OID in msPKI-Certificate-Policy.
+        $matchingTemplates = @($Environment.Templates | Where-Object {
+                $pol = @($_.'msPKI-Certificate-Policy')
+                $pol -contains $policyOid
+            })
+
+        foreach ($tpl in $matchingTemplates) {
+            $unauthEnroll = Get-UnauthorizedACEs -DistinguishedName $tpl.DistinguishedName `
+                -RightsPattern @('ExtendedRight', 'GenericAll', 'GenericWrite', 'WriteProperty')
+            if ($unauthEnroll.Count -eq 0) { continue }
+
+            if ($isPrivLinked) {
+                $anyFail = $true
+                Add-ADCSFinding -CheckName 'Test-ADCSEscalation13' -Status 'FAIL' -Object $tpl.cn `
+                    -Description "ESC13: Template '$($tpl.cn)' includes policy OID '$policyOid' which is linked via msDS-OIDToGroupLink to PRIVILEGED group '$linkedGroupDN'. Non-admin principal(s) can enroll: $($unauthEnroll.IdentityReference -join ', '). Enrolling + authenticating inserts the privileged group into the PAC." `
+                    -Remediation "Remove msDS-OIDToGroupLink from this policy OID, OR unlink the OID from a privileged group, OR restrict template enrollment to privileged identities only."
+            }
+            else {
+                Add-ADCSFinding -CheckName 'Test-ADCSEscalation13' -Status 'WARNING' -Object $tpl.cn `
+                    -Description "Template '$($tpl.cn)' includes policy OID '$policyOid' linked to group '$linkedGroupDN' (not privileged). Non-admin enrollable - review whether OID-group linkage is expected." `
+                    -Remediation 'Review the policy OID and linked group for your issuance-policy architecture. Document intent; flag as compensating-control if legitimate.'
+            }
+        }
+    }
+
+    if (-not $anyFail) {
+        Add-ADCSFinding -CheckName 'Test-ADCSEscalation13' -Status 'PASS' -Object 'OID-linked Templates' `
+            -Description 'No OID-to-privileged-group link + non-admin enrollment combinations found.' `
+            -Remediation 'No action needed.'
+    }
+}
+
+#endregion
+
 #region ==================== MAIN ENTRY POINT ====================
 
 <#
@@ -708,6 +964,10 @@ function Invoke-ADCSAssessment {
     try { Test-ADCSEscalation6 -Environment $env } catch { Write-Verbose "ESC6: $_" }
     try { Test-ADCSEscalation7 -Environment $env } catch { Write-Verbose "ESC7: $_" }
     try { Test-ADCSEscalation8 -Environment $env -ProbeHTTP $ProbeHTTP -TimeoutSeconds $HTTPProbeTimeoutSeconds } catch { Write-Verbose "ESC8: $_" }
+    try { Test-ADCSEscalation9 -Environment $env } catch { Write-Verbose "ESC9: $_" }
+    try { Test-ADCSEscalation10 -Environment $env } catch { Write-Verbose "ESC10: $_" }
+    try { Test-ADCSEscalation11 -Environment $env } catch { Write-Verbose "ESC11: $_" }
+    try { Test-ADCSEscalation13 -Environment $env } catch { Write-Verbose "ESC13: $_" }
 
     return , $script:Findings
 }
@@ -727,7 +987,12 @@ Export-ModuleMember -Function @(
     'Test-ADCSEscalation5',
     'Test-ADCSEscalation6',
     'Test-ADCSEscalation7',
-    'Test-ADCSEscalation8'
+    'Test-ADCSEscalation8',
+    # PR 4b
+    'Test-ADCSEscalation9',
+    'Test-ADCSEscalation10',
+    'Test-ADCSEscalation11',
+    'Test-ADCSEscalation13'
 )
 
 #endregion

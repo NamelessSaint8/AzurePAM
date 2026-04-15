@@ -1,7 +1,7 @@
 # Active Directory (On-Prem) Module Guide
 
 **Module:** `EntraChecks-ActiveDirectory.psm1`
-**Status:** v1.8.0 adds PR 4a — credential hygiene (LM hash, NTLMv1, DC Kerberos encryption, null sessions, domain encryption policy) and ACL abuse path detection (writable privileged objects, Shadow Credentials, RBCD, GenericWrite on privileged members). 51 total AD checks now.
+**Status:** v1.8.0 adds PR 4a — credential hygiene (LM hash, NTLMv1, DC Kerberos encryption, null sessions, domain encryption policy) and ACL abuse path detection (writable privileged objects, Shadow Credentials, RBCD, GenericWrite on privileged members). v1.9.0 adds PR 4b — bounded ACL-reach scan, DnsAdmins escalation, advanced audit policy hygiene, and DFSR SYSVOL health (plus 4 new ADCS checks ESC9/10/11/13). 59 total AD checks now (4 of which are ADCS escalations counted under section 12).
 **Coverage:** 51 read-only checks against on-premises Active Directory covering privileged access, authentication, delegation, account lifecycle, infrastructure, and AD CS.
 
 This guide covers: prerequisites, how to run the module, graceful degradation behavior, permission model, finding schema, and a full list of the 29 checks with their Trust Service Criteria / CIS / NIST mappings.
@@ -394,11 +394,55 @@ Extending the `ActiveDirectory` block:
 
 ---
 
-## 14. Deferred to future PRs
+## 14. Attack path + DNSAdmins + audit + DFSR (PR 4b)
 
-- ESC9-16 (more recent ADCS additions).
-- BloodHound-style ACL abuse path enumeration (bounded attack-path discovery).
-- SMBv1 / NetBIOS / LLMNR host enumeration.
-- Event log / audit policy hygiene.
-- DFSR SYSVOL health.
-- `DNSAdmins` / `DHCP Administrators` escalation vectors.
+PR 4b closes the remaining high-value gaps the PR 4a plan deferred. Four new AD checks plus four new ADCS escalations (ESC9, ESC10, ESC11, ESC13 — see [`ADCS-Guide.md`](ADCS-Guide.md)).
+
+### Attack path lite
+
+- **`Test-AuthenticatedUsersDACLReach`** — Bounded-depth ACL reach from non-admin principals to Domain Admin / Enterprise Admin / Schema Admin members. Direct (one-hop): non-admin holds `GenericAll`/`GenericWrite`/`WriteDacl`/`WriteOwner`/`AllExtendedRights` on a DA member → **Critical**. Indirect (two-hop): non-admin can write a group that itself can write a DA member → **High**. Bounded by `DACLReachMaxDepth` (default `2`); not full BloodHound but catches the highest-ROI 80%.
+
+### Legacy escalation
+
+- **`Test-DNSAdminsPrivilege`** — Enumerates `DnsAdmins` membership. **Critical** when any DC runs Server 2016 or earlier (CVE-2021-40469-class `ServerLevelPluginDll` DLL-load via the DNS service running as SYSTEM); **High** on Server 2019+ where Microsoft hardened the path but membership still enables zone-tampering escalation routes.
+
+### Audit hygiene
+
+- **`Test-EventAuditPolicy`** — Per-DC, parses `auditpol /get /r` output and verifies the AD-critical advanced audit subcategories (Kerberos AS/TGS, Credential Validation, Directory Service Access/Changes, User Account / Security Group Management). Missing or incomplete coverage → **High**. Override the default baseline via `ActiveDirectory.AuditSubcategoryOverrides` for organizations with non-standard requirements. Locale-dependent CSV parsing degrades to WARNING (not FAIL) on parse failure.
+
+### Replication health
+
+- **`Test-DFSRSYSVOLHealth`** — Verifies SYSVOL replicates via DFS-R (FRS-era domains emit INFO and skip), checks each DC's membership state, and scans the last 24 hours of DFSR event log for known-critical IDs (4012, 5002, 5014). Replication stall → **High** (LAPS rotation and GPO drift consequences).
+
+### Configuration
+
+```jsonc
+"ActiveDirectory": {
+    "DACLReachMaxDepth": 2,            // 1=direct only, 2=one-hop indirect, 3=two-hop
+    "AuditSubcategoryOverrides": {}    // {} = use baseline; or { "Kerberos Authentication Service": "SF", ... }
+}
+```
+
+### Critical-checks escalation
+
+`Test-AuthenticatedUsersDACLReach` and `Test-DNSAdminsPrivilege` join the `$script:CriticalChecks` list — direct DA exposure or legacy DnsAdmins membership are single-step compromise paths.
+
+### Graceful degradation
+
+| Check | Failure mode | Behavior |
+|---|---|---|
+| `Test-AuthenticatedUsersDACLReach` | Non-admin runner | Per-object WARNING for ACL-read failures; partial results returned. |
+| `Test-AuthenticatedUsersDACLReach` | Very large forest | Bounded by `DACLReachMaxDepth`; visited-set prevents cycles. |
+| `Test-DNSAdminsPrivilege` | Group not present | INFO. |
+| `Test-EventAuditPolicy` | PSRemoting blocked / locale parse failure | WARNING per DC; rest of the assessment continues. |
+| `Test-DFSRSYSVOLHealth` | DFSR module missing or FRS-era domain | INFO and skip. |
+
+---
+
+## 15. Deferred to future PRs
+
+- ESC14-16 (more esoteric / variable-maturity ADCS research).
+- Full BloodHound graph analysis with cycle detection.
+- SMBv1 / NetBIOS / LLMNR **host** enumeration (DC-level already covered by `Test-NullSessionShares`).
+- Reversible encryption audit (low finding rate; ride along in a future hygiene PR).
+- Active exploitation probes (Certipy / Rubeus / PetitPotam class — out of scope for read-only).

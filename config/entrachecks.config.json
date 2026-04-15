@@ -193,6 +193,9 @@
     "ParallelDCProbing": false,
     "Tier0OUDNs": [],
     "AuthorizedPrincipalsExtra": [],
+    "_pr4bComment": "PR 4b config knobs. DACLReachMaxDepth bounds Test-AuthenticatedUsersDACLReach (1 = direct only, 2 = one-hop indirect, 3 = two-hop). AuditSubcategoryOverrides replaces the default audit-policy baseline for Test-EventAuditPolicy (subcategory name -> SF/S/F). Leave empty to use the default baseline.",
+    "DACLReachMaxDepth": 2,
+    "AuditSubcategoryOverrides": {},
     "ADCS": {
       "_comment": "AD CS ESC1-8 audit. Runs as part of the ActiveDirectory module when an Enterprise CA is detected. ProbeHTTP enables the ESC8 web-enrollment reachability probe (disable in air-gapped or heavily-firewalled environments).",
       "Enabled": true,

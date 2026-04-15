@@ -1188,6 +1188,14 @@ function Invoke-ModuleAssessment {
                         if ($adConfig.ParallelDCProbing) { $adParams['ParallelDCProbing'] = [bool]$adConfig.ParallelDCProbing }
                         if ($adConfig.Tier0OUDNs) { $adParams['Tier0OUDNs'] = @($adConfig.Tier0OUDNs) }
                         if ($adConfig.AuthorizedPrincipalsExtra) { $adParams['AuthorizedPrincipalsExtra'] = @($adConfig.AuthorizedPrincipalsExtra) }
+                        if ($adConfig.DACLReachMaxDepth) { $adParams['DACLReachMaxDepth'] = [int]$adConfig.DACLReachMaxDepth }
+                        if ($adConfig.AuditSubcategoryOverrides) {
+                            $overrides = @{}
+                            foreach ($prop in $adConfig.AuditSubcategoryOverrides.PSObject.Properties) {
+                                $overrides[$prop.Name] = [string]$prop.Value
+                            }
+                            if ($overrides.Count -gt 0) { $adParams['AuditSubcategoryOverrides'] = $overrides }
+                        }
 
                         $adFindings = Invoke-ActiveDirectoryAssessment @adParams
                         if ($adFindings -and $adFindings.Count -gt 0) {

@@ -20,6 +20,7 @@ BeforeAll {
     # Global stubs for cmdlets the ADCS module touches.
     function Global:Get-ADRootDSE { param([Parameter(ValueFromRemainingArguments = $true)]$args) }
     function Global:Get-ADObject { param([Parameter(ValueFromRemainingArguments = $true)]$args) }
+    function Global:Get-ADDomainController { param([Parameter(ValueFromRemainingArguments = $true)]$args) }
     function Global:Get-Acl { param([Parameter(ValueFromRemainingArguments = $true)]$args) }
     function Global:Invoke-Command { param([Parameter(ValueFromRemainingArguments = $true)]$args) }
     function Global:Invoke-WebRequest { param([Parameter(ValueFromRemainingArguments = $true)]$args) }
@@ -418,6 +419,189 @@ Describe 'Test-ADCSEscalation8 — HTTP web enrollment' {
             $script:Findings = @()
             Test-ADCSEscalation8 -Environment $env -ProbeHTTP $false
             @($script:Findings | Where-Object { $_.Status -eq 'INFO' }).Count | Should -BeGreaterThan 0
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# PR 4b - ESC9 / ESC10 / ESC11 / ESC13
+# ---------------------------------------------------------------------------
+
+Describe 'Test-ADCSEscalation9 - CT_FLAG_NO_SECURITY_EXTENSION' {
+
+    It 'FAILs when a template has the flag set and is enrollable by non-admins' {
+        InModuleScope EntraChecks-ADCS {
+            $env = [pscustomobject]@{
+                HasADCS = $true
+                CAs = @()
+                Templates = @(
+                    [pscustomobject]@{
+                        cn = 'NoSidExtTemplate'
+                        DistinguishedName = 'CN=NoSidExtTemplate,DC=test'
+                        pKIExtendedKeyUsage = @('1.3.6.1.5.5.7.3.2')
+                        'msPKI-Certificate-Name-Flag' = 0
+                        'msPKI-Enrollment-Flag' = 0x80000  # CT_FLAG_NO_SECURITY_EXTENSION
+                        'msPKI-RA-Signature' = 0
+                    }
+                )
+            }
+            Mock Get-Acl {
+                [pscustomobject]@{ Owner = 'x'; Access = @(
+                        [pscustomobject]@{ IdentityReference = 'TEST\helpdesk'; ActiveDirectoryRights = 'ExtendedRight' }
+                    )
+                }
+            }
+            $script:Findings = @()
+            Test-ADCSEscalation9 -Environment $env
+            $fails = @($script:Findings | Where-Object { $_.Status -eq 'FAIL' })
+            $fails.Count | Should -BeGreaterThan 0
+            $fails[0].Description | Should -Match 'CT_FLAG_NO_SECURITY_EXTENSION'
+        }
+    }
+
+    It 'PASSes when no templates carry the flag' {
+        InModuleScope EntraChecks-ADCS {
+            $env = [pscustomobject]@{
+                HasADCS = $true
+                CAs = @()
+                Templates = @(
+                    [pscustomobject]@{
+                        cn = 'CleanTemplate'
+                        DistinguishedName = 'CN=CleanTemplate,DC=test'
+                        pKIExtendedKeyUsage = @('1.3.6.1.5.5.7.3.2')
+                        'msPKI-Certificate-Name-Flag' = 0
+                        'msPKI-Enrollment-Flag' = 2
+                        'msPKI-RA-Signature' = 0
+                    }
+                )
+            }
+            $script:Findings = @()
+            Test-ADCSEscalation9 -Environment $env
+            @($script:Findings | Where-Object { $_.Status -eq 'PASS' }).Count | Should -BeGreaterThan 0
+        }
+    }
+}
+
+Describe 'Test-ADCSEscalation10 - StrongCertificateBindingEnforcement' {
+
+    It 'FAILs Critical when StrongCertificateBindingEnforcement is 0 on a DC' {
+        InModuleScope EntraChecks-ADCS {
+            $env = [pscustomobject]@{ HasADCS = $true; CAs = @(); Templates = @() }
+            Mock Get-ADDomainController { @([pscustomobject]@{ HostName = 'dc1.test.local' }) }
+            Mock Invoke-Command { [pscustomobject]@{ StrongCertificateBindingEnforcement = 0; CertificateMappingMethods = $null } }
+            $script:Findings = @()
+            Test-ADCSEscalation10 -Environment $env
+            $fails = @($script:Findings | Where-Object { $_.Status -eq 'FAIL' })
+            $fails.Count | Should -BeGreaterThan 0
+            $fails[0].Severity | Should -Be 'Critical'
+        }
+    }
+
+    It 'PASSes when StrongCertificateBindingEnforcement is 2' {
+        InModuleScope EntraChecks-ADCS {
+            $env = [pscustomobject]@{ HasADCS = $true; CAs = @(); Templates = @() }
+            Mock Get-ADDomainController { @([pscustomobject]@{ HostName = 'dc1.test.local' }) }
+            Mock Invoke-Command { [pscustomobject]@{ StrongCertificateBindingEnforcement = 2; CertificateMappingMethods = $null } }
+            $script:Findings = @()
+            Test-ADCSEscalation10 -Environment $env
+            @($script:Findings | Where-Object { $_.Status -eq 'PASS' }).Count | Should -BeGreaterThan 0
+        }
+    }
+
+    It 'WARNs when PSRemoting to the DC fails' {
+        InModuleScope EntraChecks-ADCS {
+            $env = [pscustomobject]@{ HasADCS = $true; CAs = @(); Templates = @() }
+            Mock Get-ADDomainController { @([pscustomobject]@{ HostName = 'dc1.test.local' }) }
+            Mock Invoke-Command { throw 'Access denied' }
+            $script:Findings = @()
+            Test-ADCSEscalation10 -Environment $env
+            @($script:Findings | Where-Object { $_.Status -eq 'WARNING' }).Count | Should -BeGreaterThan 0
+        }
+    }
+}
+
+Describe 'Test-ADCSEscalation11 - IF_ENFORCEENCRYPTICERTREQUEST' {
+
+    It 'FAILs Critical when EditFlags lacks the encryption-enforce bit' {
+        InModuleScope EntraChecks-ADCS {
+            $env = [pscustomobject]@{
+                HasADCS = $true
+                CAs = @([pscustomobject]@{ cn = 'TestCA'; dNSHostName = 'ca.test.local'; certificateTemplates = @() })
+                Templates = @()
+            }
+            Mock Invoke-Command { 0x2 }  # missing 0x100
+            $script:Findings = @()
+            Test-ADCSEscalation11 -Environment $env
+            $fails = @($script:Findings | Where-Object { $_.Status -eq 'FAIL' })
+            $fails.Count | Should -BeGreaterThan 0
+            $fails[0].Severity | Should -Be 'Critical'
+        }
+    }
+
+    It 'PASSes when EditFlags has the bit set' {
+        InModuleScope EntraChecks-ADCS {
+            $env = [pscustomobject]@{
+                HasADCS = $true
+                CAs = @([pscustomobject]@{ cn = 'TestCA'; dNSHostName = 'ca.test.local'; certificateTemplates = @() })
+                Templates = @()
+            }
+            Mock Invoke-Command { 0x102 }  # 0x100 set
+            $script:Findings = @()
+            Test-ADCSEscalation11 -Environment $env
+            @($script:Findings | Where-Object { $_.Status -eq 'PASS' }).Count | Should -BeGreaterThan 0
+        }
+    }
+}
+
+Describe 'Test-ADCSEscalation13 - msDS-OIDToGroupLink' {
+
+    It 'PASSes when no policy OIDs are linked to groups' {
+        InModuleScope EntraChecks-ADCS {
+            $env = [pscustomobject]@{ HasADCS = $true; CAs = @(); Templates = @() }
+            Mock Get-ADRootDSE { [pscustomobject]@{ configurationNamingContext = 'CN=Configuration,DC=test,DC=local' } }
+            Mock Get-ADObject { @() }
+            $script:Findings = @()
+            Test-ADCSEscalation13 -Environment $env
+            @($script:Findings | Where-Object { $_.Status -eq 'PASS' }).Count | Should -BeGreaterThan 0
+        }
+    }
+
+    It 'FAILs Critical when an OID linked to Domain Admins is referenced by a non-admin enrollable template' {
+        InModuleScope EntraChecks-ADCS {
+            $env = [pscustomobject]@{
+                HasADCS = $true
+                CAs = @()
+                Templates = @(
+                    [pscustomobject]@{
+                        cn = 'OIDLinkedTpl'
+                        DistinguishedName = 'CN=OIDLinkedTpl,DC=test'
+                        pKIExtendedKeyUsage = @('1.3.6.1.5.5.7.3.2')
+                        'msPKI-Certificate-Name-Flag' = 0
+                        'msPKI-Enrollment-Flag' = 2
+                        'msPKI-RA-Signature' = 0
+                        'msPKI-Certificate-Policy' = @('1.3.6.1.4.1.99999.1.1')
+                    }
+                )
+            }
+            Mock Get-ADRootDSE { [pscustomobject]@{ configurationNamingContext = 'CN=Configuration,DC=test,DC=local' } }
+            Mock Get-ADObject {
+                @([pscustomobject]@{
+                        'msDS-OIDToGroupLink' = 'CN=Domain Admins,CN=Users,DC=test,DC=local'
+                        'msPKI-Cert-Template-OID' = '1.3.6.1.4.1.99999.1.1'
+                        displayName = 'EvilOID'
+                    })
+            }
+            Mock Get-Acl {
+                [pscustomobject]@{ Owner = 'x'; Access = @(
+                        [pscustomobject]@{ IdentityReference = 'TEST\helpdesk'; ActiveDirectoryRights = 'ExtendedRight' }
+                    )
+                }
+            }
+            $script:Findings = @()
+            Test-ADCSEscalation13 -Environment $env
+            $fails = @($script:Findings | Where-Object { $_.Status -eq 'FAIL' })
+            $fails.Count | Should -BeGreaterThan 0
+            $fails[0].Severity | Should -Be 'Critical'
         }
     }
 }

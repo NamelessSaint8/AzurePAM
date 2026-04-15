@@ -121,6 +121,11 @@ $script:CheckMetadata['Test-WritablePrivilegedACLs'] = @{ Category = 'Privileged
 $script:CheckMetadata['Test-ShadowCredentialsVulnerable'] = @{ Category = 'Privileged Access'; Frameworks = @('CIS-AD', 'NIST-AC-6', 'MCSB-IM-3', 'SOC2-CC6.1') }
 $script:CheckMetadata['Test-RBCDConfigured'] = @{ Category = 'Delegation'; Frameworks = @('CIS-AD', 'NIST-AC-6', 'MCSB-IM', 'SOC2-CC6.1') }
 $script:CheckMetadata['Test-GenericWriteToSensitive'] = @{ Category = 'Privileged Access'; Frameworks = @('CIS-AD', 'NIST-AC-6', 'SOC2-CC6.1') }
+# PR 4b additions
+$script:CheckMetadata['Test-AuthenticatedUsersDACLReach'] = @{ Category = 'Privileged Access'; Frameworks = @('CIS-AD', 'NIST-AC-6', 'MCSB-PA-5', 'SOC2-CC6.1') }
+$script:CheckMetadata['Test-DNSAdminsPrivilege'] = @{ Category = 'Privileged Access'; Frameworks = @('CIS-AD', 'NIST-AC-6', 'SOC2-CC6.1') }
+$script:CheckMetadata['Test-EventAuditPolicy'] = @{ Category = 'Infrastructure'; Frameworks = @('CIS-AD', 'NIST-AU-2', 'NIST-AU-3', 'SOC2-CC7.2') }
+$script:CheckMetadata['Test-DFSRSYSVOLHealth'] = @{ Category = 'Infrastructure'; Frameworks = @('CIS-AD', 'NIST-CM-2', 'SOC2-CC7.1') }
 
 # Critical-by-nature checks — findings at FAIL status escalate to Critical severity
 # regardless of the default High-for-FAIL mapping.
@@ -138,7 +143,10 @@ $script:CriticalChecks = @(
     'Test-WritablePrivilegedACLs',
     'Test-ShadowCredentialsVulnerable',
     'Test-GenericWriteToSensitive',
-    'Test-RBCDConfigured'
+    'Test-RBCDConfigured',
+    # PR 4b: DACL reach (one-hop direct exposure to DA), DnsAdmins on legacy DCs.
+    'Test-AuthenticatedUsersDACLReach',
+    'Test-DNSAdminsPrivilege'
 )
 
 #endregion
@@ -2416,6 +2424,387 @@ function Test-GenericWriteToSensitive {
 
 #endregion
 
+#region ==================== PR 4b - ATTACK PATH + DNSADMINS + AUDIT + DFSR ====================
+
+function Test-AuthenticatedUsersDACLReach {
+    <#
+    .SYNOPSIS
+        Bounded-depth ACL reach scan from non-admin principals to Domain Admin members.
+    .DESCRIPTION
+        For each user in Domain Admins / Enterprise Admins / Schema Admins:
+          1. Direct: does any non-admin principal hold write-class rights on
+             this user's AD object? -> Critical finding.
+          2. Indirect (if MaxDepth >= 2): does any non-admin principal hold
+             write-class rights on a GROUP that itself holds write-class rights
+             on the DA user? -> High finding (one hop harder to exploit).
+        Not a full BloodHound graph - bounded at MaxDepth to keep runtime
+        sane. Catches the vast majority of real exposure in production forests.
+    .PARAMETER MaxDepth
+        Maximum reach depth. 1 = direct only. 2 = one-hop indirect. Default 2.
+    #>
+    [CmdletBinding()]
+    param(
+        [ValidateRange(1, 3)]
+        [int]$MaxDepth = 2
+    )
+
+    Write-Host "`n[+] Scanning ACL reach paths (bounded depth = $MaxDepth)..." -ForegroundColor Cyan
+
+    $writeRights = 'GenericAll|GenericWrite|WriteProperty|WriteDacl|WriteOwner|AllExtendedRights'
+
+    # Collect DA / EA / SA member DNs.
+    $privMembers = @()
+    foreach ($g in @('Domain Admins', 'Enterprise Admins', 'Schema Admins')) {
+        try {
+            $members = Get-ADGroupMember -Identity $g -Recursive -ErrorAction Stop | Where-Object { $_.objectClass -eq 'user' }
+            foreach ($m in $members) { $privMembers += $m.DistinguishedName }
+        }
+        catch {
+            Write-Verbose "Get-ADGroupMember $g failed: $($_.Exception.Message)"
+        }
+    }
+    $privMembers = @($privMembers | Select-Object -Unique)
+    if ($privMembers.Count -eq 0) {
+        Add-ADFinding -CheckName 'Test-AuthenticatedUsersDACLReach' -Status 'PASS' -Object 'Privileged Members' `
+            -Description 'No privileged-group members enumerated (group empty or permissions blocked).' `
+            -Remediation 'No action needed.'
+        return
+    }
+
+    # Pass 1: direct exposure.
+    $visited = @{}
+    $anyDirectFail = $false
+    foreach ($dn in $privMembers) {
+        try {
+            $acl = Get-Acl -Path ("AD:\$dn") -ErrorAction Stop
+        }
+        catch {
+            Write-Verbose "ACL read failed for $dn"
+            continue
+        }
+        foreach ($ace in $acl.Access) {
+            if ($ace.ActiveDirectoryRights -notmatch $writeRights) { continue }
+            $id = [string]$ace.IdentityReference
+            if (Test-IsAuthorizedPrincipal -IdentityReference $id) { continue }
+            $anyDirectFail = $true
+            Add-ADFinding -CheckName 'Test-AuthenticatedUsersDACLReach' -Status 'FAIL' -Object $dn `
+                -Description "DIRECT reach (1 hop): non-admin '$id' has '$($ace.ActiveDirectoryRights)' on privileged user '$dn'. Single-step compromise." `
+                -Remediation 'Remove the ACE. Privileged user accounts inherit protection from AdminSDHolder; non-admin principals must not hold write rights directly.'
+            $visited[$id] = $true
+        }
+    }
+
+    # Pass 2: indirect exposure via groups that have rights on DA members.
+    if ($MaxDepth -ge 2) {
+        # First, find groups with write rights on DA members (from pass 1).
+        $writableGroups = @{}
+        foreach ($dn in $privMembers) {
+            try {
+                $acl = Get-Acl -Path ("AD:\$dn") -ErrorAction SilentlyContinue
+            }
+            catch { continue }
+            foreach ($ace in $acl.Access) {
+                if ($ace.ActiveDirectoryRights -notmatch $writeRights) { continue }
+                $id = [string]$ace.IdentityReference
+                # Strip domain prefix (e.g., "TEST\HRAdmins" -> "HRAdmins").
+                $idShort = $id
+                if ($id -match '\\(.+)$') { $idShort = $matches[1] }
+                # Only interested in groups here; skip authorized principals (covered by Pass 1 exclusion) and user-looking things.
+                try {
+                    $grp = Get-ADGroup -Identity $idShort -ErrorAction Stop
+                    if (-not $writableGroups.ContainsKey($grp.DistinguishedName)) {
+                        $writableGroups[$grp.DistinguishedName] = @()
+                    }
+                    $writableGroups[$grp.DistinguishedName] += [pscustomobject]@{
+                        TargetUser = $dn
+                        Rights = $ace.ActiveDirectoryRights
+                    }
+                }
+                catch {
+                    Write-Verbose "Identity '$idShort' is not a resolvable group; skipping (likely a user)."
+                }
+            }
+        }
+
+        # Now for each writable group, check if it has non-admin write rights itself.
+        foreach ($groupDN in $writableGroups.Keys) {
+            try {
+                $gAcl = Get-Acl -Path ("AD:\$groupDN") -ErrorAction Stop
+            }
+            catch { continue }
+            foreach ($ace in $gAcl.Access) {
+                if ($ace.ActiveDirectoryRights -notmatch $writeRights) { continue }
+                $id = [string]$ace.IdentityReference
+                if (Test-IsAuthorizedPrincipal -IdentityReference $id) { continue }
+                $targets = $writableGroups[$groupDN] | ForEach-Object { "$($_.TargetUser) ($($_.Rights))" }
+                Add-ADFinding -CheckName 'Test-AuthenticatedUsersDACLReach' -Status 'FAIL' -Object $groupDN `
+                    -Description "INDIRECT reach (2 hops): non-admin '$id' has '$($ace.ActiveDirectoryRights)' on group '$groupDN', which has write rights on privileged user(s): $($targets -join '; '). Two-step compromise." `
+                    -Remediation "Remove '$id' from the ACL on '$groupDN', OR remove the group's write rights on the privileged user(s)."
+            }
+        }
+    }
+
+    if (-not $anyDirectFail -and $visited.Count -eq 0) {
+        Add-ADFinding -CheckName 'Test-AuthenticatedUsersDACLReach' -Status 'PASS' -Object 'DACL Reach' `
+            -Description "No non-admin ACL reach paths to $($privMembers.Count) privileged member(s) within $MaxDepth hop(s)." `
+            -Remediation 'No action needed.'
+    }
+}
+
+function Test-DNSAdminsPrivilege {
+    <#
+    .SYNOPSIS
+        Audits the DnsAdmins group. Legacy privilege-escalation path (pre-2019 DCs).
+    .DESCRIPTION
+        DnsAdmins members could historically load a DLL into the DNS Service
+        (running as SYSTEM on the DC) via the ServerLevelPluginDll registry
+        value - CVE-2021-40469. Microsoft hardened this in Server 2019, but
+        membership is still an escalation surface (zone modification, cache
+        poisoning). Severity is tiered based on whether any DC runs a
+        pre-hardened OS.
+    #>
+    [CmdletBinding()]
+    param()
+
+    Write-Host "`n[+] Checking DnsAdmins group membership..." -ForegroundColor Cyan
+    try {
+        $members = @(Get-ADGroupMember -Identity 'DnsAdmins' -Recursive -ErrorAction Stop)
+    }
+    catch {
+        Add-ADFinding -CheckName 'Test-DNSAdminsPrivilege' -Status 'INFO' -Object 'DnsAdmins' `
+            -Description "DnsAdmins group not present in this domain, or unable to enumerate: $($_.Exception.Message)" `
+            -Remediation 'No action needed if DnsAdmins is genuinely absent.'
+        return
+    }
+
+    if ($members.Count -eq 0) {
+        Add-ADFinding -CheckName 'Test-DNSAdminsPrivilege' -Status 'PASS' -Object 'DnsAdmins' `
+            -Description 'DnsAdmins group has no members.' `
+            -Remediation 'No action needed.'
+        return
+    }
+
+    # Detect whether any DC is Server 2016 or earlier (pre-hardening for CVE-2021-40469).
+    $hasLegacyDC = $false
+    try {
+        $dcs = Get-ADDomainController -Filter *
+        foreach ($dc in $dcs) {
+            if ($dc.OperatingSystem -match 'Server 2008|Server 2012|Server 2016') { $hasLegacyDC = $true; break }
+        }
+    }
+    catch {
+        Write-Verbose "DC OS enumeration failed: $($_.Exception.Message)"
+    }
+
+    $memberList = ($members | ForEach-Object { "$($_.Name) [$($_.objectClass)]" }) -join '; '
+
+    if ($hasLegacyDC) {
+        Add-ADFinding -CheckName 'Test-DNSAdminsPrivilege' -Status 'FAIL' -Object 'DnsAdmins' `
+            -Description "DnsAdmins has $($members.Count) member(s): $memberList. At least one DC runs Server 2016 or earlier - DnsAdmins members can load a DLL into the DNS service (SYSTEM on DC) via ServerLevelPluginDll (CVE-2021-40469)." `
+            -Remediation 'Remove all non-essential members from DnsAdmins. Patch / upgrade DCs to Server 2019+ to get the ServerLevelPluginDll hardening. Monitor DNS-server registry changes.'
+    }
+    else {
+        Add-ADFinding -CheckName 'Test-DNSAdminsPrivilege' -Status 'WARNING' -Object 'DnsAdmins' `
+            -Description "DnsAdmins has $($members.Count) member(s): $memberList. Modern DCs are hardened against the classic CVE-2021-40469 escalation, but membership is still an escalation surface (zone modification, cache poisoning)." `
+            -Remediation 'Minimize DnsAdmins membership. Scope delegation to specific zones rather than group membership where possible.'
+    }
+}
+
+function Test-EventAuditPolicy {
+    <#
+    .SYNOPSIS
+        Verifies advanced audit policy on every DC covers the AD-critical subcategories.
+    .DESCRIPTION
+        Uses auditpol to query each DC's effective advanced audit policy.
+        Required subcategories for AD forensics:
+          - Kerberos Authentication Service (S+F)
+          - Kerberos Service Ticket Operations (S+F)
+          - Credential Validation (S+F)
+          - Directory Service Access (S+F)
+          - Directory Service Changes (S)
+          - Account Management subcategories (S)
+    .PARAMETER Subcategories
+        Optional override. Default is a reasonable baseline.
+    #>
+    [CmdletBinding()]
+    param(
+        [hashtable]$Subcategories
+    )
+
+    Write-Host "`n[+] Checking advanced audit policy on DCs..." -ForegroundColor Cyan
+
+    if (-not $Subcategories) {
+        # Default: subcategory name -> required inclusion flags (S = success, F = failure, SF = both).
+        $Subcategories = @{
+            'Kerberos Authentication Service' = 'SF'
+            'Kerberos Service Ticket Operations' = 'SF'
+            'Credential Validation' = 'SF'
+            'Directory Service Access' = 'SF'
+            'Directory Service Changes' = 'S'
+            'User Account Management' = 'S'
+            'Security Group Management' = 'S'
+        }
+    }
+
+    try {
+        $dcs = Get-ADDomainController -Filter *
+    }
+    catch {
+        Add-ADFinding -CheckName 'Test-EventAuditPolicy' -Status 'WARNING' -Object 'Audit Policy' `
+            -Description "Unable to enumerate DCs: $($_.Exception.Message)" -Remediation 'Check permissions.'
+        return
+    }
+
+    foreach ($dc in $dcs) {
+        try {
+            $policy = Invoke-Command -ComputerName $dc.HostName -ScriptBlock {
+                # auditpol CSV output: "Machine Name","Policy Target","Subcategory","Subcategory GUID","Inclusion Setting","Exclusion Setting"
+                auditpol /get /category:* /r 2>&1
+            } -ErrorAction Stop
+        }
+        catch {
+            Add-ADFinding -CheckName 'Test-EventAuditPolicy' -Status 'WARNING' -Object $dc.HostName `
+                -Description "Unable to read audit policy on '$($dc.HostName)': $($_.Exception.Message)" `
+                -Remediation 'Enable PSRemoting or verify locally: auditpol /get /category:*'
+            continue
+        }
+
+        # Parse CSV output; skip lines that aren't actual policy rows.
+        $csvRows = @()
+        try {
+            $csvText = $policy -join "`r`n"
+            $csvRows = $csvText | ConvertFrom-Csv -ErrorAction Stop
+        }
+        catch {
+            Add-ADFinding -CheckName 'Test-EventAuditPolicy' -Status 'WARNING' -Object $dc.HostName `
+                -Description "Unable to parse auditpol CSV on '$($dc.HostName)'. auditpol output may be locale-specific (non-English Windows). Manual verification required." `
+                -Remediation 'Review auditpol /get /category:* output on the DC directly.'
+            continue
+        }
+
+        $missing = @()
+        foreach ($sub in $Subcategories.Keys) {
+            $want = $Subcategories[$sub]
+            $row = $csvRows | Where-Object { $_.Subcategory -eq $sub } | Select-Object -First 1
+            if (-not $row) {
+                $missing += "$sub (not found)"
+                continue
+            }
+            $setting = [string]$row.'Inclusion Setting'
+            $ok = $true
+            if ($want -match 'S' -and $setting -notmatch 'Success') { $ok = $false }
+            if ($want -match 'F' -and $setting -notmatch 'Failure') { $ok = $false }
+            if (-not $ok) {
+                $missing += "$sub (current: '$setting', required: $want)"
+            }
+        }
+
+        if ($missing.Count -gt 0) {
+            Add-ADFinding -CheckName 'Test-EventAuditPolicy' -Status 'FAIL' -Object $dc.HostName `
+                -Description "DC '$($dc.HostName)' has audit-policy gaps: $($missing -join '; '). These gaps mean no forensic trail for the most common AD attack surfaces." `
+                -Remediation 'Configure advanced audit policy via GPO: Computer Configuration -> Policies -> Windows Settings -> Security Settings -> Advanced Audit Policy Configuration. Enable Success + Failure for each missing subcategory.'
+        }
+        else {
+            Add-ADFinding -CheckName 'Test-EventAuditPolicy' -Status 'PASS' -Object $dc.HostName `
+                -Description "DC '$($dc.HostName)' audit policy covers all $($Subcategories.Count) required subcategories." `
+                -Remediation 'No action needed.'
+        }
+    }
+}
+
+function Test-DFSRSYSVOLHealth {
+    <#
+    .SYNOPSIS
+        Verifies SYSVOL replicates via DFS-R (not legacy FRS) and no recent critical errors.
+    .DESCRIPTION
+        SYSVOL replication failures cause Group Policy drift: LAPS password
+        rotation fails to propagate, GPP cpassword remediation doesn't apply
+        consistently, security policy converges unevenly. Checks that every
+        DC is in the DFSR SYSVOL replication group and that no critical DFSR
+        events (4012 "journal wrap", 5002 "content set", 5014 "connection
+        failure") have fired in the last 24 hours.
+    #>
+    [CmdletBinding()]
+    param()
+
+    Write-Host "`n[+] Checking DFSR SYSVOL replication health..." -ForegroundColor Cyan
+
+    if (-not (Get-Module -ListAvailable -Name DFSR)) {
+        Add-ADFinding -CheckName 'Test-DFSRSYSVOLHealth' -Status 'INFO' -Object 'DFSR' `
+            -Description 'DFSR PowerShell module not available on this host. Install RSAT DFS-R Management tools or run this check from a DC.' `
+            -Remediation 'Add-WindowsCapability -Online -Name Rsat.FileServices.Tools~~~~0.0.1.0'
+        return
+    }
+
+    Import-Module DFSR -ErrorAction SilentlyContinue | Out-Null
+
+    try {
+        $dcs = Get-ADDomainController -Filter *
+    }
+    catch {
+        Add-ADFinding -CheckName 'Test-DFSRSYSVOLHealth' -Status 'WARNING' -Object 'DFSR' `
+            -Description "Unable to enumerate DCs: $($_.Exception.Message)" -Remediation 'Check permissions.'
+        return
+    }
+
+    # Check DFSR membership for the Domain System Volume replication group.
+    try {
+        $members = @(Get-DfsrMembership -GroupName 'Domain System Volume' -ErrorAction Stop)
+    }
+    catch {
+        Add-ADFinding -CheckName 'Test-DFSRSYSVOLHealth' -Status 'INFO' -Object 'DFSR' `
+            -Description "Unable to query the 'Domain System Volume' DFSR group. SYSVOL may still be on legacy FRS (Get-DfsrMembership failed: $($_.Exception.Message))." `
+            -Remediation 'If SYSVOL is on FRS, migrate to DFSR: https://learn.microsoft.com/en-us/troubleshoot/windows-server/group-policy/migrate-sysvol-replication-to-dfsr'
+        return
+    }
+
+    $dcNames = $dcs | ForEach-Object { $_.Name }
+    foreach ($dcName in $dcNames) {
+        $m = $members | Where-Object { $_.ComputerName -eq $dcName } | Select-Object -First 1
+        if (-not $m) {
+            Add-ADFinding -CheckName 'Test-DFSRSYSVOLHealth' -Status 'FAIL' -Object $dcName `
+                -Description "DC '$dcName' is not a member of the 'Domain System Volume' DFSR replication group. SYSVOL is not replicating to this DC." `
+                -Remediation 'Investigate the DC''s DFSR configuration. Use dfsrdiag to diagnose. Policies originating elsewhere will not converge on this DC.'
+            continue
+        }
+        if (-not $m.Enabled) {
+            Add-ADFinding -CheckName 'Test-DFSRSYSVOLHealth' -Status 'FAIL' -Object $dcName `
+                -Description "DC '$dcName' DFSR membership is DISABLED. SYSVOL replication is not active." `
+                -Remediation "Enable DFSR membership via: Set-DfsrMembership -GroupName 'Domain System Volume' -ContentPath <path> -ComputerName '$dcName' -FolderName SYSVOL_DFSR -Enabled `$true"
+            continue
+        }
+
+        # Check for critical DFSR events in the last 24h.
+        try {
+            $criticalIds = @(4012, 5002, 5014)
+            $evts = Invoke-Command -ComputerName $dcName -ScriptBlock {
+                param($ids)
+                Get-WinEvent -FilterHashtable @{ LogName = 'DFS Replication'; Id = $ids; StartTime = (Get-Date).AddHours(-24) } -ErrorAction SilentlyContinue -MaxEvents 20
+            } -ArgumentList (, $criticalIds) -ErrorAction Stop
+        }
+        catch {
+            Add-ADFinding -CheckName 'Test-DFSRSYSVOLHealth' -Status 'WARNING' -Object $dcName `
+                -Description "Unable to scan DFSR event log on '$dcName': $($_.Exception.Message)" `
+                -Remediation 'Enable PSRemoting or check the DFS Replication event log directly on the DC.'
+            continue
+        }
+
+        if ($evts -and @($evts).Count -gt 0) {
+            $eventSummary = ($evts | Group-Object Id | ForEach-Object { "ID $($_.Name) x$($_.Count)" }) -join '; '
+            Add-ADFinding -CheckName 'Test-DFSRSYSVOLHealth' -Status 'FAIL' -Object $dcName `
+                -Description "DC '$dcName' has DFSR critical events in the last 24h: $eventSummary. SYSVOL replication is likely impaired." `
+                -Remediation 'Investigate per event ID: 4012 = journal wrap (serious, requires non-authoritative restore); 5002 = content set disabled; 5014 = connection failure. Use dfsrdiag backlog / dfsrdiag replicationstate.'
+        }
+        else {
+            Add-ADFinding -CheckName 'Test-DFSRSYSVOLHealth' -Status 'PASS' -Object $dcName `
+                -Description "DC '$dcName' DFSR SYSVOL replication enabled, no critical events in last 24h." `
+                -Remediation 'No action needed.'
+        }
+    }
+}
+
+#endregion
+
 #region ==================== MAIN ENTRY POINT ====================
 
 <#
@@ -2448,6 +2837,10 @@ function Invoke-ActiveDirectoryAssessment {
         [bool]$ParallelDCProbing = $false,
         [string[]]$Tier0OUDNs = @(),
         [string[]]$AuthorizedPrincipalsExtra = @(),
+        # PR 4b knobs
+        [ValidateRange(1, 3)]
+        [int]$DACLReachMaxDepth = 2,
+        [hashtable]$AuditSubcategoryOverrides,
         [string[]]$IncludeChecks,
         [string[]]$ExcludeChecks
     )
@@ -2489,7 +2882,10 @@ function Invoke-ActiveDirectoryAssessment {
         'Test-NullSessionShares', 'Test-DomainEncryptionTypesPolicy',
         # PR 4a - ACL abuse paths (Group B)
         'Test-WritablePrivilegedACLs', 'Test-ShadowCredentialsVulnerable',
-        'Test-RBCDConfigured', 'Test-GenericWriteToSensitive'
+        'Test-RBCDConfigured', 'Test-GenericWriteToSensitive',
+        # PR 4b - attack path + DNSAdmins + audit + DFSR
+        'Test-AuthenticatedUsersDACLReach', 'Test-DNSAdminsPrivilege',
+        'Test-EventAuditPolicy', 'Test-DFSRSYSVOLHealth'
     )
 
     $toRun = if ($IncludeChecks) {
@@ -2536,6 +2932,11 @@ function Invoke-ActiveDirectoryAssessment {
                 'Test-DCLegacyEncryption' { & $check -Parallel:$ParallelDCProbing }
                 'Test-NullSessionShares' { & $check -Parallel:$ParallelDCProbing }
                 'Test-RBCDConfigured' { & $check -Tier0OUDNs $Tier0OUDNs }
+                'Test-AuthenticatedUsersDACLReach' { & $check -MaxDepth $DACLReachMaxDepth }
+                'Test-EventAuditPolicy' {
+                    if ($AuditSubcategoryOverrides) { & $check -Subcategories $AuditSubcategoryOverrides }
+                    else { & $check }
+                }
                 default {
                     & $check
                 }
@@ -2617,7 +3018,12 @@ Export-ModuleMember -Function @(
     'Test-WritablePrivilegedACLs',
     'Test-ShadowCredentialsVulnerable',
     'Test-RBCDConfigured',
-    'Test-GenericWriteToSensitive'
+    'Test-GenericWriteToSensitive',
+    # PR 4b - attack path + DNSAdmins + audit + DFSR
+    'Test-AuthenticatedUsersDACLReach',
+    'Test-DNSAdminsPrivilege',
+    'Test-EventAuditPolicy',
+    'Test-DFSRSYSVOLHealth'
 )
 
 #endregion

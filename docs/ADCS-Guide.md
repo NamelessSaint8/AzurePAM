@@ -1,10 +1,10 @@
-# AD CS ESC1-ESC8 Check Reference
+# AD CS ESC1-ESC13 Check Reference
 
 **Module:** `EntraChecks-ADCS.psm1`
-**Shipping in:** v1.7.0 (PR 3 of the AD roadmap).
+**Shipping in:** v1.7.0 (PR 3 — ESC1-8), v1.9.0 (PR 4b — ESC9/10/11/13).
 **Invoked by:** `Invoke-ActiveDirectoryAssessment` when an Enterprise CA is detected (no new menu item or CLI flag).
 
-This guide is a technical reference for the nine AD CS checks. For running instructions see the [AD module guide](ActiveDirectory-Guide.md).
+This guide is a technical reference for the AD CS checks (ESC1-8 plus ESC9/10/11/13). For running instructions see the [AD module guide](ActiveDirectory-Guide.md).
 
 ---
 
@@ -12,7 +12,7 @@ This guide is a technical reference for the nine AD CS checks. For running instr
 
 The "ESC" family of AD CS misconfigurations was catalogued by SpecterOps in *Certified Pre-Owned: Abusing Active Directory Certificate Services* (2021). Each ESC represents a different way a low-privilege attacker can coerce the CA into issuing a certificate that authenticates them as a higher-privilege principal — often Domain Admin. Because AD CS certificates are accepted by every DC for Kerberos PKINIT, compromising a template or CA is effectively equivalent to compromising the domain.
 
-EntraChecks detects the 8 original ESC classes. All checks are **read-only**. Results are advisory — a flagged template may have legitimate use in your environment (e.g., a smart-card enrollment agent for helpdesk staff), and the checks report the flag combination so you can decide.
+EntraChecks detects the 8 original ESC classes plus 4 newer additions (ESC9, ESC10, ESC11, ESC13 — relevant in environments that have applied the KB5014754 hardening or added OID-group links). All checks are **read-only**. Results are advisory — a flagged template may have legitimate use in your environment (e.g., a smart-card enrollment agent for helpdesk staff), and the checks report the flag combination so you can decide.
 
 ---
 
@@ -30,6 +30,10 @@ EntraChecks detects the 8 original ESC classes. All checks are **read-only**. Re
 | `Test-ADCSEscalation6` | ESC6 | CA registry (PSRemoting) | `EditFlags` registry value (under `HKLM:\SYSTEM\CurrentControlSet\Services\CertSvc\Configuration\<CAName>\PolicyModules\CertificateAuthority_MicrosoftDefault.Policy`) has the `EDITF_ATTRIBUTESUBJECTALTNAME2` (`0x40000`) bit set. |
 | `Test-ADCSEscalation7` | ESC7 | CA security descriptor (PSRemoting) | `certutil -getreg ca\<CAName>\Security` output indicates a broad principal (Domain Users / Authenticated Users / Everyone / Users / Domain Computers) holds CA administrative rights. |
 | `Test-ADCSEscalation8` | ESC8 | HTTP probe | `http://<CA>/certsrv/` is reachable over plain HTTP. |
+| `Test-ADCSEscalation9` | ESC9 | AD + ACL | Template with `CT_FLAG_NO_SECURITY_EXTENSION` (`0x80000`) in `msPKI-Enrollment-Flag` + enrollable by non-admins. The issued cert omits the SID security extension added by KB5014754, enabling ESC10-style mapping abuse. |
+| `Test-ADCSEscalation10` | ESC10 | DC registry (PSRemoting) | Per DC: `StrongCertificateBindingEnforcement` under `HKLM:\SYSTEM\CurrentControlSet\Services\Kdc`. `0` = disabled (pre-KB5014754 legacy), `1` = compatibility, `2` = full enforcement. Also surfaces legacy `CertificateMappingMethods` (implicit UPN/CN). |
+| `Test-ADCSEscalation11` | ESC11 | CA registry (PSRemoting) | CA `EditFlags` missing `IF_ENFORCEENCRYPTICERTREQUEST` (`0x00000100`) — allows NTLM-relay to CA RPC endpoint. |
+| `Test-ADCSEscalation13` | ESC13 | AD (`CN=OID,CN=Public Key Services`) | Certificate issuance policy OIDs with `msDS-OIDToGroupLink` pointing to a privileged group, used by a template enrollable by non-admins. Enrolling the cert inserts the linked group into the Kerberos PAC. |
 
 ### Authorized-principals filter
 
@@ -57,6 +61,10 @@ Add more entries to `$script:AuthorizedPrincipals` in `EntraChecks-ADCS.psm1` if
 | `Test-ADCSEscalation3` | High | Enrollment agent abuse requires a cooperating victim template; not instant DA. |
 | `Test-ADCSEscalation5` | High | PKI-container ACL abuse is a step toward CA compromise, not the compromise itself. |
 | `Test-ADCSEscalation7` | High | Broad CA admin rights enable ESC6 and arbitrary issuance — but requires the attacker to act on the CA. |
+| `Test-ADCSEscalation9` | High | SID-extension-less cert is dangerous only when combined with ESC10 or weak mapping — not a single-step path. |
+| `Test-ADCSEscalation10` | **Critical** | Domain-wide — governs every Kerberos PKINIT cert-to-account binding across all DCs. |
+| `Test-ADCSEscalation11` | **Critical** | NTLM relay to CA RPC endpoint = certificate issuance as the relayed account; no HTTPS needed (bypasses ESC8 mitigations). |
+| `Test-ADCSEscalation13` | **Critical** | Enrolling the cert injects a privileged group SID into the PAC — direct DA without modifying the template. |
 
 WARNING is used when a check can't complete (PSRemoting blocked, HTTP probe error). The WARNING never blocks the rest of the assessment.
 
@@ -110,6 +118,16 @@ Invoke-WebRequest 'http://<CA>/certsrv/' -MaximumRedirection 0
 - IIS: require SSL for `/certsrv/` (uncheck "Require SSL" is wrong — check it).
 - Enable Extended Protection for Authentication (EPA) / channel binding on the web enrollment site.
 - Better: if you don't need web enrollment, **remove the role entirely** (Server Manager → Remove Roles).
+
+### ESC9 / ESC10
+- **ESC9:** Clear `CT_FLAG_NO_SECURITY_EXTENSION` on the flagged template (Certificate Templates MMC → Properties → Server tab → uncheck "Do not include revocation information in issued certificates" / inspect `msPKI-Enrollment-Flag`). Restrict enrollment rights.
+- **ESC10:** On every DC, set `StrongCertificateBindingEnforcement=2` (full enforcement) under `HKLM\SYSTEM\CurrentControlSet\Services\Kdc`. Ensure `CertificateMappingMethods` excludes `0x4` (implicit UPN) and `0x2` (implicit CN). Microsoft's KB5014754 rollout guidance covers the full migration path and enforcement timeline.
+
+### ESC11
+- On each CA, enable the `IF_ENFORCEENCRYPTICERTREQUEST` flag via `certutil -setreg CA\InterfaceFlags +IF_ENFORCEENCRYPTICERTREQUEST && net stop certsvc && net start certsvc`. This requires packet privacy on the RPC interface, defeating unencrypted relay.
+
+### ESC13
+- Inspect `CN=OID,CN=Public Key Services,CN=Services,<config NC>` for OID objects with `msDS-OIDToGroupLink` populated. For each link to a privileged group, confirm the business need. If legitimate (rare), restrict templates that include the OID in `msPKI-Certificate-Policy` to highly-privileged enrollment rights only. Otherwise clear the attribute.
 
 Microsoft's guidance for CVE-2022-26923 (Certifried) covers ESC6/ESC8 mitigations in depth — it's the canonical reference.
 
