@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     Start-EntraChecks.ps1
     Unified orchestration script for EntraChecks compliance assessment suite
@@ -106,7 +106,7 @@ param(
     [string]$OutputDirectory = ".\Reports",
 
     [Parameter()]
-    [ValidateSet("Core", "IdentityProtection", "Devices", "SecureScore", "Defender", "AzurePolicy", "Purview", "All")]
+    [ValidateSet("Core", "IdentityProtection", "Devices", "SecureScore", "Defender", "AzurePolicy", "Purview", "ActiveDirectory", "All")]
     [string[]]$Modules,
 
     [switch]$SkipAuthentication,
@@ -375,6 +375,13 @@ $script:ModuleDefinitions = @{
         RequiresAzure = $false
         Description = "Compliance Manager assessments"
     }
+    ActiveDirectory = @{
+        Name = "Active Directory (On-Prem)"
+        Module = "EntraChecks-ActiveDirectory.psm1"
+        RequiresGraph = $false
+        RequiresAzure = $false
+        Description = "On-premises AD security audit (29 checks)"
+    }
 }
 
 # Required Graph scopes for all modules
@@ -400,74 +407,78 @@ $script:AllGraphScopes = @(
 function Show-Banner {
     Clear-Host
     Write-Host ""
-    Write-Host "  ╔═══════════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
-    Write-Host "  ║                                                                   ║" -ForegroundColor Cyan
-    Write-Host "  ║   ███████╗███╗   ██╗████████╗██████╗  █████╗                     ║" -ForegroundColor Cyan
-    Write-Host "  ║   ██╔════╝████╗  ██║╚══██╔══╝██╔══██╗██╔══██╗                    ║" -ForegroundColor Cyan
-    Write-Host "  ║   █████╗  ██╔██╗ ██║   ██║   ██████╔╝███████║                    ║" -ForegroundColor Cyan
-    Write-Host "  ║   ██╔══╝  ██║╚██╗██║   ██║   ██╔══██╗██╔══██║                    ║" -ForegroundColor Cyan
-    Write-Host "  ║   ███████╗██║ ╚████║   ██║   ██║  ██║██║  ██║                    ║" -ForegroundColor Cyan
-    Write-Host "  ║   ╚══════╝╚═╝  ╚═══╝   ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═╝                    ║" -ForegroundColor Cyan
-    Write-Host "  ║                                                                   ║" -ForegroundColor Cyan
-    Write-Host "  ║              ██████╗██╗  ██╗███████╗ ██████╗██╗  ██╗███████╗     ║" -ForegroundColor Magenta
-    Write-Host "  ║             ██╔════╝██║  ██║██╔════╝██╔════╝██║ ██╔╝██╔════╝     ║" -ForegroundColor Magenta
-    Write-Host "  ║             ██║     ███████║█████╗  ██║     █████╔╝ ███████╗     ║" -ForegroundColor Magenta
-    Write-Host "  ║             ██║     ██╔══██║██╔══╝  ██║     ██╔═██╗ ╚════██║     ║" -ForegroundColor Magenta
-    Write-Host "  ║             ╚██████╗██║  ██║███████╗╚██████╗██║  ██╗███████║     ║" -ForegroundColor Magenta
-    Write-Host "  ║              ╚═════╝╚═╝  ╚═╝╚══════╝ ╚═════╝╚═╝  ╚═╝╚══════╝     ║" -ForegroundColor Magenta
-    Write-Host "  ║                                                                   ║" -ForegroundColor Cyan
-    Write-Host "  ║           Unified Compliance Assessment Suite v$script:Version            ║" -ForegroundColor White
-    Write-Host "  ║                                                                   ║" -ForegroundColor Cyan
-    Write-Host "  ╚═══════════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
+    Write-Host "  +-------------------------------------------------------------------+" -ForegroundColor Cyan
+    Write-Host "  �                                                                   �" -ForegroundColor Cyan
+    Write-Host "  �   �������+���+   ��+��������+������+  �����+                     �" -ForegroundColor Cyan
+    Write-Host "  �   ��+----+����+  ���+--��+--+��+--��+��+--��+                    �" -ForegroundColor Cyan
+    Write-Host "  �   �����+  ��+��+ ���   ���   ������++��������                    �" -ForegroundColor Cyan
+    Write-Host "  �   ��+--+  ���+��+���   ���   ��+--��+��+--���                    �" -ForegroundColor Cyan
+    Write-Host "  �   �������+��� +�����   ���   ���  ������  ���                    �" -ForegroundColor Cyan
+    Write-Host "  �   +------++-+  +---+   +-+   +-+  +-++-+  +-+                    �" -ForegroundColor Cyan
+    Write-Host "  �                                                                   �" -ForegroundColor Cyan
+    Write-Host "  �              ������+��+  ��+�������+ ������+��+  ��+�������+     �" -ForegroundColor Magenta
+    Write-Host "  �             ��+----+���  �����+----+��+----+��� ��++��+----+     �" -ForegroundColor Magenta
+    Write-Host "  �             ���     �������������+  ���     �����++ �������+     �" -ForegroundColor Magenta
+    Write-Host "  �             ���     ��+--�����+--+  ���     ��+-��+ +----���     �" -ForegroundColor Magenta
+    Write-Host "  �             +������+���  ����������++������+���  ��+��������     �" -ForegroundColor Magenta
+    Write-Host "  �              +-----++-+  +-++------+ +-----++-+  +-++------+     �" -ForegroundColor Magenta
+    Write-Host "  �                                                                   �" -ForegroundColor Cyan
+    Write-Host "  �           Unified Compliance Assessment Suite v$script:Version            �" -ForegroundColor White
+    Write-Host "  �                                                                   �" -ForegroundColor Cyan
+    Write-Host "  +-------------------------------------------------------------------+" -ForegroundColor Cyan
     Write-Host ""
 }
 
 function Show-MainMenu {
-    Write-Host "  ┌─────────────────────────────────────────────────────────────────┐" -ForegroundColor Gray
-    Write-Host "  │                         MAIN MENU                               │" -ForegroundColor White
-    Write-Host "  ├─────────────────────────────────────────────────────────────────┤" -ForegroundColor Gray
-    Write-Host "  │                                                                 │" -ForegroundColor Gray
-    Write-Host "  │   [1] Quick Assessment      - Run all modules (recommended)    │" -ForegroundColor Yellow
-    Write-Host "  │   [2] Select Modules        - Choose specific modules to run   │" -ForegroundColor Yellow
-    Write-Host "  │   [3] View Last Results     - Open most recent reports         │" -ForegroundColor Yellow
-    Write-Host "  │   [4] Compare Snapshots     - Delta reporting                  │" -ForegroundColor Yellow
-    Write-Host "  │   [5] Manage Snapshots      - View/delete saved snapshots      │" -ForegroundColor Yellow
-    Write-Host "  │   [6] SOC 2 Readiness       - Internal SOC 2 TSC assessment   │" -ForegroundColor Yellow
-    Write-Host "  │   [7] SOC 2 Type 2          - Period coverage from snapshots  │" -ForegroundColor Yellow
-    Write-Host "  │                                                                 │" -ForegroundColor Gray
-    Write-Host "  │   [A] Authentication        - Connect to Graph and Azure       │" -ForegroundColor Cyan
-    Write-Host "  │   [D] Disconnect            - Sign out (switch tenant)         │" -ForegroundColor Cyan
-    Write-Host "  │   [S] Settings              - Configure output & preferences   │" -ForegroundColor Cyan
-    Write-Host "  │   [H] Help                  - Documentation & guides           │" -ForegroundColor Cyan
-    Write-Host "  │                                                                 │" -ForegroundColor Gray
-    Write-Host "  │   [Q] Quit                  - Quit and disconnect              │" -ForegroundColor Gray
-    Write-Host "  │                                                                 │" -ForegroundColor Gray
-    Write-Host "  └─────────────────────────────────────────────────────────────────┘" -ForegroundColor Gray
+    Write-Host "  +-----------------------------------------------------------------+" -ForegroundColor Gray
+    Write-Host "  �                         MAIN MENU                               �" -ForegroundColor White
+    Write-Host "  +-----------------------------------------------------------------�" -ForegroundColor Gray
+    Write-Host "  �                                                                 �" -ForegroundColor Gray
+    Write-Host "  �   [1] Quick Assessment      - Run all modules (recommended)    �" -ForegroundColor Yellow
+    Write-Host "  �   [2] Select Modules        - Choose specific modules to run   �" -ForegroundColor Yellow
+    Write-Host "  �   [3] View Last Results     - Open most recent reports         �" -ForegroundColor Yellow
+    Write-Host "  �   [4] Compare Snapshots     - Delta reporting                  �" -ForegroundColor Yellow
+    Write-Host "  �   [5] Manage Snapshots      - View/delete saved snapshots      �" -ForegroundColor Yellow
+    Write-Host "  �   [6] SOC 2 Readiness       - Internal SOC 2 TSC assessment   �" -ForegroundColor Yellow
+    Write-Host "  �   [7] SOC 2 Type 2          - Period coverage from snapshots  �" -ForegroundColor Yellow
+    Write-Host "  �   [8] Active Directory      - On-premises AD security audit  �" -ForegroundColor Yellow
+    Write-Host "  �                                                                 �" -ForegroundColor Gray
+    Write-Host "  �   [A] Authentication        - Connect to Graph and Azure       �" -ForegroundColor Cyan
+    Write-Host "  �   [D] Disconnect            - Sign out (switch tenant)         �" -ForegroundColor Cyan
+    Write-Host "  �   [S] Settings              - Configure output & preferences   �" -ForegroundColor Cyan
+    Write-Host "  �   [H] Help                  - Documentation & guides           �" -ForegroundColor Cyan
+    Write-Host "  �                                                                 �" -ForegroundColor Gray
+    Write-Host "  �   [Q] Quit                  - Quit and disconnect              �" -ForegroundColor Gray
+    Write-Host "  �                                                                 �" -ForegroundColor Gray
+    Write-Host "  +-----------------------------------------------------------------+" -ForegroundColor Gray
     Write-Host ""
 }
 
 function Show-ModuleMenu {
-    Write-Host "  ┌─────────────────────────────────────────────────────────────────┐" -ForegroundColor Gray
-    Write-Host "  │                      SELECT MODULES                             │" -ForegroundColor White
-    Write-Host "  ├─────────────────────────────────────────────────────────────────┤" -ForegroundColor Gray
-    Write-Host "  │                                                                 │" -ForegroundColor Gray
-    Write-Host "  │   ENTRA ID (Graph API)                                         │" -ForegroundColor Cyan
-    Write-Host "  │   [1] Core Assessment       - 25 foundational checks           │" -ForegroundColor Yellow
-    Write-Host "  │   [2] Identity Protection   - Risk-based checks (P2)           │" -ForegroundColor Yellow
-    Write-Host "  │   [3] Devices and Intune    - Device compliance                │" -ForegroundColor Yellow
-    Write-Host "  │   [4] Secure Score          - Microsoft Secure Score           │" -ForegroundColor Yellow
-    Write-Host "  │                                                                 │" -ForegroundColor Gray
-    Write-Host "  │   AZURE (ARM API)                                              │" -ForegroundColor Cyan
-    Write-Host "  │   [5] Defender for Cloud    - Regulatory compliance            │" -ForegroundColor Yellow
-    Write-Host "  │   [6] Azure Policy          - Policy compliance state          │" -ForegroundColor Yellow
-    Write-Host "  │                                                                 │" -ForegroundColor Gray
-    Write-Host "  │   MICROSOFT 365                                                │" -ForegroundColor Cyan
-    Write-Host "  │   [7] Purview Compliance    - Compliance Manager               │" -ForegroundColor Yellow
-    Write-Host "  │                                                                 │" -ForegroundColor Gray
-    Write-Host "  │   [A] Select All            [R] Run Selected                   │" -ForegroundColor Green
-    Write-Host "  │   [C] Clear Selection       [B] Back to Main Menu              │" -ForegroundColor Gray
-    Write-Host "  │                                                                 │" -ForegroundColor Gray
-    Write-Host "  └─────────────────────────────────────────────────────────────────┘" -ForegroundColor Gray
+    Write-Host "  +-----------------------------------------------------------------+" -ForegroundColor Gray
+    Write-Host "  �                      SELECT MODULES                             �" -ForegroundColor White
+    Write-Host "  +-----------------------------------------------------------------�" -ForegroundColor Gray
+    Write-Host "  �                                                                 �" -ForegroundColor Gray
+    Write-Host "  �   ENTRA ID (Graph API)                                         �" -ForegroundColor Cyan
+    Write-Host "  �   [1] Core Assessment       - 25 foundational checks           �" -ForegroundColor Yellow
+    Write-Host "  �   [2] Identity Protection   - Risk-based checks (P2)           �" -ForegroundColor Yellow
+    Write-Host "  �   [3] Devices and Intune    - Device compliance                �" -ForegroundColor Yellow
+    Write-Host "  �   [4] Secure Score          - Microsoft Secure Score           �" -ForegroundColor Yellow
+    Write-Host "  �                                                                 �" -ForegroundColor Gray
+    Write-Host "  �   AZURE (ARM API)                                              �" -ForegroundColor Cyan
+    Write-Host "  �   [5] Defender for Cloud    - Regulatory compliance            �" -ForegroundColor Yellow
+    Write-Host "  �   [6] Azure Policy          - Policy compliance state          �" -ForegroundColor Yellow
+    Write-Host "  �                                                                 �" -ForegroundColor Gray
+    Write-Host "  �   MICROSOFT 365                                                �" -ForegroundColor Cyan
+    Write-Host "  �   [7] Purview Compliance    - Compliance Manager               �" -ForegroundColor Yellow
+    Write-Host "  �                                                                 �" -ForegroundColor Gray
+    Write-Host "  �   ON-PREMISES                                                  �" -ForegroundColor Cyan
+    Write-Host "  �   [8] Active Directory      - On-prem AD security audit       �" -ForegroundColor Yellow
+    Write-Host "  �                                                                 �" -ForegroundColor Gray
+    Write-Host "  �   [A] Select All            [R] Run Selected                   �" -ForegroundColor Green
+    Write-Host "  �   [C] Clear Selection       [B] Back to Main Menu              �" -ForegroundColor Gray
+    Write-Host "  �                                                                 �" -ForegroundColor Gray
+    Write-Host "  +-----------------------------------------------------------------+" -ForegroundColor Gray
     Write-Host ""
 }
 
@@ -536,7 +547,7 @@ function Show-Progress {
     $filled = [math]::Floor($width * $PercentComplete / 100)
     $empty = $width - $filled
     
-    $bar = "█" * $filled + "░" * $empty
+    $bar = "�" * $filled + "�" * $empty
     
     Write-Host "`r  [$bar] $PercentComplete% - $Status" -NoNewline -ForegroundColor Cyan
 }
@@ -1159,6 +1170,29 @@ function Invoke-ModuleAssessment {
                         }
                     }
                 }
+
+                "ActiveDirectory" {
+                    $modulePath = Join-Path $script:ModulesPath "EntraChecks-ActiveDirectory.psm1"
+                    if (Test-Path $modulePath) {
+                        Import-Module $modulePath -Force
+                        # Pull per-module config overrides if present.
+                        $adConfig = if ($script:Config.ActiveDirectory) { $script:Config.ActiveDirectory } else { @{} }
+                        $adParams = @{}
+                        if ($adConfig.UserLogonInactivityDays) { $adParams['UserLogonInactivityDays'] = [int]$adConfig.UserLogonInactivityDays }
+                        if ($adConfig.UserPasswordAgeDays) { $adParams['UserPasswordAgeDays'] = [int]$adConfig.UserPasswordAgeDays }
+                        if ($adConfig.RecentPrivilegedDays) { $adParams['RecentPrivilegedAccountDays'] = [int]$adConfig.RecentPrivilegedDays }
+
+                        $adFindings = Invoke-ActiveDirectoryAssessment @adParams
+                        if ($adFindings -and $adFindings.Count -gt 0) {
+                            $script:Findings += $adFindings
+                            Write-Log -Level INFO -Message "Captured $($adFindings.Count) findings from ActiveDirectory module" -Category "ModuleExecution"
+                        }
+                        $results.Modules.ActiveDirectory = @{
+                            Success = $true
+                            FindingsCount = if ($adFindings) { $adFindings.Count } else { 0 }
+                        }
+                    }
+                }
             }
 
             Write-Host "    [OK] Complete" -ForegroundColor Green
@@ -1296,7 +1330,7 @@ function Invoke-SOC2ReadinessFromMenu {
         [bool]$OpenBrowser = $true
     )
 
-    Write-Host "`n  ===== SOC 2 Internal Readiness Assessment =====" -ForegroundColor Cyan
+    Write-Host "`n ===== SOC 2 Internal Readiness Assessment =====" -ForegroundColor Cyan
 
     # Load SOC 2 modules (catalog, reporting, branding)
     $soc2Module = Join-Path $script:ModulesPath "EntraChecks-SOC2.psm1"
@@ -1484,7 +1518,7 @@ function Invoke-SOC2ReadinessFromMenu {
 .SYNOPSIS
     Reads the SOC2.Enabled flag from the given config file. Returns $false
     when the file is absent, unparseable, or the flag is missing/false.
-    Pure function — no side effects other than a yellow warning on parse error.
+    Pure function � no side effects other than a yellow warning on parse error.
 
 .DESCRIPTION
     Extracted from Invoke-SOC2ReadinessIfEnabled so the flag-reading logic is
@@ -1521,7 +1555,7 @@ function Get-SOC2EnabledFromConfig {
     hands off to Invoke-SOC2ReadinessFromMenu with -SkipCoreSeed (findings
     already collected by the caller).
 
-    SOC 2 failure NEVER fails the primary Quick Assessment — errors are
+    SOC 2 failure NEVER fails the primary Quick Assessment � errors are
     caught and logged as a yellow warning only.
 
 .PARAMETER TenantName
@@ -1571,7 +1605,7 @@ function Invoke-SOC2TypeTwoFromMenu {
         [string]$SnapshotDirectory
     )
 
-    Write-Host "`n  ===== SOC 2 Type 2 Period Coverage =====" -ForegroundColor Cyan
+    Write-Host "`n ===== SOC 2 Type 2 Period Coverage =====" -ForegroundColor Cyan
 
     # Load required modules
     $needed = @(
@@ -1616,7 +1650,7 @@ function Invoke-SOC2TypeTwoFromMenu {
     $reportPrefix = if ($tt -and $tt.ReportFilenamePrefix) { $tt.ReportFilenamePrefix } else { 'SOC2-TypeTwo' }
     $cfgSnapshotDir = if ($tt -and $tt.SnapshotDirectory) { $tt.SnapshotDirectory } else { $SnapshotDirectory }
 
-    # Resolve period from SOC2.TypeTwoPeriod (top-level) — interactive prompt if missing
+    # Resolve period from SOC2.TypeTwoPeriod (top-level) � interactive prompt if missing
     $startDate = $null
     $endDate = $null
     if ($soc2Cfg -and $soc2Cfg.TypeTwoPeriod) {
@@ -1957,7 +1991,8 @@ function Start-InteractiveMode {
                         "5" { if ("Defender" -notin $selectedModules) { $selectedModules += "Defender" } }
                         "6" { if ("AzurePolicy" -notin $selectedModules) { $selectedModules += "AzurePolicy" } }
                         "7" { if ("Purview" -notin $selectedModules) { $selectedModules += "Purview" } }
-                        "A" { $selectedModules = @("Core", "IdentityProtection", "Devices", "SecureScore", "Defender", "AzurePolicy", "Purview") }
+                        "8" { if ("ActiveDirectory" -notin $selectedModules) { $selectedModules += "ActiveDirectory" } }
+                        "A" { $selectedModules = @("Core", "IdentityProtection", "Devices", "SecureScore", "Defender", "AzurePolicy", "Purview", "ActiveDirectory") }
                         "C" { $selectedModules = @() }
                         "R" {
                             if ($selectedModules.Count -gt 0) {
@@ -2066,6 +2101,18 @@ function Start-InteractiveMode {
                 Read-Host "`n  Press Enter to continue"
             }
 
+            "8" {
+                # Active Directory (On-Prem) assessment
+                if (-not $tenantName) {
+                    $tenantName = Read-Host "`n  Enter tenant name"
+                }
+                $results = Invoke-ModuleAssessment -SelectedModules @('ActiveDirectory') -TenantName $tenantName -OutputDir $OutputDirectory
+                if ($results) {
+                    Write-Host "`n  AD assessment complete. Findings will appear in the next report generation." -ForegroundColor Green
+                }
+                Read-Host "`n  Press Enter to continue"
+            }
+
             "A" {
                 # Authentication
                 Write-Host ""
@@ -2095,7 +2142,7 @@ function Start-InteractiveMode {
             "H" {
                 # Help
                 Write-Host "`n  EntraChecks Documentation" -ForegroundColor Cyan
-                Write-Host "  =========================" -ForegroundColor Cyan
+                Write-Host " =========================" -ForegroundColor Cyan
                 Write-Host ""
                 Write-Host "  Available Modules:" -ForegroundColor White
                 foreach ($key in $script:ModuleDefinitions.Keys) {

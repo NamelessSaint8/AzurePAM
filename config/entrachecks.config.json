@@ -176,5 +176,15 @@
         "ReportFilenamePrefix": "SOC2-TypeTwo"
       }
     }
+  },
+  "ActiveDirectory": {
+    "_comment": "On-premises AD assessment module (PR 1). Disabled by default — opt in by setting Enabled=true or by selecting Module [8] / -Modules ActiveDirectory at runtime. Requires RSAT + a domain-joined Windows host.",
+    "Enabled": false,
+    "UserLogonInactivityDays": 180,
+    "UserPasswordAgeDays": 180,
+    "RecentPrivilegedDays": 30,
+    "KrbTgtPasswordAgeDays": 180,
+    "IncludeComputers": true,
+    "PrivilegedGroupWhitelist": {}
   }
 }

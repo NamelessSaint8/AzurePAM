@@ -1,0 +1,1472 @@
+<#
+.SYNOPSIS
+    EntraChecks-ActiveDirectory.psm1
+    On-premises Active Directory security assessment module.
+
+.DESCRIPTION
+    Runs 29 read-only Active Directory security checks and emits
+    schema-aligned findings that flow into the EntraChecks unified
+    reporting pipeline alongside cloud findings.
+
+    Migrated from the stand-alone ad/ActiveDirectoryv3.ps1 script.
+    All Check-* functions renamed to Test-* (approved PowerShell verb).
+    The duplicate Check-KerberosPreAuthDisabled definition was removed.
+
+    Graceful degradation: if the platform is not Windows, RSAT is not
+    installed, the host is not domain-joined, or the current user lacks
+    Domain Admin privilege, the module emits a single INFO/WARNING
+    finding and returns without running individual checks.
+
+.NOTES
+    Version: 1.0.0
+    Author:  David Stells
+    Requires: Windows + ActiveDirectory PowerShell module (RSAT)
+    Optional: GroupPolicy PowerShell module (for GPO checks)
+
+    Permission model:
+    - Domain User       -> most read-only checks run; ACL/drift checks
+                           may return incomplete results (WARNING).
+    - Domain Admin      -> full check coverage.
+    - Read-Only DA      -> full coverage for read-only checks.
+
+.LINK
+    Plan: plans/AD-PR1-Refactor-Plan.md
+    Source: ad/ActiveDirectoryv3.ps1 (removed after migration)
+#>
+
+#Requires -Version 5.1
+
+#region ==================== MODULE STATE ====================
+
+$script:ModuleName = 'EntraChecks-ActiveDirectory'
+$script:ModuleVersion = '1.0.0'
+
+# Populated by Invoke-ActiveDirectoryAssessment. Accessible via
+#   & (Get-Module EntraChecks-ActiveDirectory) { $script:Findings }
+$script:Findings = @()
+
+# Per-check default thresholds (overridable via parameters).
+$script:DefaultUserLogonInactivityDays = 180
+$script:DefaultUserPasswordAgeDays = 180
+$script:DefaultRecentPrivilegedAccountDays = 30
+$script:DefaultKrbTgtPasswordAgeDays = 180
+
+# Privileged group canonical list used by multiple checks.
+$script:PrivilegedGroups = @(
+    'Domain Admins',
+    'Enterprise Admins',
+    'Administrators',
+    'Schema Admins',
+    'Account Operators',
+    'Backup Operators'
+)
+
+# Groups + SYSTEM principal allowed to have broad rights on protected objects.
+$script:AdminPrincipals = @(
+    'Domain Admins',
+    'Enterprise Admins',
+    'Administrators',
+    'SYSTEM'
+)
+
+# Per-check metadata: Category + ComplianceFrameworks. Indexed by the CheckName
+# passed to Add-ADFinding. Drives unified-report grouping and SOC 2 mapping.
+$script:CheckMetadata = @{}
+$script:CheckMetadata['Test-ADForestAndDomain'] = @{ Category = 'Infrastructure'; Frameworks = @('CIS-AD', 'NIST-CM-8') }
+$script:CheckMetadata['Test-DomainControllers'] = @{ Category = 'Infrastructure'; Frameworks = @('CIS-AD', 'NIST-CM-8', 'SOC2-CC6.1') }
+$script:CheckMetadata['Test-ADPasswordPolicy'] = @{ Category = 'Authentication'; Frameworks = @('CIS-AD', 'NIST-IA-5', 'SOC2-CC6.2', 'PCI-DSS-8.3') }
+$script:CheckMetadata['Test-ADStaleAccounts'] = @{ Category = 'Account Lifecycle'; Frameworks = @('CIS-AD', 'NIST-AC-2', 'SOC2-CC6.2') }
+$script:CheckMetadata['Test-PrivilegedGroupMembership'] = @{ Category = 'Privileged Access'; Frameworks = @('CIS-AD', 'NIST-AC-6', 'SOC2-CC6.1') }
+$script:CheckMetadata['Test-ProtectedUsersAdoption'] = @{ Category = 'Privileged Access'; Frameworks = @('CIS-AD', 'MCSB-PA-5', 'SOC2-CC6.1') }
+$script:CheckMetadata['Test-DomainTrusts'] = @{ Category = 'Infrastructure'; Frameworks = @('CIS-AD', 'NIST-AC-3') }
+$script:CheckMetadata['Test-ADServiceAccounts'] = @{ Category = 'Account Lifecycle'; Frameworks = @('CIS-AD', 'NIST-IA-5') }
+$script:CheckMetadata['Test-KrbTgtAccountAge'] = @{ Category = 'Authentication'; Frameworks = @('CIS-AD', 'NIST-IA-5', 'SOC2-CC6.1') }
+$script:CheckMetadata['Test-DelegationOverview'] = @{ Category = 'Delegation'; Frameworks = @('CIS-AD', 'MCSB-IM', 'SOC2-CC6.1') }
+$script:CheckMetadata['Test-GPOInventory'] = @{ Category = 'Infrastructure'; Frameworks = @('CIS-AD') }
+$script:CheckMetadata['Test-DuplicateSPNs'] = @{ Category = 'Authentication'; Frameworks = @('CIS-AD', 'MCSB-IM') }
+$script:CheckMetadata['Test-PrivilegedObjectACLs'] = @{ Category = 'Privileged Access'; Frameworks = @('CIS-AD', 'NIST-AC-6', 'SOC2-CC6.1') }
+$script:CheckMetadata['Test-GPPPasswords'] = @{ Category = 'Authentication'; Frameworks = @('CIS-AD', 'NIST-IA-5', 'SOC2-CC6.1', 'PCI-DSS-3.5') }
+$script:CheckMetadata['Test-KerberosPreAuthDisabled'] = @{ Category = 'Authentication'; Frameworks = @('CIS-AD', 'MCSB-IM', 'SOC2-CC6.2') }
+$script:CheckMetadata['Test-UnconstrainedDelegation'] = @{ Category = 'Delegation'; Frameworks = @('CIS-AD', 'MCSB-IM', 'SOC2-CC6.1') }
+$script:CheckMetadata['Test-PasswordNeverExpires'] = @{ Category = 'Account Lifecycle'; Frameworks = @('CIS-AD', 'NIST-IA-5', 'SOC2-CC6.2') }
+$script:CheckMetadata['Test-SIDHistory'] = @{ Category = 'Privileged Access'; Frameworks = @('CIS-AD', 'NIST-AC-6') }
+$script:CheckMetadata['Test-PrivilegedSmartcardRequirement'] = @{ Category = 'Privileged Access'; Frameworks = @('CIS-AD', 'NIST-IA-2', 'SOC2-CC6.1') }
+$script:CheckMetadata['Test-PrivilegedGroupCreep'] = @{ Category = 'Privileged Access'; Frameworks = @('CIS-AD', 'NIST-AC-6', 'SOC2-CC6.1') }
+$script:CheckMetadata['Test-AdminSDHolderDrift'] = @{ Category = 'Privileged Access'; Frameworks = @('CIS-AD', 'NIST-AC-6', 'SOC2-CC6.1') }
+$script:CheckMetadata['Test-DangerousSIDsInPrivilegedGroups'] = @{ Category = 'Privileged Access'; Frameworks = @('CIS-AD', 'NIST-AC-6', 'SOC2-CC6.1') }
+$script:CheckMetadata['Test-PasswordsInDescription'] = @{ Category = 'Account Lifecycle'; Frameworks = @('CIS-AD', 'NIST-IA-5') }
+$script:CheckMetadata['Test-UserAccountsWithSPN'] = @{ Category = 'Authentication'; Frameworks = @('CIS-AD', 'MCSB-IM', 'SOC2-CC6.2') }
+$script:CheckMetadata['Test-OUAndGPODelegation'] = @{ Category = 'Privileged Access'; Frameworks = @('CIS-AD', 'NIST-AC-6') }
+$script:CheckMetadata['Test-RecentPrivilegedAccounts'] = @{ Category = 'Privileged Access'; Frameworks = @('CIS-AD', 'NIST-AC-2', 'SOC2-CC6.1') }
+$script:CheckMetadata['Test-NestedGroupPrivilegePaths'] = @{ Category = 'Privileged Access'; Frameworks = @('CIS-AD', 'NIST-AC-6') }
+$script:CheckMetadata['Test-SensitiveObjectACLDrift'] = @{ Category = 'Privileged Access'; Frameworks = @('CIS-AD', 'NIST-AC-6', 'SOC2-CC6.1') }
+$script:CheckMetadata['Test-ShadowGroupNames'] = @{ Category = 'Privileged Access'; Frameworks = @('CIS-AD', 'NIST-AC-6') }
+
+# Critical-by-nature checks — findings at FAIL status escalate to Critical severity
+# regardless of the default High-for-FAIL mapping.
+$script:CriticalChecks = @(
+    'Test-UnconstrainedDelegation',
+    'Test-KrbTgtAccountAge',
+    'Test-DangerousSIDsInPrivilegedGroups',
+    'Test-GPPPasswords',
+    'Test-AdminSDHolderDrift'
+)
+
+#endregion
+
+#region ==================== PRIVATE HELPERS ====================
+
+<#
+.SYNOPSIS
+    Emits a schema-aligned finding into $script:Findings.
+.DESCRIPTION
+    Single helper for every Test-* function to use. Normalizes status
+    vocabulary (OK -> PASS), infers Severity from status + CheckName,
+    looks up Category + ComplianceFrameworks from $script:CheckMetadata,
+    and derives RiskScore from Severity.
+#>
+function Add-ADFinding {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$CheckName,
+        [Parameter(Mandatory)] [ValidateSet('PASS', 'FAIL', 'WARNING', 'INFO', 'OK')] [string]$Status,
+        [Parameter(Mandatory)] [string]$Object,
+        [Parameter(Mandatory)] [string]$Description,
+        [string]$Remediation = ''
+    )
+
+    # Normalize legacy OK -> PASS (migration from old schema).
+    if ($Status -eq 'OK') { $Status = 'PASS' }
+
+    $meta = $script:CheckMetadata[$CheckName]
+    $category = if ($meta) { $meta.Category } else { 'ActiveDirectory' }
+    $frameworks = if ($meta) { $meta.Frameworks } else { @() }
+
+    $severity = switch ($Status) {
+        'FAIL' { if ($script:CriticalChecks -contains $CheckName) { 'Critical' } else { 'High' } }
+        'WARNING' { 'Medium' }
+        'PASS' { 'Low' }
+        'INFO' { 'Low' }
+        default { 'Low' }
+    }
+
+    $riskScore = switch ($severity) {
+        'Critical' { 90 }
+        'High' { 70 }
+        'Medium' { 50 }
+        'Low' { 10 }
+        default { 0 }
+    }
+
+    # Individual assignment to avoid PSAlignAssignmentStatement + PSUseConsistentWhitespace clash.
+    $finding = [pscustomobject]@{
+        Time = Get-Date
+        CheckName = $CheckName
+        Status = $Status
+        Severity = $severity
+        Category = $category
+        Object = $Object
+        Description = $Description
+        Remediation = $Remediation
+        ComplianceFrameworks = $frameworks
+        ComplianceReference = ($frameworks -join ', ')
+        RiskScore = $riskScore
+        Type = "AD_$CheckName"
+        Source = 'ActiveDirectory'
+    }
+    $script:Findings += $finding
+}
+
+<#
+.SYNOPSIS
+    Probes the runtime environment for Active Directory readiness.
+.DESCRIPTION
+    Returns a PSCustomObject with IsAvailable, FailureReason, IsDomainAdmin,
+    DomainName, and ModulePresent fields. Invoke-ActiveDirectoryAssessment
+    checks IsAvailable and returns early (emitting a single INFO finding)
+    when AD queries cannot run.
+#>
+function Test-ADEnvironment {
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param()
+
+    $result = [ordered]@{
+        IsAvailable = $false
+        FailureReason = $null
+        IsDomainAdmin = $false
+        DomainName = $null
+        ModulePresent = $false
+        Platform = $null
+    }
+
+    # Stage 1 — platform. $IsWindows isn't available on PS 5.1, so use $env:OS.
+    $isWindows = ($env:OS -eq 'Windows_NT') -or ($PSVersionTable.PSEdition -eq 'Desktop')
+    $result['Platform'] = if ($isWindows) { 'Windows' } else { 'Non-Windows' }
+    if (-not $isWindows) {
+        $result['FailureReason'] = 'Active Directory checks only run on Windows. Current platform is not Windows.'
+        return [pscustomobject]$result
+    }
+
+    # Stage 2 — RSAT / ActiveDirectory module.
+    $adModule = Get-Module -ListAvailable -Name ActiveDirectory -ErrorAction SilentlyContinue
+    if (-not $adModule) {
+        $result['FailureReason'] = "ActiveDirectory PowerShell module not installed. Install RSAT: Add-WindowsCapability -Online -Name Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0"
+        return [pscustomobject]$result
+    }
+    $result['ModulePresent'] = $true
+    Import-Module ActiveDirectory -ErrorAction SilentlyContinue | Out-Null
+
+    # Stage 3 — domain-joined probe.
+    try {
+        $domain = Get-ADDomain -ErrorAction Stop
+        $result['DomainName'] = $domain.DNSRoot
+    }
+    catch {
+        $result['FailureReason'] = "Unable to query Active Directory. This is expected if the host is not domain-joined or AD connectivity is unavailable. Error: $($_.Exception.Message)"
+        return [pscustomobject]$result
+    }
+
+    # Stage 4 — permission probe (soft — presence of Domain Admin membership).
+    try {
+        $current = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+        foreach ($g in $current.Groups) {
+            # S-1-5-21-*-512 = Domain Admins; S-1-5-32-544 = local Administrators.
+            if ($g.Value -match '^S-1-5-21-.+-512$' -or $g.Value -eq 'S-1-5-32-544') {
+                $result['IsDomainAdmin'] = $true
+                break
+            }
+        }
+    }
+    catch {
+        Write-Verbose "Test-ADEnvironment permission probe failed: $($_.Exception.Message)"
+    }
+
+    $result['IsAvailable'] = $true
+    return [pscustomobject]$result
+}
+
+#endregion
+
+#region ==================== INITIALIZATION ====================
+
+function Initialize-ActiveDirectoryModule {
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param()
+
+    Write-Host "`n[+] Loading module: $script:ModuleName v$script:ModuleVersion" -ForegroundColor Magenta
+    $script:Findings = @()
+
+    return @{
+        ModuleName = $script:ModuleName
+        Version = $script:ModuleVersion
+        Initialized = $true
+    }
+}
+
+#endregion
+
+#region ==================== INFRASTRUCTURE CHECKS ====================
+
+function Test-ADForestAndDomain {
+    <#
+    .SYNOPSIS
+        Captures AD forest + domain metadata (functional levels, SID, NetBIOS).
+    #>
+    [CmdletBinding()]
+    param()
+
+    Write-Host "`n[+] Collecting forest and domain information..." -ForegroundColor Cyan
+    try {
+        $adForest = Get-ADForest
+        $adDomain = Get-ADDomain
+        $summary = @"
+Forest Name: $($adForest.Name)
+Forest Functional Level: $($adForest.ForestMode)
+Domain Name: $($adDomain.DNSRoot)
+Domain NetBIOS Name: $($adDomain.NetBIOSName)
+Domain Functional Level: $($adDomain.DomainMode)
+Forest Root Domain: $($adForest.RootDomain)
+Domain SID: $($adDomain.DomainSID.Value)
+"@
+        Add-ADFinding -CheckName 'Test-ADForestAndDomain' -Status 'INFO' -Object 'Forest & Domain' `
+            -Description "AD Forest and domain basic info: $summary" `
+            -Remediation 'For reference only. Ensure forest / domain functional levels are current and supported.'
+    }
+    catch {
+        Add-ADFinding -CheckName 'Test-ADForestAndDomain' -Status 'WARNING' -Object 'Forest & Domain' `
+            -Description "Unable to collect forest / domain info: $($_.Exception.Message)" `
+            -Remediation 'Check AD module installation and connectivity.'
+    }
+}
+
+function Test-DomainControllers {
+    <#
+    .SYNOPSIS
+        Enumerates all domain controllers with OS, IP, GC status, and RODC flag.
+    #>
+    [CmdletBinding()]
+    param()
+
+    Write-Host "`n[+] Enumerating domain controllers..." -ForegroundColor Cyan
+    try {
+        $dcs = Get-ADDomainController -Filter *
+        $lines = foreach ($d in $dcs) {
+            $role = if ($d.IsReadOnly) { 'RODC' } else { 'RWDC' }
+            "DC: $($d.Name) | Site: $($d.Site) | OS: $($d.OperatingSystem) | IPv4: $($d.IPv4Address) | IPv6: $($d.IPv6Address) | GC: $($d.IsGlobalCatalog) | Role: $role"
+        }
+        Add-ADFinding -CheckName 'Test-DomainControllers' -Status 'INFO' -Object 'Domain Controllers' `
+            -Description "Domain controllers ($($dcs.Count)): $($lines -join ' ; ')" `
+            -Remediation 'Review for completeness, expected OS versions, and correct site assignments.'
+    }
+    catch {
+        Add-ADFinding -CheckName 'Test-DomainControllers' -Status 'WARNING' -Object 'Domain Controllers' `
+            -Description "Unable to enumerate domain controllers: $($_.Exception.Message)" `
+            -Remediation 'Check AD module and network connectivity to a DC.'
+    }
+}
+
+function Test-DomainTrusts {
+    <#
+    .SYNOPSIS
+        Enumerates all AD domain trust relationships.
+    #>
+    [CmdletBinding()]
+    param()
+
+    Write-Host "`n[+] Enumerating domain trusts..." -ForegroundColor Cyan
+    try {
+        $trusts = @(Get-ADTrust -Filter *)
+        if ($trusts.Count -eq 0) {
+            Add-ADFinding -CheckName 'Test-DomainTrusts' -Status 'INFO' -Object 'Domain Trusts' `
+                -Description 'No domain trusts found.' `
+                -Remediation 'No action needed.'
+            return
+        }
+        foreach ($t in $trusts) {
+            $desc = "Trust: $($t.Name) | Direction: $($t.TrustDirection) | Type: $($t.TrustType) | Transitive: $($t.IsTransitive)"
+            if (-not $t.IsTransitive -or $t.TrustDirection -eq 'None') {
+                Add-ADFinding -CheckName 'Test-DomainTrusts' -Status 'WARNING' -Object $t.Name `
+                    -Description "$desc (non-transitive or untrusted)." `
+                    -Remediation 'Review this trust. Non-transitive / untrusted trusts complicate auth and can increase risk.'
+            }
+            else {
+                Add-ADFinding -CheckName 'Test-DomainTrusts' -Status 'INFO' -Object $t.Name `
+                    -Description $desc `
+                    -Remediation 'Verify this trust is expected and documented.'
+            }
+        }
+    }
+    catch {
+        Add-ADFinding -CheckName 'Test-DomainTrusts' -Status 'WARNING' -Object 'Domain Trusts' `
+            -Description "Unable to enumerate trusts: $($_.Exception.Message)" `
+            -Remediation 'Check permissions and trust relationships.'
+    }
+}
+
+function Test-GPOInventory {
+    <#
+    .SYNOPSIS
+        Enumerates all Group Policy Objects.
+    #>
+    [CmdletBinding()]
+    param()
+
+    Write-Host "`n[+] Enumerating Group Policy Objects..." -ForegroundColor Cyan
+    try {
+        if (-not (Get-Module -ListAvailable -Name GroupPolicy)) {
+            Add-ADFinding -CheckName 'Test-GPOInventory' -Status 'INFO' -Object 'GPOs' `
+                -Description 'GroupPolicy PowerShell module not installed. GPO inventory skipped.' `
+                -Remediation 'Install RSAT GroupPolicyManagement feature to enable this check.'
+            return
+        }
+        $gpos = @(Get-GPO -All)
+        if ($gpos.Count -eq 0) {
+            Add-ADFinding -CheckName 'Test-GPOInventory' -Status 'INFO' -Object 'GPOs' `
+                -Description 'No GPOs found.' -Remediation 'No action needed.'
+            return
+        }
+        Add-ADFinding -CheckName 'Test-GPOInventory' -Status 'INFO' -Object 'GPOs' `
+            -Description "Total GPOs found: $($gpos.Count)." `
+            -Remediation 'Review for intended purpose and scope.'
+    }
+    catch {
+        Add-ADFinding -CheckName 'Test-GPOInventory' -Status 'WARNING' -Object 'GPOs' `
+            -Description "Unable to enumerate GPOs: $($_.Exception.Message)" `
+            -Remediation 'Check permissions and GroupPolicy module.'
+    }
+}
+
+#endregion
+
+#region ==================== AUTHENTICATION CHECKS ====================
+
+function Test-ADPasswordPolicy {
+    <#
+    .SYNOPSIS
+        Captures the default domain password policy settings.
+    #>
+    [CmdletBinding()]
+    param()
+
+    Write-Host "`n[+] Collecting password policy..." -ForegroundColor Cyan
+    try {
+        $p = Get-ADDefaultDomainPasswordPolicy
+        $summary = "MinPasswordLength=$($p.MinPasswordLength); HistoryCount=$($p.PasswordHistoryCount); ComplexityEnabled=$($p.ComplexityEnabled); LockoutThreshold=$($p.LockoutThreshold); MaxPasswordAge=$($p.MaxPasswordAge); ReversibleEncryption=$($p.ReversibleEncryptionEnabled)"
+
+        # Flag weak settings.
+        if ($p.MinPasswordLength -lt 14) {
+            Add-ADFinding -CheckName 'Test-ADPasswordPolicy' -Status 'WARNING' -Object 'Password Policy' `
+                -Description "MinPasswordLength is $($p.MinPasswordLength). CIS benchmark recommends >=14." `
+                -Remediation 'Increase MinPasswordLength to 14 or more via the Default Domain Policy.'
+        }
+        if (-not $p.ComplexityEnabled) {
+            Add-ADFinding -CheckName 'Test-ADPasswordPolicy' -Status 'FAIL' -Object 'Password Policy' `
+                -Description 'Password complexity is disabled.' `
+                -Remediation 'Enable password complexity via the Default Domain Policy.'
+        }
+        if ($p.ReversibleEncryptionEnabled) {
+            Add-ADFinding -CheckName 'Test-ADPasswordPolicy' -Status 'FAIL' -Object 'Password Policy' `
+                -Description 'Reversible encryption for passwords is ENABLED at the domain level.' `
+                -Remediation 'Disable reversible encryption unless a legacy protocol explicitly requires it.'
+        }
+
+        Add-ADFinding -CheckName 'Test-ADPasswordPolicy' -Status 'INFO' -Object 'Password Policy' `
+            -Description "Current domain password policy: $summary" `
+            -Remediation 'Review for compliance with organizational and regulatory requirements.'
+    }
+    catch {
+        Add-ADFinding -CheckName 'Test-ADPasswordPolicy' -Status 'WARNING' -Object 'Password Policy' `
+            -Description "Unable to retrieve password policy: $($_.Exception.Message)" `
+            -Remediation 'Check AD module and permissions.'
+    }
+}
+
+function Test-KrbTgtAccountAge {
+    <#
+    .SYNOPSIS
+        Audits KRBTGT account state (enabled, password age, key version).
+    #>
+    [CmdletBinding()]
+    param(
+        [int]$MaxAgeDays = $script:DefaultKrbTgtPasswordAgeDays
+    )
+
+    Write-Host "`n[+] Auditing KRBTGT account..." -ForegroundColor Cyan
+    try {
+        $k = Get-ADUser -Identity 'krbtgt' -Properties Enabled, PasswordLastSet, 'msds-keyversionnumber', whenCreated
+        $days = if ($k.PasswordLastSet) { ((Get-Date) - $k.PasswordLastSet).Days } else { -1 }
+
+        if (-not $k.Enabled) {
+            Add-ADFinding -CheckName 'Test-KrbTgtAccountAge' -Status 'FAIL' -Object 'krbtgt' `
+                -Description 'KRBTGT account is disabled. Kerberos ticketing will break.' `
+                -Remediation 'Re-enable the krbtgt account immediately.'
+        }
+
+        if ($days -gt $MaxAgeDays) {
+            Add-ADFinding -CheckName 'Test-KrbTgtAccountAge' -Status 'FAIL' -Object 'krbtgt' `
+                -Description "KRBTGT password is $days days old (threshold $MaxAgeDays). Elevated Golden Ticket risk." `
+                -Remediation 'Rotate the KRBTGT password (twice, 24h apart) using the Microsoft-provided New-KrbtgtKeys.ps1 to invalidate stolen tickets.'
+        }
+
+        Add-ADFinding -CheckName 'Test-KrbTgtAccountAge' -Status 'INFO' -Object 'krbtgt' `
+            -Description "Enabled=$($k.Enabled); PasswordLastSet=$($k.PasswordLastSet) ($days days ago); KeyVersion=$($k.'msds-keyversionnumber'); Created=$($k.whenCreated)" `
+            -Remediation 'Rotate KRBTGT password at least every 180 days.'
+    }
+    catch {
+        Add-ADFinding -CheckName 'Test-KrbTgtAccountAge' -Status 'WARNING' -Object 'krbtgt' `
+            -Description "Unable to audit krbtgt: $($_.Exception.Message)" `
+            -Remediation 'Check permissions and that the krbtgt account exists.'
+    }
+}
+
+function Test-KerberosPreAuthDisabled {
+    <#
+    .SYNOPSIS
+        Finds enabled user accounts with Kerberos Pre-Authentication disabled (AS-REP roastable).
+    #>
+    [CmdletBinding()]
+    param()
+
+    Write-Host "`n[+] Checking for users with Kerberos Pre-Auth disabled..." -ForegroundColor Cyan
+    try {
+        $users = @(Get-ADUser -Filter * -Properties DoesNotRequirePreAuth, Enabled | Where-Object { $_.DoesNotRequirePreAuth -eq $true -and $_.Enabled -eq $true })
+        foreach ($u in $users) {
+            Add-ADFinding -CheckName 'Test-KerberosPreAuthDisabled' -Status 'FAIL' -Object $u.SamAccountName `
+                -Description "'Do not require Kerberos preauthentication' is enabled (AS-REP roasting risk)." `
+                -Remediation 'Disable the flag unless strictly required for a legacy application. Review for potential compromise.'
+        }
+        if ($users.Count -eq 0) {
+            Add-ADFinding -CheckName 'Test-KerberosPreAuthDisabled' -Status 'PASS' -Object 'All Users' `
+                -Description 'No enabled users with Kerberos Pre-Auth disabled.' `
+                -Remediation 'No action needed.'
+        }
+    }
+    catch {
+        Add-ADFinding -CheckName 'Test-KerberosPreAuthDisabled' -Status 'WARNING' -Object 'Users' `
+            -Description "Unable to enumerate users: $($_.Exception.Message)" `
+            -Remediation 'Check permissions.'
+    }
+}
+
+function Test-DuplicateSPNs {
+    <#
+    .SYNOPSIS
+        Flags SPN values assigned to more than one AD object.
+    #>
+    [CmdletBinding()]
+    param()
+
+    Write-Host "`n[+] Checking for duplicate SPNs..." -ForegroundColor Cyan
+    try {
+        $objs = Get-ADObject -LDAPFilter '(|(objectClass=user)(objectClass=computer))' -Properties ServicePrincipalName
+        $map = @{}
+        foreach ($o in $objs) {
+            if ($o.ServicePrincipalName) {
+                foreach ($spn in $o.ServicePrincipalName) {
+                    if (-not $map.ContainsKey($spn)) { $map[$spn] = @() }
+                    $map[$spn] += $o.DistinguishedName
+                }
+            }
+        }
+        $dupCount = 0
+        foreach ($kv in $map.GetEnumerator()) {
+            if ($kv.Value.Count -gt 1) {
+                $dupCount++
+                Add-ADFinding -CheckName 'Test-DuplicateSPNs' -Status 'FAIL' -Object $kv.Key `
+                    -Description "Duplicate SPN '$($kv.Key)' on $($kv.Value.Count) objects: $($kv.Value -join '; ')" `
+                    -Remediation 'Each SPN must be assigned to exactly one account. Remove duplicates.'
+            }
+        }
+        if ($dupCount -eq 0) {
+            Add-ADFinding -CheckName 'Test-DuplicateSPNs' -Status 'PASS' -Object 'SPNs' `
+                -Description 'No duplicate SPNs found.' -Remediation 'No action needed.'
+        }
+    }
+    catch {
+        Add-ADFinding -CheckName 'Test-DuplicateSPNs' -Status 'WARNING' -Object 'SPNs' `
+            -Description "Unable to enumerate SPNs: $($_.Exception.Message)" `
+            -Remediation 'Check permissions.'
+    }
+}
+
+function Test-UserAccountsWithSPN {
+    <#
+    .SYNOPSIS
+        Flags enabled user accounts carrying SPNs (Kerberoast exposure).
+    #>
+    [CmdletBinding()]
+    param()
+
+    Write-Host "`n[+] Checking for user accounts with SPNs (Kerberoast exposure)..." -ForegroundColor Cyan
+    try {
+        $users = @(Get-ADUser -Filter * -Properties ServicePrincipalName, Enabled, ObjectClass | Where-Object { $_.Enabled -and $_.ServicePrincipalName -and $_.ServicePrincipalName.Count -gt 0 -and $_.ObjectClass -eq 'user' })
+        foreach ($u in $users) {
+            Add-ADFinding -CheckName 'Test-UserAccountsWithSPN' -Status 'WARNING' -Object $u.SamAccountName `
+                -Description 'User account carries one or more SPNs (Kerberoastable).' `
+                -Remediation 'Move to a group Managed Service Account (gMSA) where possible. PR 2 will add password-age correlation to escalate this.'
+        }
+        if ($users.Count -eq 0) {
+            Add-ADFinding -CheckName 'Test-UserAccountsWithSPN' -Status 'PASS' -Object 'All Users' `
+                -Description 'No enabled users with SPNs.' -Remediation 'No action needed.'
+        }
+    }
+    catch {
+        Add-ADFinding -CheckName 'Test-UserAccountsWithSPN' -Status 'WARNING' -Object 'Users' `
+            -Description "Unable to enumerate: $($_.Exception.Message)" `
+            -Remediation 'Check permissions.'
+    }
+}
+
+function Test-GPPPasswords {
+    <#
+    .SYNOPSIS
+        Scans SYSVOL for Group Policy Preferences cpassword attributes.
+    #>
+    [CmdletBinding()]
+    param()
+
+    Write-Host "`n[+] Scanning SYSVOL for GPP cpasswords..." -ForegroundColor Cyan
+    try {
+        $sysvol = "\\$((Get-ADDomain).DNSRoot)\SYSVOL"
+        $xmlFiles = Get-ChildItem -Path $sysvol -Recurse -Filter '*.xml' -ErrorAction SilentlyContinue
+        $hit = $false
+        foreach ($f in $xmlFiles) {
+            $content = Get-Content -LiteralPath $f.FullName -ErrorAction SilentlyContinue
+            if ($content -match 'cpassword="[^"]+') {
+                $hit = $true
+                Add-ADFinding -CheckName 'Test-GPPPasswords' -Status 'FAIL' -Object $f.FullName `
+                    -Description 'GPP XML file contains a cpassword attribute (reversible password in SYSVOL).' `
+                    -Remediation 'Remove the GPP cpassword from SYSVOL. Reset all credentials exposed. Do not use GPP for password management.'
+            }
+        }
+        if (-not $hit) {
+            Add-ADFinding -CheckName 'Test-GPPPasswords' -Status 'PASS' -Object 'GPP Passwords' `
+                -Description 'No GPP cpasswords found in SYSVOL.' -Remediation 'No action needed.'
+        }
+    }
+    catch {
+        Add-ADFinding -CheckName 'Test-GPPPasswords' -Status 'WARNING' -Object 'GPP Passwords' `
+            -Description "Unable to scan SYSVOL: $($_.Exception.Message)" `
+            -Remediation 'Ensure SYSVOL is reachable and you have read permission.'
+    }
+}
+
+#endregion
+
+#region ==================== DELEGATION CHECKS ====================
+
+function Test-UnconstrainedDelegation {
+    <#
+    .SYNOPSIS
+        Flags enabled accounts with unconstrained delegation.
+    #>
+    [CmdletBinding()]
+    param()
+
+    Write-Host "`n[+] Checking for unconstrained delegation..." -ForegroundColor Cyan
+    try {
+        $comps = @(Get-ADComputer -Filter * -Properties TrustedForDelegation, Enabled | Where-Object { $_.TrustedForDelegation -eq $true -and $_.Enabled -eq $true })
+        foreach ($c in $comps) {
+            Add-ADFinding -CheckName 'Test-UnconstrainedDelegation' -Status 'FAIL' -Object $c.DNSHostName `
+                -Description 'Computer has unconstrained delegation enabled.' `
+                -Remediation 'Remove unconstrained delegation; use constrained delegation if needed.'
+        }
+        $users = @(Get-ADUser -Filter * -Properties TrustedForDelegation, Enabled | Where-Object { $_.TrustedForDelegation -eq $true -and $_.Enabled -eq $true })
+        foreach ($u in $users) {
+            Add-ADFinding -CheckName 'Test-UnconstrainedDelegation' -Status 'FAIL' -Object $u.SamAccountName `
+                -Description 'User has unconstrained delegation enabled.' `
+                -Remediation 'Disable unconstrained delegation. User accounts should almost never have this.'
+        }
+        if ($comps.Count -eq 0 -and $users.Count -eq 0) {
+            Add-ADFinding -CheckName 'Test-UnconstrainedDelegation' -Status 'PASS' -Object 'All Accounts' `
+                -Description 'No accounts with unconstrained delegation.' -Remediation 'No action needed.'
+        }
+    }
+    catch {
+        Add-ADFinding -CheckName 'Test-UnconstrainedDelegation' -Status 'WARNING' -Object 'Delegation' `
+            -Description "Unable to enumerate: $($_.Exception.Message)" `
+            -Remediation 'Check permissions.'
+    }
+}
+
+function Test-DelegationOverview {
+    <#
+    .SYNOPSIS
+        Enumerates both constrained and unconstrained delegation assignments.
+    #>
+    [CmdletBinding()]
+    param()
+
+    Write-Host "`n[+] Auditing delegation overview..." -ForegroundColor Cyan
+    try {
+        $cComps = @(Get-ADComputer -Filter * -Properties 'msDS-AllowedToDelegateTo', Enabled | Where-Object { $_.Enabled -and $_.'msDS-AllowedToDelegateTo' -and $_.'msDS-AllowedToDelegateTo'.Count -gt 0 })
+        foreach ($c in $cComps) {
+            $svcs = $c.'msDS-AllowedToDelegateTo' -join '; '
+            Add-ADFinding -CheckName 'Test-DelegationOverview' -Status 'INFO' -Object $c.DNSHostName `
+                -Description "Constrained delegation to: $svcs" `
+                -Remediation 'Review business need and that targets are scoped correctly.'
+        }
+        $cUsers = @(Get-ADUser -Filter * -Properties 'msDS-AllowedToDelegateTo', Enabled | Where-Object { $_.Enabled -and $_.'msDS-AllowedToDelegateTo' -and $_.'msDS-AllowedToDelegateTo'.Count -gt 0 })
+        foreach ($u in $cUsers) {
+            $svcs = $u.'msDS-AllowedToDelegateTo' -join '; '
+            Add-ADFinding -CheckName 'Test-DelegationOverview' -Status 'INFO' -Object $u.SamAccountName `
+                -Description "User has constrained delegation to: $svcs" `
+                -Remediation 'Review business need and scope.'
+        }
+        if ($cComps.Count -eq 0 -and $cUsers.Count -eq 0) {
+            Add-ADFinding -CheckName 'Test-DelegationOverview' -Status 'INFO' -Object 'Delegation' `
+                -Description 'No constrained-delegation configurations detected.' `
+                -Remediation 'No action needed.'
+        }
+    }
+    catch {
+        Add-ADFinding -CheckName 'Test-DelegationOverview' -Status 'WARNING' -Object 'Delegation' `
+            -Description "Unable to enumerate: $($_.Exception.Message)" `
+            -Remediation 'Check permissions.'
+    }
+}
+
+#endregion
+
+#region ==================== ACCOUNT LIFECYCLE CHECKS ====================
+
+function Test-ADStaleAccounts {
+    <#
+    .SYNOPSIS
+        Flags enabled user accounts that are inactive or have stale passwords.
+    #>
+    [CmdletBinding()]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingUsernameAndPasswordParams', '',
+        Justification = 'Parameters are day-count thresholds, not credentials.')]
+    param(
+        [int]$UserLogonInactivityDays = $script:DefaultUserLogonInactivityDays,
+        [int]$UserPasswordAgeDays = $script:DefaultUserPasswordAgeDays
+    )
+
+    Write-Host "`n[+] Checking stale accounts and passwords..." -ForegroundColor Cyan
+    try {
+        $users = Get-ADUser -Filter * -Properties SamAccountName, Enabled, LastLogonDate, PasswordLastSet
+        $now = Get-Date
+        $inactive = 0; $stalePwd = 0
+        foreach ($u in $users | Where-Object { $_.Enabled }) {
+            if ($u.LastLogonDate -and ($now - $u.LastLogonDate).Days -gt $UserLogonInactivityDays) {
+                $inactive++
+                Add-ADFinding -CheckName 'Test-ADStaleAccounts' -Status 'WARNING' -Object $u.SamAccountName `
+                    -Description "Inactive $((($now - $u.LastLogonDate).Days)) days (last logon $($u.LastLogonDate))." `
+                    -Remediation 'Review and consider disabling or removing.'
+            }
+            if ($u.PasswordLastSet -and ($now - $u.PasswordLastSet).Days -gt $UserPasswordAgeDays) {
+                $stalePwd++
+                Add-ADFinding -CheckName 'Test-ADStaleAccounts' -Status 'WARNING' -Object $u.SamAccountName `
+                    -Description "Password not changed in $((($now - $u.PasswordLastSet).Days)) days (last set $($u.PasswordLastSet))." `
+                    -Remediation 'Require password change or review necessity.'
+            }
+        }
+        Add-ADFinding -CheckName 'Test-ADStaleAccounts' -Status 'INFO' -Object 'User Accounts' `
+            -Description "Checked $($users.Count) enabled users: $inactive inactive, $stalePwd with stale passwords." `
+            -Remediation 'Review flagged accounts above.'
+    }
+    catch {
+        Add-ADFinding -CheckName 'Test-ADStaleAccounts' -Status 'WARNING' -Object 'User Accounts' `
+            -Description "Unable to enumerate: $($_.Exception.Message)" `
+            -Remediation 'Check permissions and AD module.'
+    }
+}
+
+function Test-PasswordNeverExpires {
+    <#
+    .SYNOPSIS
+        Flags enabled accounts with PasswordNeverExpires set.
+    #>
+    [CmdletBinding()]
+    param()
+
+    Write-Host "`n[+] Checking for PasswordNeverExpires..." -ForegroundColor Cyan
+    try {
+        $users = @(Get-ADUser -Filter * -Properties PasswordNeverExpires, Enabled | Where-Object { $_.PasswordNeverExpires -eq $true -and $_.Enabled -eq $true })
+        foreach ($u in $users) {
+            Add-ADFinding -CheckName 'Test-PasswordNeverExpires' -Status 'FAIL' -Object $u.SamAccountName `
+                -Description "'Password never expires' is enabled." `
+                -Remediation 'Require password expiration. For service accounts, consider migrating to a gMSA.'
+        }
+        if ($users.Count -eq 0) {
+            Add-ADFinding -CheckName 'Test-PasswordNeverExpires' -Status 'PASS' -Object 'All Users' `
+                -Description 'No accounts with PasswordNeverExpires.' -Remediation 'No action needed.'
+        }
+    }
+    catch {
+        Add-ADFinding -CheckName 'Test-PasswordNeverExpires' -Status 'WARNING' -Object 'Users' `
+            -Description "Unable to enumerate: $($_.Exception.Message)" `
+            -Remediation 'Check permissions.'
+    }
+}
+
+function Test-ADServiceAccounts {
+    <#
+    .SYNOPSIS
+        Enumerates MSA / gMSA accounts.
+    #>
+    [CmdletBinding()]
+    param()
+
+    Write-Host "`n[+] Enumerating managed service accounts..." -ForegroundColor Cyan
+    try {
+        $msa = @(Get-ADServiceAccount -Filter * -Properties SamAccountName, Enabled, LastLogonDate, PasswordLastSet, ObjectClass)
+        if ($msa.Count -eq 0) {
+            Add-ADFinding -CheckName 'Test-ADServiceAccounts' -Status 'INFO' -Object 'Service Accounts' `
+                -Description 'No managed service accounts (classic or gMSA) in the domain.' `
+                -Remediation 'Consider migrating service accounts to gMSA where possible.'
+            return
+        }
+        foreach ($a in $msa) {
+            $type = if ($a.ObjectClass -eq 'msDS-GroupManagedServiceAccount') { 'gMSA' } else { 'MSA' }
+            Add-ADFinding -CheckName 'Test-ADServiceAccounts' -Status 'INFO' -Object "$($a.SamAccountName) [$type]" `
+                -Description "Enabled=$($a.Enabled); PasswordLastSet=$($a.PasswordLastSet)" `
+                -Remediation 'Review lifecycle and rotate credentials regularly.'
+        }
+        Add-ADFinding -CheckName 'Test-ADServiceAccounts' -Status 'INFO' -Object 'Service Accounts' `
+            -Description "Total managed service accounts: $($msa.Count)." `
+            -Remediation 'Monitor for unused or risky service accounts.'
+    }
+    catch {
+        Add-ADFinding -CheckName 'Test-ADServiceAccounts' -Status 'WARNING' -Object 'Service Accounts' `
+            -Description "Unable to enumerate: $($_.Exception.Message)" `
+            -Remediation 'Check permissions.'
+    }
+}
+
+function Test-PasswordsInDescription {
+    <#
+    .SYNOPSIS
+        Scans Description fields on users / groups for password-like patterns.
+    #>
+    [CmdletBinding()]
+    param()
+
+    Write-Host "`n[+] Checking Description fields for secrets..." -ForegroundColor Cyan
+    $patterns = @('password[\s:=]+.+', 'pwd[\s:=]+.+', 'pass[\s:=]+.+', 'secret[\s:=]+.+')
+    $hit = $false
+    try {
+        $users = Get-ADUser -Filter * -Properties Description, Enabled | Where-Object { $_.Enabled -and $_.Description }
+        foreach ($u in $users) {
+            foreach ($p in $patterns) {
+                if ($u.Description -match $p) {
+                    $hit = $true
+                    Add-ADFinding -CheckName 'Test-PasswordsInDescription' -Status 'FAIL' -Object $u.SamAccountName `
+                        -Description "Description contains possible secret: '$($u.Description)'" `
+                        -Remediation 'Remove secrets from Description immediately. Train admins on secure credential handling.'
+                    break
+                }
+            }
+        }
+        $groups = Get-ADGroup -Filter * -Properties Description | Where-Object { $_.Description }
+        foreach ($g in $groups) {
+            foreach ($p in $patterns) {
+                if ($g.Description -match $p) {
+                    $hit = $true
+                    Add-ADFinding -CheckName 'Test-PasswordsInDescription' -Status 'FAIL' -Object $g.SamAccountName `
+                        -Description "Group Description contains possible secret: '$($g.Description)'" `
+                        -Remediation 'Remove secrets from Description immediately.'
+                    break
+                }
+            }
+        }
+        if (-not $hit) {
+            Add-ADFinding -CheckName 'Test-PasswordsInDescription' -Status 'PASS' -Object 'All Accounts' `
+                -Description 'No password-like patterns in Description fields.' -Remediation 'No action needed.'
+        }
+    }
+    catch {
+        Add-ADFinding -CheckName 'Test-PasswordsInDescription' -Status 'WARNING' -Object 'Descriptions' `
+            -Description "Unable to scan: $($_.Exception.Message)" `
+            -Remediation 'Check permissions.'
+    }
+}
+
+#endregion
+
+#region ==================== PRIVILEGED ACCESS CHECKS ====================
+
+function Test-PrivilegedGroupMembership {
+    <#
+    .SYNOPSIS
+        Enumerates privileged group members. Flags disabled accounts in admin groups.
+    #>
+    [CmdletBinding()]
+    param()
+
+    Write-Host "`n[+] Enumerating privileged group membership..." -ForegroundColor Cyan
+    foreach ($gname in $script:PrivilegedGroups) {
+        try {
+            $members = Get-ADGroupMember -Identity $gname -Recursive -ErrorAction Stop
+            $mInfo = @()
+            foreach ($m in $members) {
+                if ($m.objectClass -eq 'user') {
+                    $user = Get-ADUser -Identity $m.SamAccountName -Properties Enabled
+                    if (-not $user.Enabled) {
+                        Add-ADFinding -CheckName 'Test-PrivilegedGroupMembership' -Status 'WARNING' `
+                            -Object "$($user.SamAccountName) ($gname)" `
+                            -Description "Disabled user is a member of '$gname'." `
+                            -Remediation 'Remove disabled accounts from privileged groups.'
+                    }
+                    $mInfo += "$($user.SamAccountName) [user] (Enabled=$($user.Enabled))"
+                }
+                else {
+                    $mInfo += "$($m.Name) [$($m.objectClass)]"
+                }
+            }
+            Add-ADFinding -CheckName 'Test-PrivilegedGroupMembership' -Status 'INFO' -Object $gname `
+                -Description "Members: $($mInfo -join '; ')" `
+                -Remediation 'Review expected membership and privilege creep.'
+        }
+        catch {
+            Add-ADFinding -CheckName 'Test-PrivilegedGroupMembership' -Status 'WARNING' -Object $gname `
+                -Description "Unable to enumerate '$gname': $($_.Exception.Message)" `
+                -Remediation 'Check permissions or if group exists in this domain.'
+        }
+    }
+}
+
+function Test-ProtectedUsersAdoption {
+    <#
+    .SYNOPSIS
+        Enumerates Protected Users group members.
+    #>
+    [CmdletBinding()]
+    param()
+
+    Write-Host "`n[+] Checking Protected Users adoption..." -ForegroundColor Cyan
+    $gname = 'Protected Users'
+    try {
+        $members = @(Get-ADGroupMember -Identity $gname -ErrorAction Stop)
+        if ($members.Count -eq 0) {
+            Add-ADFinding -CheckName 'Test-ProtectedUsersAdoption' -Status 'WARNING' -Object $gname `
+                -Description 'Protected Users group has no members.' `
+                -Remediation 'Add high-value accounts (admins, sensitive service accounts) for enhanced credential protection.'
+        }
+        else {
+            $list = ($members | ForEach-Object { $_.Name }) -join '; '
+            Add-ADFinding -CheckName 'Test-ProtectedUsersAdoption' -Status 'INFO' -Object $gname `
+                -Description "Members: $list" `
+                -Remediation 'Review membership; add critical accounts where appropriate.'
+        }
+    }
+    catch {
+        Add-ADFinding -CheckName 'Test-ProtectedUsersAdoption' -Status 'WARNING' -Object $gname `
+            -Description "Protected Users not accessible: $($_.Exception.Message)" `
+            -Remediation 'Ensure the domain functional level supports Protected Users and the running user has read rights.'
+    }
+}
+
+function Test-SIDHistory {
+    <#
+    .SYNOPSIS
+        Flags enabled users / groups that carry SIDHistory values.
+    #>
+    [CmdletBinding()]
+    param()
+
+    Write-Host "`n[+] Checking for SIDHistory..." -ForegroundColor Cyan
+    try {
+        $users = @(Get-ADUser -Filter * -Properties SIDHistory, Enabled | Where-Object { $_.SIDHistory -and $_.SIDHistory.Count -gt 0 -and $_.Enabled -eq $true })
+        foreach ($u in $users) {
+            Add-ADFinding -CheckName 'Test-SIDHistory' -Status 'WARNING' -Object $u.SamAccountName `
+                -Description 'User has SIDHistory values set.' `
+                -Remediation 'Investigate why. Remove legacy SIDs post-migration. Monitor for unauthorized use.'
+        }
+        $groups = @(Get-ADGroup -Filter * -Properties SIDHistory | Where-Object { $_.SIDHistory -and $_.SIDHistory.Count -gt 0 })
+        foreach ($g in $groups) {
+            Add-ADFinding -CheckName 'Test-SIDHistory' -Status 'WARNING' -Object $g.SamAccountName `
+                -Description 'Group has SIDHistory values set.' `
+                -Remediation 'Review necessity; remove legacy SIDs if migration is complete.'
+        }
+        if ($users.Count -eq 0 -and $groups.Count -eq 0) {
+            Add-ADFinding -CheckName 'Test-SIDHistory' -Status 'PASS' -Object 'All Users & Groups' `
+                -Description 'No SIDHistory values found.' -Remediation 'No action needed.'
+        }
+    }
+    catch {
+        Add-ADFinding -CheckName 'Test-SIDHistory' -Status 'WARNING' -Object 'SIDHistory' `
+            -Description "Unable to enumerate: $($_.Exception.Message)" `
+            -Remediation 'Check permissions.'
+    }
+}
+
+function Test-PrivilegedSmartcardRequirement {
+    <#
+    .SYNOPSIS
+        Flags privileged users without SmartcardLogonRequired.
+    #>
+    [CmdletBinding()]
+    param()
+
+    Write-Host "`n[+] Checking privileged users for smartcard requirement..." -ForegroundColor Cyan
+    $failHit = $false
+    foreach ($gname in $script:PrivilegedGroups) {
+        try {
+            $members = Get-ADGroupMember -Identity $gname -Recursive -ErrorAction Stop | Where-Object { $_.objectClass -eq 'user' }
+        }
+        catch { continue }
+        foreach ($m in $members) {
+            $user = Get-ADUser -Identity $m.SamAccountName -Properties SmartcardLogonRequired, Enabled
+            if ($user.Enabled -and -not $user.SmartcardLogonRequired) {
+                $failHit = $true
+                Add-ADFinding -CheckName 'Test-PrivilegedSmartcardRequirement' -Status 'FAIL' -Object $user.SamAccountName `
+                    -Description "Privileged user '$($user.SamAccountName)' in '$gname' does NOT require smartcard logon." `
+                    -Remediation 'Enforce smartcard MFA for all privileged users.'
+            }
+        }
+    }
+    if (-not $failHit) {
+        Add-ADFinding -CheckName 'Test-PrivilegedSmartcardRequirement' -Status 'PASS' -Object 'Privileged Users' `
+            -Description 'All privileged users require smartcard logon.' -Remediation 'No action needed.'
+    }
+}
+
+function Test-PrivilegedGroupCreep {
+    <#
+    .SYNOPSIS
+        Flags privileged-group members not on an approved whitelist.
+    #>
+    [CmdletBinding()]
+    param(
+        [hashtable]$Whitelist
+    )
+
+    Write-Host "`n[+] Checking for privilege creep in privileged groups..." -ForegroundColor Cyan
+    # Default whitelist — conservative: only Administrator is allowed in any privileged group by default.
+    if (-not $Whitelist) {
+        $Whitelist = @{}
+        foreach ($g in $script:PrivilegedGroups) { $Whitelist[$g] = @('Administrator') }
+    }
+    $failHit = $false
+    foreach ($gname in $script:PrivilegedGroups) {
+        try {
+            $members = Get-ADGroupMember -Identity $gname -Recursive -ErrorAction Stop | Where-Object { $_.objectClass -eq 'user' }
+        }
+        catch { continue }
+        $wl = $Whitelist[$gname]
+        foreach ($m in $members) {
+            if ($null -eq $wl -or $wl.Count -eq 0 -or $wl -notcontains $m.SamAccountName) {
+                $failHit = $true
+                Add-ADFinding -CheckName 'Test-PrivilegedGroupCreep' -Status 'WARNING' `
+                    -Object "$($m.SamAccountName) ($gname)" `
+                    -Description "User '$($m.SamAccountName)' is in privileged group '$gname' but is NOT on the approved whitelist." `
+                    -Remediation "Review membership of '$gname'. Remove if unauthorized. Update whitelist as needed."
+            }
+        }
+    }
+    if (-not $failHit) {
+        Add-ADFinding -CheckName 'Test-PrivilegedGroupCreep' -Status 'PASS' -Object 'Privileged Groups' `
+            -Description 'No non-whitelisted members in privileged groups.' -Remediation 'No action needed.'
+    }
+}
+
+function Test-AdminSDHolderDrift {
+    <#
+    .SYNOPSIS
+        Detects ACL or owner drift on the AdminSDHolder object.
+    #>
+    [CmdletBinding()]
+    param()
+
+    Write-Host "`n[+] Checking AdminSDHolder ACL drift..." -ForegroundColor Cyan
+    $dn = "CN=AdminSDHolder, CN=System, $((Get-ADDomain).DistinguishedName)"
+    try {
+        $acl = Get-Acl -Path ("AD:\$dn")
+    }
+    catch {
+        Add-ADFinding -CheckName 'Test-AdminSDHolderDrift' -Status 'WARNING' -Object 'AdminSDHolder' `
+            -Description "Unable to read AdminSDHolder ACL: $($_.Exception.Message)" `
+            -Remediation 'Run with sufficient privileges (Domain Admin).'
+        return
+    }
+    $expectedOwners = @('Domain Admins', 'Enterprise Admins')
+    $ownerOK = $false
+    foreach ($eo in $expectedOwners) { if ($acl.Owner -like "*$eo*") { $ownerOK = $true; break } }
+    if (-not $ownerOK) {
+        Add-ADFinding -CheckName 'Test-AdminSDHolderDrift' -Status 'WARNING' -Object 'AdminSDHolder' `
+            -Description "Owner is not a privileged group (owner: $($acl.Owner))." `
+            -Remediation 'Restore ownership to Domain Admins or Enterprise Admins.'
+    }
+    $flagged = @($acl.Access | Where-Object { ($_.ActiveDirectoryRights -match 'WriteProperty|GenericAll|GenericWrite|All') -and ($_.IdentityReference -notmatch 'Domain Admins|Enterprise Admins|SYSTEM|Administrators|SELF') })
+    foreach ($a in $flagged) {
+        Add-ADFinding -CheckName 'Test-AdminSDHolderDrift' -Status 'FAIL' -Object "AdminSDHolder ($($a.IdentityReference))" `
+            -Description "Non-standard permission: '$($a.IdentityReference)' has '$($a.ActiveDirectoryRights)' on AdminSDHolder." `
+            -Remediation 'Remove unauthorized ACEs from AdminSDHolder. Only privileged groups should have write rights.'
+    }
+    if ($flagged.Count -eq 0 -and $ownerOK) {
+        Add-ADFinding -CheckName 'Test-AdminSDHolderDrift' -Status 'PASS' -Object 'AdminSDHolder' `
+            -Description 'No ACL or owner drift.' -Remediation 'No action needed.'
+    }
+}
+
+function Test-DangerousSIDsInPrivilegedGroups {
+    <#
+    .SYNOPSIS
+        Flags dangerous well-known SIDs (Everyone, Anonymous Logon) in privileged groups.
+    #>
+    [CmdletBinding()]
+    param()
+
+    Write-Host "`n[+] Checking for dangerous SIDs in privileged groups..." -ForegroundColor Cyan
+    $dangerous = @{ 'Everyone' = 'S-1-1-0'; 'Anonymous Logon' = 'S-1-5-7' }
+    $failHit = $false
+    foreach ($gname in $script:PrivilegedGroups) {
+        try {
+            $members = Get-ADGroupMember -Identity $gname -Recursive -ErrorAction Stop
+        }
+        catch { continue }
+        foreach ($label in $dangerous.Keys) {
+            $sid = $dangerous[$label]
+            foreach ($m in $members) {
+                if ($m.SID -and $m.SID.Value -eq $sid) {
+                    $failHit = $true
+                    Add-ADFinding -CheckName 'Test-DangerousSIDsInPrivilegedGroups' -Status 'FAIL' -Object $gname `
+                        -Description "Privileged group '$gname' contains dangerous SID '$label' ($sid)." `
+                        -Remediation 'Remove immediately. Audit for similar entries in all critical groups.'
+                }
+            }
+        }
+    }
+    if (-not $failHit) {
+        Add-ADFinding -CheckName 'Test-DangerousSIDsInPrivilegedGroups' -Status 'PASS' -Object 'Privileged Groups' `
+            -Description 'No dangerous SIDs detected.' -Remediation 'No action needed.'
+    }
+}
+
+function Test-PrivilegedObjectACLs {
+    <#
+    .SYNOPSIS
+        Audits ACLs on privileged group containers.
+    #>
+    [CmdletBinding()]
+    param()
+
+    Write-Host "`n[+] Auditing ACLs on privileged objects..." -ForegroundColor Cyan
+    $dn = (Get-ADDomain).DistinguishedName
+    $objects = @(
+        "CN=Domain Admins, CN=Users, $dn",
+        "CN=Enterprise Admins, CN=Users, $dn",
+        "CN=Administrators, CN=Builtin, $dn",
+        "CN=Schema Admins, CN=Users, $dn",
+        "CN=Account Operators, CN=Users, $dn",
+        "CN=Backup Operators, CN=Users, $dn"
+    )
+    foreach ($o in $objects) {
+        try {
+            $acl = Get-Acl -Path ("AD:\$o")
+            $risky = @($acl.Access | Where-Object { ($_.ActiveDirectoryRights -match 'GenericAll|GenericWrite|All|WriteProperty') -and ($script:AdminPrincipals -notcontains $_.IdentityReference.Value) })
+            foreach ($r in $risky) {
+                Add-ADFinding -CheckName 'Test-PrivilegedObjectACLs' -Status 'WARNING' -Object $o `
+                    -Description "Non-admin '$($r.IdentityReference)' has '$($r.ActiveDirectoryRights)' on '$o'." `
+                    -Remediation 'Restrict rights on privileged objects to admin teams only.'
+            }
+        }
+        catch {
+            Add-ADFinding -CheckName 'Test-PrivilegedObjectACLs' -Status 'WARNING' -Object $o `
+                -Description "Unable to retrieve ACL: $($_.Exception.Message)" `
+                -Remediation 'Check permissions or whether the object exists.'
+        }
+    }
+}
+
+function Test-OUAndGPODelegation {
+    <#
+    .SYNOPSIS
+        Scans OUs and GPOs for non-admin write / GenericAll ACEs.
+    #>
+    [CmdletBinding()]
+    param()
+
+    Write-Host "`n[+] Checking OU and GPO delegation..." -ForegroundColor Cyan
+    $failHit = $false
+    try {
+        $ous = Get-ADOrganizationalUnit -Filter * | Sort-Object DistinguishedName
+        foreach ($ou in $ous) {
+            try { $acl = Get-Acl -Path ("AD:\$($ou.DistinguishedName)") } catch { continue }
+            $risky = @($acl.Access | Where-Object { ($_.ActiveDirectoryRights -match 'WriteProperty|GenericWrite|GenericAll|All') -and ($script:AdminPrincipals -notcontains $_.IdentityReference.Value) })
+            foreach ($r in $risky) {
+                $failHit = $true
+                Add-ADFinding -CheckName 'Test-OUAndGPODelegation' -Status 'WARNING' -Object "OU: $($ou.Name)" `
+                    -Description "OU '$($ou.Name)' grants '$($r.ActiveDirectoryRights)' to non-admin '$($r.IdentityReference)'." `
+                    -Remediation 'Review and remove non-admin delegation unless business-justified.'
+            }
+        }
+        if (Get-Module -ListAvailable -Name GroupPolicy) {
+            $gpos = Get-GPO -All
+            foreach ($g in $gpos) {
+                $gdn = "CN={$($g.Id)}, CN=Policies, CN=System, $((Get-ADDomain).DistinguishedName)"
+                try { $acl = Get-Acl -Path ("AD:\$gdn") } catch { continue }
+                $risky = @($acl.Access | Where-Object { ($_.ActiveDirectoryRights -match 'WriteProperty|GenericWrite|GenericAll|All') -and ($script:AdminPrincipals -notcontains $_.IdentityReference.Value) })
+                foreach ($r in $risky) {
+                    $failHit = $true
+                    Add-ADFinding -CheckName 'Test-OUAndGPODelegation' -Status 'WARNING' -Object "GPO: $($g.DisplayName)" `
+                        -Description "GPO '$($g.DisplayName)' grants '$($r.ActiveDirectoryRights)' to non-admin '$($r.IdentityReference)'." `
+                        -Remediation 'Review and remove non-admin delegation unless business-justified.'
+                }
+            }
+        }
+        if (-not $failHit) {
+            Add-ADFinding -CheckName 'Test-OUAndGPODelegation' -Status 'PASS' -Object 'OUs and GPOs' `
+                -Description 'No risky non-admin write permissions detected.' -Remediation 'No action needed.'
+        }
+    }
+    catch {
+        Add-ADFinding -CheckName 'Test-OUAndGPODelegation' -Status 'WARNING' -Object 'OU/GPO Delegation' `
+            -Description "Unable to enumerate: $($_.Exception.Message)" `
+            -Remediation 'Check permissions.'
+    }
+}
+
+function Test-RecentPrivilegedAccounts {
+    <#
+    .SYNOPSIS
+        Flags privileged-group members created in the last N days.
+    #>
+    [CmdletBinding()]
+    param(
+        [int]$RecentDays = $script:DefaultRecentPrivilegedAccountDays
+    )
+
+    Write-Host "`n[+] Checking for recently-created privileged accounts..." -ForegroundColor Cyan
+    $threshold = (Get-Date).AddDays(-$RecentDays)
+    $failHit = $false
+    foreach ($gname in $script:PrivilegedGroups) {
+        try {
+            $members = Get-ADGroupMember -Identity $gname -Recursive -ErrorAction Stop | Where-Object { $_.objectClass -eq 'user' }
+        }
+        catch { continue }
+        foreach ($m in $members) {
+            $u = Get-ADUser -Identity $m.SamAccountName -Properties whenCreated, Enabled
+            if ($u.Enabled -and $u.whenCreated -gt $threshold) {
+                $failHit = $true
+                Add-ADFinding -CheckName 'Test-RecentPrivilegedAccounts' -Status 'FAIL' `
+                    -Object "$($u.SamAccountName) ($gname)" `
+                    -Description "Privileged user '$($u.SamAccountName)' created $($u.whenCreated) (<$RecentDays days ago)." `
+                    -Remediation 'Verify the creation was authorized. Investigate for possible persistence.'
+            }
+        }
+    }
+    if (-not $failHit) {
+        Add-ADFinding -CheckName 'Test-RecentPrivilegedAccounts' -Status 'PASS' -Object 'Privileged Accounts' `
+            -Description "No privileged accounts created in the last $RecentDays days." `
+            -Remediation 'No action needed.'
+    }
+}
+
+function Test-NestedGroupPrivilegePaths {
+    <#
+    .SYNOPSIS
+        Flags ForeignSecurityPrincipals in privileged groups (cross-domain / trust members).
+    #>
+    [CmdletBinding()]
+    param()
+
+    Write-Host "`n[+] Checking for foreign-trust members in privileged groups..." -ForegroundColor Cyan
+    $failHit = $false
+    foreach ($gname in $script:PrivilegedGroups) {
+        try {
+            $members = Get-ADGroupMember -Identity $gname -Recursive -ErrorAction Stop
+        }
+        catch { continue }
+        foreach ($m in $members) {
+            if ($m.objectClass -eq 'foreignSecurityPrincipal') {
+                $failHit = $true
+                Add-ADFinding -CheckName 'Test-NestedGroupPrivilegePaths' -Status 'WARNING' -Object $gname `
+                    -Description "Privileged group '$gname' contains a ForeignSecurityPrincipal: $($m.Name)." `
+                    -Remediation 'Verify and minimize trusted-domain membership in privileged groups.'
+            }
+        }
+    }
+    if (-not $failHit) {
+        Add-ADFinding -CheckName 'Test-NestedGroupPrivilegePaths' -Status 'PASS' -Object 'Privileged Groups' `
+            -Description 'No ForeignSecurityPrincipals in privileged groups.' `
+            -Remediation 'No action needed.'
+    }
+}
+
+function Test-SensitiveObjectACLDrift {
+    <#
+    .SYNOPSIS
+        Scans sensitive AD objects for non-admin ACEs with broad rights.
+    #>
+    [CmdletBinding()]
+    param()
+
+    Write-Host "`n[+] Checking ACL drift on sensitive AD objects..." -ForegroundColor Cyan
+    $dn = (Get-ADDomain).DistinguishedName
+    $objs = @(
+        "CN=Domain Admins, CN=Users, $dn",
+        "CN=Enterprise Admins, CN=Users, $dn",
+        "CN=Administrators, CN=Builtin, $dn",
+        "CN=Schema Admins, CN=Users, $dn",
+        "CN=Account Operators, CN=Users, $dn",
+        "CN=Backup Operators, CN=Users, $dn"
+    )
+    $failHit = $false
+    foreach ($o in $objs) {
+        try { $acl = Get-Acl -Path ("AD:\$o") }
+        catch {
+            Add-ADFinding -CheckName 'Test-SensitiveObjectACLDrift' -Status 'WARNING' -Object $o `
+                -Description "Unable to read ACL for '$o'." `
+                -Remediation 'Verify object exists and permissions are healthy.'
+            continue
+        }
+        $risky = @($acl.Access | Where-Object { ($_.ActiveDirectoryRights -match 'WriteProperty|GenericWrite|GenericAll|All') -and ($script:AdminPrincipals -notcontains $_.IdentityReference.Value) })
+        foreach ($r in $risky) {
+            $failHit = $true
+            Add-ADFinding -CheckName 'Test-SensitiveObjectACLDrift' -Status 'FAIL' -Object $o `
+                -Description "Non-admin '$($r.IdentityReference)' has '$($r.ActiveDirectoryRights)' on '$o'." `
+                -Remediation 'Remove unauthorized write permissions. Only admin teams should hold broad rights.'
+        }
+    }
+    if (-not $failHit) {
+        Add-ADFinding -CheckName 'Test-SensitiveObjectACLDrift' -Status 'PASS' -Object 'Sensitive Objects' `
+            -Description 'No risky non-admin write permissions detected.' -Remediation 'No action needed.'
+    }
+}
+
+function Test-ShadowGroupNames {
+    <#
+    .SYNOPSIS
+        Flags groups with names that typosquat privileged groups.
+    #>
+    [CmdletBinding()]
+    param()
+
+    Write-Host "`n[+] Checking for shadow / lookalike group names..." -ForegroundColor Cyan
+    $patterns = @(
+        'Domain Admin', 'DomainAdministrator', 'Domain_Administrator', 'Domain Administrators',
+        'Domian Admins', 'DomianAdmins', 'Enterprise Admin', 'EnterpriseAdministrator',
+        'Enterprise Administrators', 'Schema Admin', 'SchemaAdministrator',
+        'Administrat0rs', 'Adm1n', 'Account Operator', 'Backup Operator', 'Ops', 'Root'
+    )
+    $failHit = $false
+    try {
+        $all = Get-ADGroup -Filter * | Sort-Object Name
+        foreach ($g in $all) {
+            if ($script:PrivilegedGroups -contains $g.Name) { continue }
+            foreach ($p in $patterns) {
+                if ($g.Name -like "*$p*") {
+                    $failHit = $true
+                    Add-ADFinding -CheckName 'Test-ShadowGroupNames' -Status 'WARNING' -Object $g.Name `
+                        -Description "Suspicious group name: '$($g.Name)' (possible shadow / lookalike admin group)." `
+                        -Remediation 'Review this group for unnecessary privileges. Remove if not required.'
+                    break
+                }
+            }
+        }
+        if (-not $failHit) {
+            Add-ADFinding -CheckName 'Test-ShadowGroupNames' -Status 'PASS' -Object 'Groups' `
+                -Description 'No suspicious shadow group names detected.' -Remediation 'No action needed.'
+        }
+    }
+    catch {
+        Add-ADFinding -CheckName 'Test-ShadowGroupNames' -Status 'WARNING' -Object 'Groups' `
+            -Description "Unable to enumerate: $($_.Exception.Message)" `
+            -Remediation 'Check permissions.'
+    }
+}
+
+#endregion
+
+#region ==================== MAIN ENTRY POINT ====================
+
+<#
+.SYNOPSIS
+    Runs the full Active Directory assessment.
+.DESCRIPTION
+    Verifies the environment via Test-ADEnvironment, then invokes all (or a
+    selected subset of) Test-* functions. Returns the accumulated findings array.
+.PARAMETER UserLogonInactivityDays
+    Threshold for flagging stale user logons. Default 180.
+.PARAMETER UserPasswordAgeDays
+    Threshold for flagging stale passwords. Default 180.
+.PARAMETER IncludeChecks
+    Optional list of specific Test-* function names to run. Default: all.
+.PARAMETER ExcludeChecks
+    Optional list of Test-* function names to skip.
+#>
+function Invoke-ActiveDirectoryAssessment {
+    [CmdletBinding()]
+    [OutputType([array])]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingUsernameAndPasswordParams', '',
+        Justification = 'Parameters are day-count thresholds, not credentials.')]
+    param(
+        [int]$UserLogonInactivityDays = $script:DefaultUserLogonInactivityDays,
+        [int]$UserPasswordAgeDays = $script:DefaultUserPasswordAgeDays,
+        [int]$RecentPrivilegedAccountDays = $script:DefaultRecentPrivilegedAccountDays,
+        [int]$KrbTgtPasswordAgeDays = $script:DefaultKrbTgtPasswordAgeDays,
+        [string[]]$IncludeChecks,
+        [string[]]$ExcludeChecks
+    )
+
+    $script:Findings = @()
+
+    $env = Test-ADEnvironment
+    if (-not $env.IsAvailable) {
+        Add-ADFinding -CheckName 'Test-ADForestAndDomain' -Status 'INFO' -Object 'Active Directory Module' `
+            -Description "Active Directory checks skipped. $($env.FailureReason)" `
+            -Remediation 'Run on a domain-joined Windows host with RSAT installed. Cloud-only environments can ignore this finding.'
+        return , $script:Findings
+    }
+
+    if (-not $env.IsDomainAdmin) {
+        Add-ADFinding -CheckName 'Test-ADForestAndDomain' -Status 'WARNING' -Object 'Active Directory Permissions' `
+            -Description 'Running without Domain Admin privileges. ACL / drift checks may return incomplete results.' `
+            -Remediation 'Re-run as a Domain Admin or Read-Only Domain Admin for full coverage.'
+    }
+
+    $allChecks = @(
+        'Test-ADForestAndDomain', 'Test-DomainControllers', 'Test-ADPasswordPolicy',
+        'Test-ADStaleAccounts', 'Test-PrivilegedGroupMembership', 'Test-ProtectedUsersAdoption',
+        'Test-DomainTrusts', 'Test-ADServiceAccounts', 'Test-KrbTgtAccountAge',
+        'Test-DelegationOverview', 'Test-GPOInventory', 'Test-DuplicateSPNs',
+        'Test-PrivilegedObjectACLs', 'Test-GPPPasswords', 'Test-KerberosPreAuthDisabled',
+        'Test-UnconstrainedDelegation', 'Test-PasswordNeverExpires', 'Test-SIDHistory',
+        'Test-PrivilegedSmartcardRequirement', 'Test-PrivilegedGroupCreep', 'Test-AdminSDHolderDrift',
+        'Test-DangerousSIDsInPrivilegedGroups', 'Test-PasswordsInDescription', 'Test-UserAccountsWithSPN',
+        'Test-OUAndGPODelegation', 'Test-RecentPrivilegedAccounts', 'Test-NestedGroupPrivilegePaths',
+        'Test-SensitiveObjectACLDrift', 'Test-ShadowGroupNames'
+    )
+
+    $toRun = if ($IncludeChecks) {
+        $allChecks | Where-Object { $IncludeChecks -contains $_ }
+    }
+    else {
+        $allChecks
+    }
+    if ($ExcludeChecks) {
+        $toRun = $toRun | Where-Object { $ExcludeChecks -notcontains $_ }
+    }
+
+    foreach ($check in $toRun) {
+        try {
+            switch ($check) {
+                'Test-ADStaleAccounts' {
+                    & $check -UserLogonInactivityDays $UserLogonInactivityDays -UserPasswordAgeDays $UserPasswordAgeDays
+                }
+                'Test-KrbTgtAccountAge' {
+                    & $check -MaxAgeDays $KrbTgtPasswordAgeDays
+                }
+                'Test-RecentPrivilegedAccounts' {
+                    & $check -RecentDays $RecentPrivilegedAccountDays
+                }
+                default {
+                    & $check
+                }
+            }
+        }
+        catch {
+            Add-ADFinding -CheckName $check -Status 'WARNING' -Object $check `
+                -Description "Check failed unexpectedly: $($_.Exception.Message)" `
+                -Remediation 'Inspect the module source or report this failure; the assessment continued with the remaining checks.'
+        }
+    }
+
+    return , $script:Findings
+}
+
+#endregion
+
+#region ==================== MODULE EXPORTS ====================
+
+Export-ModuleMember -Function @(
+    'Initialize-ActiveDirectoryModule',
+    'Test-ADEnvironment',
+    'Invoke-ActiveDirectoryAssessment',
+    'Test-ADForestAndDomain',
+    'Test-DomainControllers',
+    'Test-ADPasswordPolicy',
+    'Test-ADStaleAccounts',
+    'Test-PrivilegedGroupMembership',
+    'Test-ProtectedUsersAdoption',
+    'Test-DomainTrusts',
+    'Test-ADServiceAccounts',
+    'Test-KrbTgtAccountAge',
+    'Test-DelegationOverview',
+    'Test-GPOInventory',
+    'Test-DuplicateSPNs',
+    'Test-PrivilegedObjectACLs',
+    'Test-GPPPasswords',
+    'Test-KerberosPreAuthDisabled',
+    'Test-UnconstrainedDelegation',
+    'Test-PasswordNeverExpires',
+    'Test-SIDHistory',
+    'Test-PrivilegedSmartcardRequirement',
+    'Test-PrivilegedGroupCreep',
+    'Test-AdminSDHolderDrift',
+    'Test-DangerousSIDsInPrivilegedGroups',
+    'Test-PasswordsInDescription',
+    'Test-UserAccountsWithSPN',
+    'Test-OUAndGPODelegation',
+    'Test-RecentPrivilegedAccounts',
+    'Test-NestedGroupPrivilegePaths',
+    'Test-SensitiveObjectACLDrift',
+    'Test-ShadowGroupNames'
+)
+
+#endregion
