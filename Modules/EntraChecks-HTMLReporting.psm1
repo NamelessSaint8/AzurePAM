@@ -24,6 +24,7 @@ $modulePath = Split-Path -Parent $PSCommandPath
 Import-Module (Join-Path $modulePath "EntraChecks-ComplianceMapping.psm1") -Force
 Import-Module (Join-Path $modulePath "EntraChecks-RiskScoring.psm1") -Force -DisableNameChecking
 Import-Module (Join-Path $modulePath "EntraChecks-RemediationGuidance.psm1") -Force
+Import-Module (Join-Path $modulePath "EntraChecks-PrivilegedIdentityRender.psm1") -Force -DisableNameChecking -ErrorAction SilentlyContinue
 # NOTE: EntraChecks-Branding.psm1 provides Get-ReportBrandingContext, which
 # callers can use to construct the -Branding object passed to
 # New-EnhancedHTMLReport. We don't import it here — only its output is
@@ -108,6 +109,11 @@ function New-EnhancedHTMLReport {
 
         # Override the module-scoped low-confidence list per call.
         [string[]]$LowConfidenceCheckNames,
+
+        # Output of Merge-PrivilegedIdentityRosters (PR 4). When supplied,
+        # the standalone HTML report appends a Privileged Identity Roster
+        # section with the same visual treatment as the unified report.
+        [object]$PrivilegedIdentityRoster,
 
         [string[]]$IncludeSections = @('All')
     )
@@ -229,6 +235,17 @@ function New-EnhancedHTMLReport {
     $htmlPurview = Get-PurviewSection -PurviewCompliance $PurviewCompliance
     $htmlHybridCorr = Get-HybridCorrelationSection -HybridCorrelation $HybridCorrelation
     $htmlDetailed = Get-DetailedFindingsSection -Findings $enhancedFindings -LowConfidenceCheckNames $effectiveLowConfidence
+
+    # PR 5 — Privileged Identity Roster section. Skipped silently if no
+    # roster supplied OR the render module isn't loaded.
+    $htmlPrivilegedIdentity = ''
+    $htmlPrivilegedIdentityCss = ''
+    if ($PrivilegedIdentityRoster -and (Get-Command Get-PrivilegedIdentityHtmlSection -ErrorAction SilentlyContinue)) {
+        $piMatchSummary = if ($PrivilegedIdentityRoster -is [hashtable] -and $PrivilegedIdentityRoster.ContainsKey('Statistics')) { $PrivilegedIdentityRoster.Statistics } else { $null }
+        $htmlPrivilegedIdentity = '<section class="section">' + (Get-PrivilegedIdentityHtmlSection -RosterInput $PrivilegedIdentityRoster -MatchSummary $piMatchSummary) + '</section>'
+        $htmlPrivilegedIdentityCss = '<style>' + (Get-PrivilegedIdentityRosterCss) + '</style>'
+    }
+
     $htmlJavaScript = Get-HTMLJavaScript
 
     # Assemble complete HTML
@@ -240,6 +257,7 @@ function New-EnhancedHTMLReport {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Microsoft Entra ID Security Assessment - $($TenantInfo.TenantName)</title>
     $htmlHead
+    $htmlPrivilegedIdentityCss
 </head>
 <body>
     $htmlNav
@@ -266,6 +284,7 @@ function New-EnhancedHTMLReport {
         $htmlPurview
         $htmlHybridCorr
         $htmlDetailed
+        $htmlPrivilegedIdentity
         $integrityBlock
     </div>
     $htmlJavaScript
@@ -2301,6 +2320,7 @@ function Get-DetailedFindingsSection {
             <div><strong>Risk Score:</strong> $($finding.RiskScore) / 100</div>
             <div><strong>Priority Score:</strong> $($finding.PriorityScore)</div>
             <div><strong>Remediation Effort:</strong> $($finding.RemediationEffortDescription)</div>
+            <div><strong>Source:</strong> $(if ($finding.Source) { [System.Net.WebUtility]::HtmlEncode([string]$finding.Source) } else { 'Internal' })</div>
         </div>
 
         $complianceRef

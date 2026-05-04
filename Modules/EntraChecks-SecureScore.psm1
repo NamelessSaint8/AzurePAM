@@ -32,6 +32,10 @@
 $script:ModuleVersion = "1.0.0"
 $script:ModuleName = "EntraChecks-SecureScore"
 
+# Provenance: data source key for any findings this module emits via Add-Finding.
+# Matches a key in EntraChecks-DataSources.psm1 :: $script:DataSourceCatalog.
+$script:DataSourceKey = 'SecureScore'
+
 #region ==================== SECURE SCORE CONTROL MAPPINGS ====================
 
 # Mapping between Microsoft Secure Score controls and EntraChecks

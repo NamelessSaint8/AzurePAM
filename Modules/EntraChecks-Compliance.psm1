@@ -30,6 +30,12 @@
 
 #Requires -Version 5.1
 
+# Import dependent modules
+$script:ComplianceModulePath = Split-Path -Parent $PSCommandPath
+Import-Module (Join-Path $script:ComplianceModulePath "EntraChecks-DataSources.psm1") -Force -DisableNameChecking
+Import-Module (Join-Path $script:ComplianceModulePath "EntraChecks-RemediationGuidance.psm1") -Force -ErrorAction SilentlyContinue
+Import-Module (Join-Path $script:ComplianceModulePath "EntraChecks-PrivilegedIdentityRender.psm1") -Force -DisableNameChecking -ErrorAction SilentlyContinue
+
 # Module version
 $script:ModuleVersion = "1.0.0"
 $script:ModuleName = "EntraChecks-Compliance"
@@ -1829,9 +1835,15 @@ function Export-UnifiedComplianceReport {
         
         [Parameter()]
         $AzurePolicyData,
-        
+
         [Parameter()]
-        $PurviewComplianceData
+        $PurviewComplianceData,
+
+        # Output of Merge-PrivilegedIdentityRosters (unified AD <-> Entra
+        # privileged-identity roster). When supplied, the report renders the
+        # Privileged Identity Roster section + dashboard tile.
+        [Parameter()]
+        $PrivilegedIdentityRoster
     )
     
     Write-Host "`n" -NoNewline
@@ -1847,20 +1859,20 @@ function Export-UnifiedComplianceReport {
     $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
     $assessmentDate = Get-Date -Format "MMMM dd, yyyy HH:mm"
     
-    # Gather data from all sources
-    $dataSources = @{
-        Internal = @{ Available = $false; Data = $null }
-        SecureScore = @{ Available = $false; Data = $null }
-        DefenderCompliance = @{ Available = $false; Data = $null }
-        AzurePolicy = @{ Available = $false; Data = $null }
-        PurviewCompliance = @{ Available = $false; Data = $null }
+    # Gather data from all sources. Catalog provides static provenance
+    # (Provider, Endpoints, Cmdlets, Scopes, ReferenceUrl); we extend each entry
+    # with Available/Data and stamp runtime context via Update-DataSourceContext.
+    $dataSources = Get-DataSourceCatalog
+    foreach ($dsKey in @($dataSources.Keys)) {
+        $dataSources[$dsKey]['Available'] = $false
+        $dataSources[$dsKey]['Data'] = $null
     }
-    
+
     # Internal findings (CIS/NIST mapping)
     Write-Host "`n[1/5] Processing internal findings..." -ForegroundColor Cyan
     $cisMapping = $null
     $nistMapping = $null
-    
+
     if ($Findings -and $Findings.Count -gt 0) {
         $cisMapping = Get-CISComplianceMapping -Findings $Findings
         $nistMapping = Get-NISTComplianceMapping -Findings $Findings
@@ -1870,22 +1882,25 @@ function Export-UnifiedComplianceReport {
             NIST = $nistMapping
             FindingsCount = $Findings.Count
         }
+        Update-DataSourceContext -Descriptor $dataSources.Internal
     }
     else {
         Write-Host "    [!] No internal findings available" -ForegroundColor Yellow
     }
-    
+
     # Secure Score
     Write-Host "`n[2/5] Processing Secure Score data..." -ForegroundColor Cyan
     if ($IncludeSecureScore) {
         if ($SecureScoreData) {
             $dataSources.SecureScore.Available = $true
             $dataSources.SecureScore.Data = $SecureScoreData
+            Update-DataSourceContext -Descriptor $dataSources.SecureScore
             Write-Host "    [OK] Using provided Secure Score data" -ForegroundColor Green
         }
         elseif ($script:SecureScoreData) {
             $dataSources.SecureScore.Available = $true
             $dataSources.SecureScore.Data = $script:SecureScoreData
+            Update-DataSourceContext -Descriptor $dataSources.SecureScore
             Write-Host "    [OK] Using cached Secure Score data" -ForegroundColor Green
         }
         else {
@@ -1895,19 +1910,19 @@ function Export-UnifiedComplianceReport {
     else {
         Write-Host "    [i] Secure Score not requested (use -IncludeSecureScore)" -ForegroundColor Gray
     }
-    
+
     # Defender for Cloud
     Write-Host "`n[3/5] Processing Defender for Cloud data..." -ForegroundColor Cyan
     if ($IncludeDefenderCompliance) {
-        if ($DefenderComplianceData) {
+        $dcData = if ($DefenderComplianceData) { $DefenderComplianceData } elseif ($script:DefenderComplianceData) { $script:DefenderComplianceData } else { $null }
+        if ($dcData) {
             $dataSources.DefenderCompliance.Available = $true
-            $dataSources.DefenderCompliance.Data = $DefenderComplianceData
-            Write-Host "    [OK] Using provided Defender compliance data" -ForegroundColor Green
-        }
-        elseif ($script:DefenderComplianceData) {
-            $dataSources.DefenderCompliance.Available = $true
-            $dataSources.DefenderCompliance.Data = $script:DefenderComplianceData
-            Write-Host "    [OK] Using cached Defender compliance data" -ForegroundColor Green
+            $dataSources.DefenderCompliance.Data = $dcData
+            $dcSubs = @()
+            if ($dcData.Summary -and $dcData.Summary.Subscriptions) { $dcSubs = @($dcData.Summary.Subscriptions) }
+            elseif ($dcData.Subscriptions) { $dcSubs = @($dcData.Subscriptions | ForEach-Object { if ($_.Name) { $_.Name } else { $_ } }) }
+            Update-DataSourceContext -Descriptor $dataSources.DefenderCompliance -Subscriptions $dcSubs
+            Write-Host "    [OK] Using Defender compliance data" -ForegroundColor Green
         }
         else {
             Write-Host "    [!] No Defender data. Import EntraChecks-DefenderCompliance module and run Get-DefenderComplianceAssessment." -ForegroundColor Yellow
@@ -1916,19 +1931,19 @@ function Export-UnifiedComplianceReport {
     else {
         Write-Host "    [i] Defender compliance not requested (use -IncludeDefenderCompliance)" -ForegroundColor Gray
     }
-    
+
     # Azure Policy
     Write-Host "`n[4/5] Processing Azure Policy data..." -ForegroundColor Cyan
     if ($IncludeAzurePolicy) {
-        if ($AzurePolicyData) {
+        $apData = if ($AzurePolicyData) { $AzurePolicyData } elseif ($script:AzurePolicyData) { $script:AzurePolicyData } else { $null }
+        if ($apData) {
             $dataSources.AzurePolicy.Available = $true
-            $dataSources.AzurePolicy.Data = $AzurePolicyData
-            Write-Host "    [OK] Using provided Azure Policy data" -ForegroundColor Green
-        }
-        elseif ($script:AzurePolicyData) {
-            $dataSources.AzurePolicy.Available = $true
-            $dataSources.AzurePolicy.Data = $script:AzurePolicyData
-            Write-Host "    [OK] Using cached Azure Policy data" -ForegroundColor Green
+            $dataSources.AzurePolicy.Data = $apData
+            $apSubs = @()
+            if ($apData.Summary -and $apData.Summary.Subscriptions) { $apSubs = @($apData.Summary.Subscriptions) }
+            elseif ($apData.Subscriptions) { $apSubs = @($apData.Subscriptions | ForEach-Object { if ($_.Name) { $_.Name } else { $_ } }) }
+            Update-DataSourceContext -Descriptor $dataSources.AzurePolicy -Subscriptions $apSubs
+            Write-Host "    [OK] Using Azure Policy data" -ForegroundColor Green
         }
         else {
             Write-Host "    [!] No Azure Policy data. Import EntraChecks-AzurePolicy module and run Get-AzurePolicyComplianceAssessment." -ForegroundColor Yellow
@@ -1937,18 +1952,20 @@ function Export-UnifiedComplianceReport {
     else {
         Write-Host "    [i] Azure Policy not requested (use -IncludeAzurePolicy)" -ForegroundColor Gray
     }
-    
+
     # Purview Compliance Manager
     Write-Host "`n[5/5] Processing Purview Compliance Manager data..." -ForegroundColor Cyan
     if ($IncludePurviewCompliance) {
         if ($PurviewComplianceData) {
             $dataSources.PurviewCompliance.Available = $true
             $dataSources.PurviewCompliance.Data = $PurviewComplianceData
+            Update-DataSourceContext -Descriptor $dataSources.PurviewCompliance
             Write-Host "    [OK] Using provided Purview compliance data" -ForegroundColor Green
         }
         elseif ($script:PurviewComplianceData) {
             $dataSources.PurviewCompliance.Available = $true
             $dataSources.PurviewCompliance.Data = $script:PurviewComplianceData
+            Update-DataSourceContext -Descriptor $dataSources.PurviewCompliance
             Write-Host "    [OK] Using cached Purview compliance data" -ForegroundColor Green
         }
         else {
@@ -2406,7 +2423,226 @@ function Export-UnifiedComplianceReport {
             font-size: 0.9rem;
             margin-top: 10px;
         }
-        
+
+        /* Data Sources — provenance cards + accordion reference table */
+        .ds-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
+            gap: 20px;
+            margin-bottom: 25px;
+        }
+        .ds-card {
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            border-top: 4px solid var(--primary);
+            padding: 20px 22px;
+            scroll-margin-top: 16px;
+        }
+        .ds-card.ds-securescore { border-top-color: #00bcf2; }
+        .ds-card.ds-defender    { border-top-color: var(--purple); }
+        .ds-card.ds-azurepolicy { border-top-color: #0089d6; }
+        .ds-card.ds-purview     { border-top-color: #742774; }
+        .ds-card.ds-internal    { border-top-color: var(--primary); }
+        .ds-card-head {
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            margin-bottom: 4px;
+        }
+        .ds-card-head h3 { font-size: 1.05rem; }
+        .ds-card-provider {
+            font-size: 0.78rem;
+            color: var(--gray-600);
+            margin-bottom: 14px;
+        }
+        .ds-fields {
+            display: grid;
+            grid-template-columns: 110px 1fr;
+            row-gap: 6px;
+            column-gap: 12px;
+            font-size: 0.85rem;
+        }
+        .ds-fields dt {
+            color: var(--gray-600);
+            font-weight: 600;
+            text-transform: uppercase;
+            font-size: 0.7rem;
+            letter-spacing: 0.03em;
+            padding-top: 2px;
+        }
+        .ds-fields dd {
+            margin: 0;
+            color: var(--gray-800);
+            word-wrap: break-word;
+            overflow-wrap: break-word;
+        }
+        .ds-fields dd ul {
+            margin: 0;
+            padding-left: 18px;
+        }
+        .ds-fields dd ul li { margin-bottom: 2px; }
+        .ds-fields dd code {
+            background: var(--gray-100);
+            padding: 1px 5px;
+            border-radius: 3px;
+            font-family: 'Consolas', 'Courier New', monospace;
+            font-size: 0.78rem;
+        }
+        .ds-card-footer {
+            margin-top: 14px;
+            padding-top: 12px;
+            border-top: 1px solid var(--gray-200);
+            font-size: 0.82rem;
+            color: var(--gray-600);
+        }
+        .ds-card-footer a { color: var(--primary); text-decoration: none; }
+        .ds-card-footer a:hover { text-decoration: underline; }
+        .ds-table-flyout {
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            padding: 0;
+            margin-top: 10px;
+        }
+        .ds-table-flyout summary {
+            padding: 14px 22px;
+            cursor: pointer;
+            font-weight: 600;
+            color: var(--gray-800);
+            user-select: none;
+        }
+        .ds-table-flyout summary::marker { color: var(--primary); }
+        .ds-table-flyout[open] summary {
+            border-bottom: 1px solid var(--gray-200);
+        }
+        .ds-table-flyout-body {
+            max-height: 520px;
+            overflow: auto;
+        }
+        .ds-table-flyout-body table {
+            table-layout: auto;
+            min-width: 100%;
+        }
+        .ds-table-flyout-body th {
+            position: sticky;
+            top: 0;
+            z-index: 1;
+        }
+        .ds-table-flyout-body td {
+            font-size: 0.82rem;
+            vertical-align: top;
+        }
+        a.ds-tile-link {
+            color: inherit;
+            text-decoration: none;
+            display: block;
+        }
+        a.ds-tile-link:hover { background: rgba(255,255,255,0.18); }
+
+        /* Findings — expandable rows ported from the standalone HTML report */
+        .uf-findings-list {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+        .uf-finding {
+            background: white;
+            border-radius: 6px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+            overflow: hidden;
+        }
+        .uf-finding > summary {
+            padding: 12px 18px;
+            cursor: pointer;
+            list-style: none;
+            display: grid;
+            grid-template-columns: 90px 1fr 220px 110px 1.6fr 1fr 22px;
+            gap: 14px;
+            align-items: center;
+            font-size: 0.88rem;
+            user-select: none;
+        }
+        .uf-finding > summary::-webkit-details-marker { display: none; }
+        .uf-finding > summary::marker { display: none; }
+        .uf-finding > summary:hover { background: var(--gray-100); }
+        .uf-finding[open] > summary { border-bottom: 1px solid var(--gray-200); }
+        .uf-finding > summary .uf-caret {
+            text-align: right;
+            color: var(--gray-600);
+            transition: transform 0.15s ease-in-out;
+        }
+        .uf-finding[open] > summary .uf-caret { transform: rotate(180deg); }
+        .uf-finding-static > summary {
+            cursor: default;
+        }
+        .uf-finding-static > summary:hover { background: transparent; }
+        .uf-finding-static > summary .uf-caret { visibility: hidden; }
+        .uf-headers {
+            display: grid;
+            grid-template-columns: 90px 1fr 220px 110px 1.6fr 1fr 22px;
+            gap: 14px;
+            padding: 10px 18px;
+            background: var(--gray-100);
+            font-weight: 600;
+            font-size: 0.72rem;
+            text-transform: uppercase;
+            color: var(--gray-600);
+            border-radius: 6px;
+            margin-bottom: 8px;
+            letter-spacing: 0.04em;
+        }
+        .uf-finding-body {
+            padding: 16px 22px 20px;
+            font-size: 0.9rem;
+        }
+        .uf-finding-meta {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 12px 24px;
+            margin-bottom: 12px;
+            padding: 12px 14px;
+            background: var(--gray-100);
+            border-radius: 4px;
+            font-size: 0.85rem;
+        }
+        .uf-remediation-steps {
+            background: #e7f3ff;
+            padding: 14px 18px;
+            border-radius: 4px;
+            margin-top: 12px;
+        }
+        .uf-remediation-steps h4 {
+            color: var(--primary);
+            margin-bottom: 8px;
+            font-size: 0.95rem;
+        }
+        .uf-remediation-steps ol {
+            margin-left: 20px;
+            margin-bottom: 8px;
+        }
+        .uf-remediation-steps li { margin-bottom: 6px; }
+        .uf-code-block {
+            background: #1e1e1e;
+            color: #d4d4d4;
+            padding: 12px 14px;
+            border-radius: 4px;
+            overflow-x: auto;
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 0.82rem;
+            margin: 8px 0;
+            white-space: pre-wrap;
+        }
+        .uf-source-link {
+            text-decoration: none;
+        }
+        .uf-source-link .source-badge {
+            cursor: pointer;
+        }
+        .uf-source-link:hover .source-badge {
+            filter: brightness(1.1);
+        }
+
         footer {
             text-align: center;
             padding: 30px;
@@ -2418,6 +2654,8 @@ function Export-UnifiedComplianceReport {
             body { background: white; }
             .card { break-inside: avoid; }
         }
+
+$(if (Get-Command Get-PrivilegedIdentityRosterCss -ErrorAction SilentlyContinue) { Get-PrivilegedIdentityRosterCss } else { '' })
     </style>
 </head>
 <body>
@@ -2438,10 +2676,13 @@ function Export-UnifiedComplianceReport {
                     <label>Total Findings</label>
                     <span>$($Findings.Count)</span>
                 </div>
+                <a class="ds-tile-link" href="#data-sources" title="Jump to Data Sources">
                 <div class="meta-item">
                     <label>Data Sources</label>
-                    <span>$(($dataSources.GetEnumerator() | Where-Object { $_.Value.Available }).Count) Active</span>
+                    <span>$(($dataSources.GetEnumerator() | Where-Object { $_.Value.Available }).Count) Active &rarr;</span>
                 </div>
+                </a>
+                $(if ($PrivilegedIdentityRoster -and (Get-Command Get-PrivilegedIdentityDashboardTile -ErrorAction SilentlyContinue)) { Get-PrivilegedIdentityDashboardTile -RosterInput $PrivilegedIdentityRoster } else { '' })
             </div>
         </header>
 "@
@@ -2478,30 +2719,52 @@ function Export-UnifiedComplianceReport {
         </div>
 "@
 
-    # All Assessment Findings table (primary content)
+    # All Assessment Findings — expandable rows. FAIL/WARNING findings expand
+    # to show portal/PowerShell remediation pulled from EntraChecks-RemediationGuidance.
     if ($Findings -and $Findings.Count -gt 0) {
+        # Enrich findings with detailed remediation guidance when the module is
+        # available. Add-RemediationGuidance is idempotent — if a finding
+        # already carries .RemediationGuidance, it's left untouched.
+        $enrichedFindings = if (Get-Command Add-RemediationGuidance -ErrorAction SilentlyContinue) {
+            @($Findings | ForEach-Object { $_ | Add-RemediationGuidance })
+        }
+        else { @($Findings) }
+
+        $sourceClassMap = @{
+            'Internal' = 'source-internal'
+            'SecureScore' = 'source-securescore'
+            'DefenderCompliance' = 'source-defender'
+            'AzurePolicy' = 'source-azurepolicy'
+            'PurviewCompliance' = 'source-purview'
+        }
+        $sourceLabelMap = @{
+            'Internal' = 'EntraChecks'
+            'SecureScore' = 'Secure Score'
+            'DefenderCompliance' = 'Defender'
+            'AzurePolicy' = 'Azure Policy'
+            'PurviewCompliance' = 'Purview'
+        }
+
         $html += @"
 
-        <h2 class="section-title">All Assessment Findings ($($Findings.Count))</h2>
-        <div class="card">
-            <div class="card-body">
-                <table>
-                    <thead>
-                        <tr>
-                            <th class="col-check">Check</th>
-                            <th class="col-status">Status</th>
-                            <th class="col-category">Category</th>
-                            <th class="col-object">Object</th>
-                            <th class="col-desc">Description</th>
-                            <th class="col-remediation">Remediation</th>
-                        </tr>
-                    </thead>
-                    <tbody>
+        <h2 class="section-title">All Assessment Findings ($($enrichedFindings.Count))</h2>
+        <div class="uf-headers">
+            <div>Status</div>
+            <div>Check</div>
+            <div>Object</div>
+            <div>Source</div>
+            <div>Description</div>
+            <div>Remediation</div>
+            <div></div>
+        </div>
+        <div class="uf-findings-list">
 "@
-        $sortedFindings = $Findings | Sort-Object @{Expression = {
+
+        $sortedFindings = $enrichedFindings | Sort-Object @{Expression = {
                 switch ($_.Status) { 'FAIL' { 0 } 'WARNING' { 1 } 'INFO' { 2 } 'OK' { 3 } default { 4 } }
             }
         }
+
         foreach ($f in $sortedFindings) {
             $fStatusBadge = switch ($f.Status) {
                 'FAIL' { '<span class="badge badge-danger">FAIL</span>' }
@@ -2511,27 +2774,108 @@ function Export-UnifiedComplianceReport {
             }
             $fCheckName = [System.Net.WebUtility]::HtmlEncode($f.Check)
             if (-not $fCheckName) { $fCheckName = [System.Net.WebUtility]::HtmlEncode($f.CheckName) }
-            $fCategory = [System.Net.WebUtility]::HtmlEncode($f.Category)
             $fObj = [System.Net.WebUtility]::HtmlEncode($f.Object)
             $fDesc = [System.Net.WebUtility]::HtmlEncode($f.Description)
             $fRem = [System.Net.WebUtility]::HtmlEncode($f.Remediation)
+
+            $sourceKey = if ($f.Source) { [string]$f.Source } else { 'Internal' }
+            $sourceCss = if ($sourceClassMap.ContainsKey($sourceKey)) { $sourceClassMap[$sourceKey] } else { 'source-internal' }
+            $sourceLbl = if ($sourceLabelMap.ContainsKey($sourceKey)) { $sourceLabelMap[$sourceKey] } else { $sourceKey }
+            $sourceBadgeHtml = "<a class=`"uf-source-link`" href=`"#data-source-$sourceKey`" title=`"Jump to $sourceLbl provenance card`"><span class=`"source-badge $sourceCss`">$sourceLbl</span></a>"
+
+            # Body is meaningful only for FAIL/WARNING; OK/INFO render a static
+            # row with no expand affordance to keep the list scannable.
+            $hasFlyout = ($f.Status -in @('FAIL', 'WARNING'))
+            $caret = if ($hasFlyout) { '&#9660;' } else { '' }
+            $finOpen = '<details class="uf-finding">'
+            if (-not $hasFlyout) {
+                $finOpen = '<details class="uf-finding uf-finding-static">'
+            }
+
+            $bodyHtml = ''
+            if ($hasFlyout) {
+                $rg = $f.RemediationGuidance
+                $portalSteps = ''
+                $psSteps = ''
+                $impactBlock = ''
+                if ($rg) {
+                    if ($rg.StepsPortal) {
+                        $stepLis = ($rg.StepsPortal | ForEach-Object {
+                                $line = ($_ -replace '^\d+\.\s*', '')
+                                "<li>$([System.Net.WebUtility]::HtmlEncode($line))</li>"
+                            }) -join ''
+                        $portalSteps = @"
+                <h4>&#128273; Remediation Steps (Azure Portal)</h4>
+                <ol>$stepLis</ol>
+"@
+                    }
+                    if ($rg.StepsPowerShell) {
+                        $codeSafe = [System.Net.WebUtility]::HtmlEncode([string]$rg.StepsPowerShell)
+                        $psSteps = @"
+                <h4 style="margin-top: 12px;">&#128187; PowerShell Remediation</h4>
+                <pre class="uf-code-block">$codeSafe</pre>
+"@
+                    }
+                    if ($rg.Impact) {
+                        $posSafe = [System.Net.WebUtility]::HtmlEncode([string]$rg.Impact.Positive)
+                        $negSafe = [System.Net.WebUtility]::HtmlEncode([string]$rg.Impact.Negative)
+                        $impactBlock = @"
+                <p style="margin-top: 10px;"><strong>Impact:</strong> $posSafe</p>
+                <p><strong>Considerations:</strong> $negSafe</p>
+"@
+                    }
+                }
+
+                $remediationBlock = if ($portalSteps -or $psSteps -or $impactBlock) {
+                    @"
+            <div class="uf-remediation-steps">
+                $portalSteps
+                $psSteps
+                $impactBlock
+            </div>
+"@
+                }
+                else { '' }
+
+                $bodyHtml = @"
+        <div class="uf-finding-body">
+            <div class="uf-finding-meta">
+                <div><strong>Object:</strong> $fObj</div>
+                <div><strong>Source:</strong> $sourceLbl</div>
+                <div><strong>Status:</strong> $($f.Status)</div>
+            </div>
+            <p><strong>Description:</strong> $fDesc</p>
+            <p><strong>Quick remediation:</strong> $fRem</p>
+            $remediationBlock
+        </div>
+"@
+            }
+
             $html += @"
-                        <tr>
-                            <td><strong>$fCheckName</strong></td>
-                            <td>$fStatusBadge</td>
-                            <td>$fCategory</td>
-                            <td>$fObj</td>
-                            <td>$fDesc</td>
-                            <td style="font-size:0.85rem;">$fRem</td>
-                        </tr>
+        $finOpen
+            <summary>
+                <div>$fStatusBadge</div>
+                <div><strong>$fCheckName</strong></div>
+                <div>$fObj</div>
+                <div>$sourceBadgeHtml</div>
+                <div>$fDesc</div>
+                <div style="font-size:0.82rem;">$fRem</div>
+                <div class="uf-caret">$caret</div>
+            </summary>
+            $bodyHtml
+        </details>
 "@
         }
         $html += @"
-                    </tbody>
-                </table>
-            </div>
         </div>
 "@
+    }
+
+    # Privileged Identity Roster — rendered between Findings and Compliance Overview.
+    # Skipped silently if no roster supplied OR the render module isn't loaded.
+    if ($PrivilegedIdentityRoster -and (Get-Command Get-PrivilegedIdentityHtmlSection -ErrorAction SilentlyContinue)) {
+        $matchSummary = if ($PrivilegedIdentityRoster -is [hashtable] -and $PrivilegedIdentityRoster.ContainsKey('Statistics')) { $PrivilegedIdentityRoster.Statistics } else { $null }
+        $html += Get-PrivilegedIdentityHtmlSection -RosterInput $PrivilegedIdentityRoster -MatchSummary $matchSummary
     }
 
     $html += @"
@@ -2634,63 +2978,188 @@ function Export-UnifiedComplianceReport {
         }
     }
 
-    # Data sources summary
+    # Data Sources — provenance cards + collapsed accordion reference table.
+    # Cards give the rich per-source view; the table flyout below is the flat
+    # "paste into evidence binder" view auditors want.
     $html += @"
 
-        <h2 class="section-title">Data Sources</h2>
-        <div class="card">
-            <div class="card-body">
+        <h2 class="section-title" id="data-sources">Data Sources</h2>
+        <p style="margin-bottom: 18px; color: var(--gray-600); font-size: 0.9rem;">
+            Each card documents the API, cmdlet, scope, and runtime context that produced the data in this report.
+            Expand the reference table below for a flat one-row-per-source view.
+        </p>
+        <div class="ds-grid">
+"@
+
+    $orderedKeys = @('Internal', 'SecureScore', 'DefenderCompliance', 'AzurePolicy', 'PurviewCompliance')
+    $cardClassMap = @{
+        'Internal' = 'ds-internal'
+        'SecureScore' = 'ds-securescore'
+        'DefenderCompliance' = 'ds-defender'
+        'AzurePolicy' = 'ds-azurepolicy'
+        'PurviewCompliance' = 'ds-purview'
+    }
+    $titleMap = @{
+        'Internal' = 'EntraChecks Internal'
+        'SecureScore' = 'Microsoft Secure Score'
+        'DefenderCompliance' = 'Defender for Cloud Compliance'
+        'AzurePolicy' = 'Azure Policy'
+        'PurviewCompliance' = 'Purview Compliance Manager'
+    }
+
+    # Per-source "Result" line — preserves the existing at-a-glance details
+    # (count of findings, score, subscription/standard counts) so we keep the
+    # information density of the old table.
+    function Get-DataSourceResultLine {
+        param([string]$Key, [hashtable]$Source)
+        if (-not $Source.Available) { return $null }
+        switch ($Key) {
+            'Internal' { return "$($Source.Data.FindingsCount) findings processed" }
+            'SecureScore' { return "Score: $($Source.Data.ScorePercent)%" }
+            'DefenderCompliance' { return "$($Source.Data.Summary.TotalSubscriptions) subscriptions, $($Source.Data.Summary.TotalStandards) standards" }
+            'AzurePolicy' { return "$($Source.Data.Summary.TotalSubscriptions) subscriptions, $($Source.Data.Summary.TotalPolicies) policies" }
+            'PurviewCompliance' {
+                $pvSummary = @()
+                if ($Source.Data.Summary.ComplianceScore) { $pvSummary += "Score: $($Source.Data.Summary.ComplianceScore)%" }
+                if ($Source.Data.Summary.TotalAssessments) { $pvSummary += "$($Source.Data.Summary.TotalAssessments) assessments" }
+                if ($pvSummary.Count -gt 0) { return ($pvSummary -join ', ') } else { return 'Data available' }
+            }
+        }
+        return $null
+    }
+
+    function Format-DataSourceList {
+        param([object]$Items, [switch]$AsCode)
+        if (-not $Items -or @($Items).Count -eq 0) { return '<em style="color:var(--gray-600);">none</em>' }
+        $lis = foreach ($i in @($Items)) {
+            $safe = [System.Net.WebUtility]::HtmlEncode([string]$i)
+            if ($AsCode) { "<li><code>$safe</code></li>" } else { "<li>$safe</li>" }
+        }
+        return "<ul>$($lis -join '')</ul>"
+    }
+
+    foreach ($dsKey in $orderedKeys) {
+        if (-not $dataSources.ContainsKey($dsKey)) { continue }
+        $src = $dataSources[$dsKey]
+        $title = $titleMap[$dsKey]
+        $cardClass = $cardClassMap[$dsKey]
+        $statusBadge = if ($src.Available) {
+            '<span class="badge badge-success">Active</span>'
+        } else {
+            '<span class="badge badge-warning">Not Available</span>'
+        }
+
+        $providerSafe = [System.Net.WebUtility]::HtmlEncode([string]$src.Provider)
+        $endpointsHtml = Format-DataSourceList -Items $src.Endpoints -AsCode
+        $cmdletsHtml = Format-DataSourceList -Items $src.Cmdlets -AsCode
+        $scopesHtml = Format-DataSourceList -Items $src.Scopes
+
+        $authLine = if ($src.AuthMethod) {
+            $auth = [System.Net.WebUtility]::HtmlEncode([string]$src.AuthMethod)
+            if ($src.Upn) { $auth += " &middot; " + [System.Net.WebUtility]::HtmlEncode([string]$src.Upn) }
+            $auth
+        } else { '<em style="color:var(--gray-600);">not yet queried</em>' }
+
+        $tenantLine = if ($src.Tenant) { [System.Net.WebUtility]::HtmlEncode([string]$src.Tenant) } else { '&mdash;' }
+
+        $subsLine = if ($src.Subscriptions -and @($src.Subscriptions).Count -gt 0) {
+            ([System.Net.WebUtility]::HtmlEncode((@($src.Subscriptions) -join ', ')))
+        } else { '&mdash;' }
+
+        $queriedLine = if ($src.QueriedAt) { (Get-Date $src.QueriedAt -Format 'yyyy-MM-dd HH:mm:ss') + ' UTC' } else { '&mdash;' }
+
+        $resultLine = Get-DataSourceResultLine -Key $dsKey -Source $src
+        $resultHtml = if ($resultLine) {
+            '<div class="ds-card-footer"><strong>Result:</strong> ' + [System.Net.WebUtility]::HtmlEncode($resultLine) + '</div>'
+        } else { '' }
+
+        $referenceHtml = if ($src.ReferenceUrl) {
+            $url = [System.Net.WebUtility]::HtmlEncode([string]$src.ReferenceUrl)
+            "<div class=`"ds-card-footer`"><a href=`"$url`" target=`"_blank`" rel=`"noopener`">$url &rarr;</a></div>"
+        } else { '' }
+
+        $html += @"
+            <div class="ds-card $cardClass" id="data-source-$dsKey">
+                <div class="ds-card-head">
+                    <h3>$title</h3>
+                    $statusBadge
+                </div>
+                <div class="ds-card-provider">$providerSafe</div>
+                <dl class="ds-fields">
+                    <dt>Endpoint</dt><dd>$endpointsHtml</dd>
+                    <dt>Cmdlet</dt><dd>$cmdletsHtml</dd>
+                    <dt>Scope</dt><dd>$scopesHtml</dd>
+                    <dt>Auth</dt><dd>$authLine</dd>
+                    <dt>Tenant</dt><dd><code>$tenantLine</code></dd>
+                    <dt>Subscriptions</dt><dd>$subsLine</dd>
+                    <dt>Queried</dt><dd>$queriedLine</dd>
+                </dl>
+                $resultHtml
+                $referenceHtml
+            </div>
+"@
+    }
+
+    $html += @"
+        </div>
+
+        <details class="ds-table-flyout">
+            <summary>Source reference table (flat view for evidence)</summary>
+            <div class="ds-table-flyout-body">
                 <table>
                     <thead>
                         <tr>
                             <th>Source</th>
                             <th>Status</th>
-                            <th>Details</th>
+                            <th>Provider</th>
+                            <th>Endpoint(s)</th>
+                            <th>Cmdlet(s)</th>
+                            <th>Scope</th>
+                            <th>Auth</th>
+                            <th>Tenant</th>
+                            <th>Subscriptions</th>
+                            <th>Queried</th>
+                            <th>Reference</th>
                         </tr>
                     </thead>
                     <tbody>
 "@
 
-    foreach ($source in $dataSources.GetEnumerator()) {
-        $statusBadge = if ($source.Value.Available) { 
-            '<span class="badge badge-success">Active</span>' 
-        } else { 
-            '<span class="badge badge-warning">Not Available</span>' 
-        }
-        
-        $details = switch ($source.Key) {
-            "Internal" { 
-                if ($source.Value.Available) { "$($source.Value.Data.FindingsCount) findings processed" } 
-                else { "Run EntraChecks security assessment" }
-            }
-            "SecureScore" {
-                if ($source.Value.Available) { "Score: $($source.Value.Data.ScorePercent)%" }
-                else { "Import EntraChecks-SecureScore module" }
-            }
-            "DefenderCompliance" {
-                if ($source.Value.Available) { "$($source.Value.Data.Summary.TotalSubscriptions) subscriptions, $($source.Value.Data.Summary.TotalStandards) standards" }
-                else { "Import EntraChecks-DefenderCompliance module" }
-            }
-            "AzurePolicy" {
-                if ($source.Value.Available) { "$($source.Value.Data.Summary.TotalSubscriptions) subscriptions, $($source.Value.Data.Summary.TotalPolicies) policies" }
-                else { "Import EntraChecks-AzurePolicy module" }
-            }
-            "PurviewCompliance" {
-                if ($source.Value.Available) { 
-                    $pvSummary = @()
-                    if ($source.Value.Data.Summary.ComplianceScore) { $pvSummary += "Score: $($source.Value.Data.Summary.ComplianceScore)%" }
-                    if ($source.Value.Data.Summary.TotalAssessments) { $pvSummary += "$($source.Value.Data.Summary.TotalAssessments) assessments" }
-                    if ($pvSummary.Count -gt 0) { $pvSummary -join ", " } else { "Data available" }
-                }
-                else { "Import EntraChecks-PurviewCompliance module" }
-            }
-        }
-        
+    foreach ($dsKey in $orderedKeys) {
+        if (-not $dataSources.ContainsKey($dsKey)) { continue }
+        $src = $dataSources[$dsKey]
+        $rowStatus = if ($src.Available) { '<span class="badge badge-success">Active</span>' } else { '<span class="badge badge-warning">Not Available</span>' }
+        $endpointJoined = if ($src.Endpoints) { ((@($src.Endpoints)) -join '; ') } else { '' }
+        $cmdletJoined = if ($src.Cmdlets) { ((@($src.Cmdlets)) -join '; ') } else { '' }
+        $scopeJoined = if ($src.Scopes) { ((@($src.Scopes)) -join '; ') } else { '' }
+        $tenantSafe = if ($src.Tenant) { [System.Net.WebUtility]::HtmlEncode([string]$src.Tenant) } else { '&mdash;' }
+        $subsSafe = if ($src.Subscriptions -and @($src.Subscriptions).Count -gt 0) {
+            [System.Net.WebUtility]::HtmlEncode((@($src.Subscriptions) -join ', '))
+        } else { '&mdash;' }
+        $queriedSafe = if ($src.QueriedAt) { (Get-Date $src.QueriedAt -Format 'yyyy-MM-dd HH:mm:ss') + ' UTC' } else { '&mdash;' }
+        $authSafe = if ($src.AuthMethod) {
+            $a = [System.Net.WebUtility]::HtmlEncode([string]$src.AuthMethod)
+            if ($src.Upn) { $a += ' · ' + [System.Net.WebUtility]::HtmlEncode([string]$src.Upn) }
+            $a
+        } else { '&mdash;' }
+        $refSafe = if ($src.ReferenceUrl) {
+            $u = [System.Net.WebUtility]::HtmlEncode([string]$src.ReferenceUrl)
+            "<a href=`"$u`" target=`"_blank`" rel=`"noopener`">link</a>"
+        } else { '&mdash;' }
+
         $html += @"
                         <tr>
-                            <td><strong>$($source.Key)</strong></td>
-                            <td>$statusBadge</td>
-                            <td>$details</td>
+                            <td><strong>$($titleMap[$dsKey])</strong></td>
+                            <td>$rowStatus</td>
+                            <td>$([System.Net.WebUtility]::HtmlEncode([string]$src.Provider))</td>
+                            <td><code>$([System.Net.WebUtility]::HtmlEncode($endpointJoined))</code></td>
+                            <td><code>$([System.Net.WebUtility]::HtmlEncode($cmdletJoined))</code></td>
+                            <td>$([System.Net.WebUtility]::HtmlEncode($scopeJoined))</td>
+                            <td>$authSafe</td>
+                            <td><code>$tenantSafe</code></td>
+                            <td>$subsSafe</td>
+                            <td>$queriedSafe</td>
+                            <td>$refSafe</td>
                         </tr>
 "@
     }
@@ -2699,7 +3168,7 @@ function Export-UnifiedComplianceReport {
                     </tbody>
                 </table>
             </div>
-        </div>
+        </details>
 
         <footer>
             <p>Generated by EntraChecks Unified Compliance Module v$script:ModuleVersion</p>

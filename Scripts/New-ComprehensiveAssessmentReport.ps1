@@ -544,6 +544,7 @@ try {
         -AzurePolicy $externalData.AzurePolicy `
         -PurviewCompliance $externalData.PurviewCompliance `
         -HybridCorrelation $externalData.HybridCorrelation `
+        -PrivilegedIdentityRoster $externalData.PrivilegedIdentityRoster `
         -IncludeSections @('All')
 
     Write-Host "    HTML report generated successfully" -ForegroundColor Green
@@ -766,6 +767,33 @@ if ($GenerateExcelReport) {
             # (or fall back to the raw external data if HTML generation didn't run).
             $ssForExcel = if ($secureScoreForReport) { $secureScoreForReport } else { $externalData.SecureScore }
 
+            # Build a runtime-populated provenance catalog so the Excel
+            # workbook's Data Sources sheet shows Auth/Tenant/QueriedAt for
+            # each source we actually pulled.
+            $excelCatalog = $null
+            if (Get-Command Get-DataSourceCatalog -ErrorAction SilentlyContinue) {
+                $excelCatalog = Get-DataSourceCatalog
+                $excelCatalog.Internal['Available'] = $true
+                $excelCatalog.Internal['Data'] = @{ FindingsCount = $findingsWithRisk.Count }
+                Update-DataSourceContext -Descriptor $excelCatalog.Internal
+                if ($ssForExcel) {
+                    $excelCatalog.SecureScore['Available'] = $true
+                    Update-DataSourceContext -Descriptor $excelCatalog.SecureScore
+                }
+                if ($externalData.AzurePolicy) {
+                    $excelCatalog.AzurePolicy['Available'] = $true
+                    Update-DataSourceContext -Descriptor $excelCatalog.AzurePolicy
+                }
+                if ($externalData.PurviewCompliance) {
+                    $excelCatalog.PurviewCompliance['Available'] = $true
+                    Update-DataSourceContext -Descriptor $excelCatalog.PurviewCompliance
+                }
+                if ($externalData.DefenderCompliance) {
+                    $excelCatalog.DefenderCompliance['Available'] = $true
+                    Update-DataSourceContext -Descriptor $excelCatalog.DefenderCompliance
+                }
+            }
+
             New-EnhancedExcelReport `
                 -Findings $findingsWithRisk `
                 -OutputPath $excelPath `
@@ -774,6 +802,8 @@ if ($GenerateExcelReport) {
                 -AzurePolicy $externalData.AzurePolicy `
                 -PurviewCompliance $externalData.PurviewCompliance `
                 -HybridCorrelation $externalData.HybridCorrelation `
+                -DataSourceCatalog $excelCatalog `
+                -PrivilegedIdentityRoster $externalData.PrivilegedIdentityRoster `
                 -UseImportExcel
 
             Write-Host "    [OK] Excel workbook generated: $excelPath" -ForegroundColor Green

@@ -28,6 +28,10 @@ RemediationScripts-*/
 *.log
 *.transcript
 
+# PowerShell session caches (auto-generated when modules are loaded)
+ModuleAnalysisCache-*
+StartupProfileData-*
+
 # Generated reports
 *.xlsx
 *.csv

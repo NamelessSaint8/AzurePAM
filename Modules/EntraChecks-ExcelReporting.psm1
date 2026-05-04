@@ -26,6 +26,8 @@ $modulePath = Split-Path -Parent $PSCommandPath
 Import-Module (Join-Path $modulePath "EntraChecks-ComplianceMapping.psm1") -Force
 Import-Module (Join-Path $modulePath "EntraChecks-RiskScoring.psm1") -Force
 Import-Module (Join-Path $modulePath "EntraChecks-RemediationGuidance.psm1") -Force
+Import-Module (Join-Path $modulePath "EntraChecks-DataSources.psm1") -Force -DisableNameChecking
+Import-Module (Join-Path $modulePath "EntraChecks-PrivilegedIdentityRender.psm1") -Force -DisableNameChecking -ErrorAction SilentlyContinue
 
 #region Excel Generation Functions
 
@@ -76,6 +78,18 @@ function New-EnhancedExcelReport {
         # PR 2 (AD-Hybrid): output of Get-HybridIdentityCorrelation.
         [object]$HybridCorrelation,
 
+        # Provenance catalog (output of Get-DataSourceCatalog with runtime
+        # context populated by Update-DataSourceContext). When supplied, a
+        # Data Sources sheet is added to the workbook. When omitted, the
+        # workbook still emits the sheet using the static catalog with
+        # Available = $false for each source.
+        [object]$DataSourceCatalog,
+
+        # Output of Merge-PrivilegedIdentityRosters (PR 4). When supplied,
+        # the workbook gains "Privileged Identities" + "Privilege Detail"
+        # sheets. When omitted, those sheets are skipped silently.
+        [object]$PrivilegedIdentityRoster,
+
         [switch]$UseImportExcel
     )
 
@@ -105,14 +119,16 @@ function New-EnhancedExcelReport {
         Write-Verbose "Generating Excel workbook with ImportExcel module..."
         New-ExcelWorkbook -Findings $enhancedFindings -OutputPath $OutputPath -TenantInfo $TenantInfo `
             -SecureScore $SecureScore -AzurePolicy $AzurePolicy -PurviewCompliance $PurviewCompliance `
-            -HybridCorrelation $HybridCorrelation
+            -HybridCorrelation $HybridCorrelation -DataSourceCatalog $DataSourceCatalog `
+            -PrivilegedIdentityRoster $PrivilegedIdentityRoster
     }
     else {
         # Fall back to multiple CSV files
         Write-Verbose "Generating CSV files (ImportExcel not available)..."
         New-CSVWorkbook -Findings $enhancedFindings -OutputPath $OutputPath -TenantInfo $TenantInfo `
             -SecureScore $SecureScore -AzurePolicy $AzurePolicy -PurviewCompliance $PurviewCompliance `
-            -HybridCorrelation $HybridCorrelation
+            -HybridCorrelation $HybridCorrelation -DataSourceCatalog $DataSourceCatalog `
+            -PrivilegedIdentityRoster $PrivilegedIdentityRoster
     }
 
     return $OutputPath
@@ -135,7 +151,11 @@ function New-ExcelWorkbook {
 
         [object]$PurviewCompliance,
 
-        [object]$HybridCorrelation
+        [object]$HybridCorrelation,
+
+        [object]$DataSourceCatalog,
+
+        [object]$PrivilegedIdentityRoster
     )
 
     # Calculate summaries
@@ -186,7 +206,8 @@ function New-ExcelWorkbook {
     @{N = 'Risk Score'; E = { $_.RiskScore } },
     @{N = 'Priority Score'; E = { $_.PriorityScore } },
     @{N = 'Remediation Effort'; E = { $_.RemediationEffortDescription } },
-    @{N = 'Compliance Frameworks'; E = { $_.ComplianceReference } }
+    @{N = 'Compliance Frameworks'; E = { $_.ComplianceReference } },
+    @{N = 'Source'; E = { if ($_.Source) { $_.Source } else { 'Internal' } } }
 
     $allFindingsExport | Export-Excel -Path $OutputPath -WorksheetName 'All Findings' -AutoSize -BoldTopRow -FreezeTopRow -AutoFilter
 
@@ -343,6 +364,30 @@ function New-ExcelWorkbook {
         $csRows = @(ConvertTo-HybridCrossSurfaceRows -HybridCorrelation $HybridCorrelation)
         if ($csRows.Count -gt 0) {
             $csRows | Export-Excel -Path $OutputPath -WorksheetName 'Hybrid Cross-Surface' -AutoSize -BoldTopRow -FreezeTopRow -AutoFilter
+        }
+    }
+
+    # 14. Data Sources — provenance audit appendix. Always emitted (uses static
+    # catalog when no runtime context was supplied) so the workbook always
+    # documents which APIs/cmdlets/scopes were available to the report.
+    Write-Verbose "Creating Data Sources sheet..."
+    $catalogForSheet = if ($DataSourceCatalog) { $DataSourceCatalog } else { Get-DataSourceCatalog }
+    $dsRows = @(ConvertTo-DataSourceRows -Catalog $catalogForSheet)
+    if ($dsRows.Count -gt 0) {
+        $dsRows | Export-Excel -Path $OutputPath -WorksheetName 'Data Sources' -AutoSize -BoldTopRow -FreezeTopRow -AutoFilter
+    }
+
+    # 15-16. Privileged Identity Roster (PR 5).
+    if ($PrivilegedIdentityRoster -and (Get-Command Get-PrivilegedIdentityRows -ErrorAction SilentlyContinue)) {
+        Write-Verbose "Creating Privileged Identities sheet..."
+        $idRows = @(Get-PrivilegedIdentityRows -RosterInput $PrivilegedIdentityRoster)
+        if ($idRows.Count -gt 0) {
+            $idRows | Export-Excel -Path $OutputPath -WorksheetName 'Privileged Identities' -AutoSize -BoldTopRow -FreezeTopRow -AutoFilter
+        }
+        Write-Verbose "Creating Privilege Detail sheet..."
+        $detailRows = @(Get-PrivilegeDetailRows -RosterInput $PrivilegedIdentityRoster)
+        if ($detailRows.Count -gt 0) {
+            $detailRows | Export-Excel -Path $OutputPath -WorksheetName 'Privilege Detail' -AutoSize -BoldTopRow -FreezeTopRow -AutoFilter
         }
     }
 
@@ -528,7 +573,11 @@ function New-CSVWorkbook {
 
         [object]$PurviewCompliance,
 
-        [object]$HybridCorrelation
+        [object]$HybridCorrelation,
+
+        [object]$DataSourceCatalog,
+
+        [object]$PrivilegedIdentityRoster
     )
 
     # Create directory for CSV files
@@ -580,7 +629,8 @@ function New-CSVWorkbook {
     @{N = 'Risk Score'; E = { $_.RiskScore } },
     @{N = 'Priority Score'; E = { $_.PriorityScore } },
     @{N = 'Remediation Effort'; E = { $_.RemediationEffortDescription } },
-    @{N = 'Compliance Frameworks'; E = { $_.ComplianceReference } }
+    @{N = 'Compliance Frameworks'; E = { $_.ComplianceReference } },
+    @{N = 'Source'; E = { if ($_.Source) { $_.Source } else { 'Internal' } } }
     $allFindingsExport | Export-Csv -LiteralPath (Join-Path $csvDir '02-AllFindings.csv') -NoTypeInformation -Encoding UTF8
 
     # 3. Priority Findings (top 25)
@@ -707,6 +757,25 @@ function New-CSVWorkbook {
         $csRows = @(ConvertTo-HybridCrossSurfaceRows -HybridCorrelation $HybridCorrelation)
         if ($csRows.Count -gt 0) {
             $csRows | Export-Csv -LiteralPath (Join-Path $csvDir '14-HybridCrossSurface.csv') -NoTypeInformation -Encoding UTF8
+        }
+    }
+
+    # Always emit Data Sources audit appendix.
+    $catalogForCsv = if ($DataSourceCatalog) { $DataSourceCatalog } else { Get-DataSourceCatalog }
+    $dsRows = @(ConvertTo-DataSourceRows -Catalog $catalogForCsv)
+    if ($dsRows.Count -gt 0) {
+        $dsRows | Export-Csv -LiteralPath (Join-Path $csvDir '15-DataSources.csv') -NoTypeInformation -Encoding UTF8
+    }
+
+    # Privileged Identity Roster (PR 5) — two CSVs mirroring the Excel sheets.
+    if ($PrivilegedIdentityRoster -and (Get-Command Get-PrivilegedIdentityRows -ErrorAction SilentlyContinue)) {
+        $idRows = @(Get-PrivilegedIdentityRows -RosterInput $PrivilegedIdentityRoster)
+        if ($idRows.Count -gt 0) {
+            $idRows | Export-Csv -LiteralPath (Join-Path $csvDir '16-PrivilegedIdentities.csv') -NoTypeInformation -Encoding UTF8
+        }
+        $detailRows = @(Get-PrivilegeDetailRows -RosterInput $PrivilegedIdentityRoster)
+        if ($detailRows.Count -gt 0) {
+            $detailRows | Export-Csv -LiteralPath (Join-Path $csvDir '17-PrivilegeDetail.csv') -NoTypeInformation -Encoding UTF8
         }
     }
 

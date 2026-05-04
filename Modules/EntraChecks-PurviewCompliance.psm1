@@ -42,6 +42,10 @@
 $script:ModuleVersion = "1.0.0"
 $script:ModuleName = "EntraChecks-PurviewCompliance"
 
+# Provenance: data source key for any findings this module emits via Add-Finding.
+# Matches a key in EntraChecks-DataSources.psm1 :: $script:DataSourceCatalog.
+$script:DataSourceKey = 'PurviewCompliance'
+
 #region ==================== COMPLIANCE MANAGER MAPPINGS ====================
 
 # Compliance Manager assessment templates and their frameworks

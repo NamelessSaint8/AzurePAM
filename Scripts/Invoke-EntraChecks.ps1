@@ -512,7 +512,12 @@ function Add-Finding {
         [Parameter(Mandatory)]
         [string]$Description,
 
-        [string]$Remediation = "Review and address as appropriate."
+        [string]$Remediation = "Review and address as appropriate.",
+
+        # Provenance: which data source produced this finding. Optional —
+        # auto-derived from the call stack when omitted (sources are mapped
+        # by .psm1 file name in EntraChecks-DataSources.psm1).
+        [string]$Source
     )
 
     # Auto-capture calling function name for CIS/NIST compliance mapping
@@ -528,6 +533,25 @@ function Add-Finding {
         'Default'
     }
 
+    # Resolve data source key. Prefers explicit -Source if given; otherwise
+    # falls back to call-stack auto-derive via Resolve-FindingSource. When the
+    # DataSources module isn't loaded (legacy invocation path), we default to
+    # 'Internal'.
+    $resolvedSource = if (Get-Command Resolve-FindingSource -ErrorAction SilentlyContinue) {
+        if ($PSBoundParameters.ContainsKey('Source')) {
+            Resolve-FindingSource -ExplicitSource $Source -WarningAction SilentlyContinue
+        }
+        else {
+            Resolve-FindingSource
+        }
+    }
+    elseif ($Source) {
+        $Source
+    }
+    else {
+        'Internal'
+    }
+
     $finding = [PSCustomObject]@{
         Time = (Get-Date)
         CheckName = $checkName
@@ -536,6 +560,7 @@ function Add-Finding {
         Object = $Object
         Description = $Description
         Remediation = $Remediation
+        Source = $resolvedSource
     }
 
     $script:Findings += $finding

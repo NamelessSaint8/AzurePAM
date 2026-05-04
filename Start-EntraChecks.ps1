@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Start-EntraChecks.ps1
     Unified orchestration script for EntraChecks compliance assessment suite
@@ -132,7 +132,18 @@ param(
 
     [switch]$GenerateExcelReport,
 
-    [switch]$GenerateRemediationScripts
+    [switch]$GenerateRemediationScripts,
+
+    # PR 2 of Privileged Identity Roster: emit the AD privileged-identity
+    # roster as JSON to the output directory. Independent of the full report
+    # pipeline so auditors can consume the roster before PR 5 lands its UI.
+    [switch]$EmitPrivilegedRoster,
+
+    # PR 4 of Privileged Identity Roster: optional JSON file with operator-
+    # asserted AD-SID <-> Entra-Object-ID equivalences. Used by the cross-
+    # surface correlator to harden weak/no auto-match cases.
+    # Schema: [{ "AdSid": "...", "EntraObjectId": "...", "CanonicalId": "..." }]
+    [string]$IdentityOverridesPath
 )
 
 # Default comprehensive report and executive summary to enabled
@@ -252,6 +263,13 @@ if ($ConfigFile) {
 $loggingModule = Join-Path $script:ModulesPath "EntraChecks-Logging.psm1"
 if (Test-Path $loggingModule) {
     Import-Module $loggingModule -Force -ErrorAction SilentlyContinue
+}
+
+# Import data sources catalog so Add-Finding can tag each finding with its
+# provenance source (auto-derived from the call stack, with optional override).
+$dsModule = Join-Path $script:ModulesPath "EntraChecks-DataSources.psm1"
+if (Test-Path $dsModule) {
+    Import-Module $dsModule -Force -DisableNameChecking -ErrorAction SilentlyContinue
 }
 
 # Initialize logging subsystem (from config or defaults)
@@ -408,79 +426,79 @@ $script:AllGraphScopes = @(
 function Show-Banner {
     Clear-Host
     Write-Host ""
-    Write-Host "  +-------------------------------------------------------------------+" -ForegroundColor Cyan
-    Write-Host "  �                                                                   �" -ForegroundColor Cyan
-    Write-Host "  �   �������+���+   ��+��������+������+  �����+                     �" -ForegroundColor Cyan
-    Write-Host "  �   ��+----+����+  ���+--��+--+��+--��+��+--��+                    �" -ForegroundColor Cyan
-    Write-Host "  �   �����+  ��+��+ ���   ���   ������++��������                    �" -ForegroundColor Cyan
-    Write-Host "  �   ��+--+  ���+��+���   ���   ��+--��+��+--���                    �" -ForegroundColor Cyan
-    Write-Host "  �   �������+��� +�����   ���   ���  ������  ���                    �" -ForegroundColor Cyan
-    Write-Host "  �   +------++-+  +---+   +-+   +-+  +-++-+  +-+                    �" -ForegroundColor Cyan
-    Write-Host "  �                                                                   �" -ForegroundColor Cyan
-    Write-Host "  �              ������+��+  ��+�������+ ������+��+  ��+�������+     �" -ForegroundColor Magenta
-    Write-Host "  �             ��+----+���  �����+----+��+----+��� ��++��+----+     �" -ForegroundColor Magenta
-    Write-Host "  �             ���     �������������+  ���     �����++ �������+     �" -ForegroundColor Magenta
-    Write-Host "  �             ���     ��+--�����+--+  ���     ��+-��+ +----���     �" -ForegroundColor Magenta
-    Write-Host "  �             +������+���  ����������++������+���  ��+��������     �" -ForegroundColor Magenta
-    Write-Host "  �              +-----++-+  +-++------+ +-----++-+  +-++------+     �" -ForegroundColor Magenta
-    Write-Host "  �                                                                   �" -ForegroundColor Cyan
-    Write-Host "  �           Unified Compliance Assessment Suite v$script:Version            �" -ForegroundColor White
-    Write-Host "  �                                                                   �" -ForegroundColor Cyan
-    Write-Host "  +-------------------------------------------------------------------+" -ForegroundColor Cyan
+    Write-Host "  ╔═══════════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
+    Write-Host "  ║                                                                   ║" -ForegroundColor Cyan
+    Write-Host "  ║   ███████╗███╗   ██╗████████╗██████╗  █████╗                     ║" -ForegroundColor Cyan
+    Write-Host "  ║   ██╔════╝████╗  ██║╚══██╔══╝██╔══██╗██╔══██╗                    ║" -ForegroundColor Cyan
+    Write-Host "  ║   █████╗  ██╔██╗ ██║   ██║   ██████╔╝███████║                    ║" -ForegroundColor Cyan
+    Write-Host "  ║   ██╔══╝  ██║╚██╗██║   ██║   ██╔══██╗██╔══██║                    ║" -ForegroundColor Cyan
+    Write-Host "  ║   ███████╗██║ ╚████║   ██║   ██║  ██║██║  ██║                    ║" -ForegroundColor Cyan
+    Write-Host "  ║   ╚══════╝╚═╝  ╚═══╝   ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═╝                    ║" -ForegroundColor Cyan
+    Write-Host "  ║                                                                   ║" -ForegroundColor Cyan
+    Write-Host "  ║              ██████╗██╗  ██╗███████╗ ██████╗██╗  ██╗███████╗     ║" -ForegroundColor Magenta
+    Write-Host "  ║             ██╔════╝██║  ██║██╔════╝██╔════╝██║ ██╔╝██╔════╝     ║" -ForegroundColor Magenta
+    Write-Host "  ║             ██║     ███████║█████╗  ██║     █████╔╝ ███████╗     ║" -ForegroundColor Magenta
+    Write-Host "  ║             ██║     ██╔══██║██╔══╝  ██║     ██╔═██╗ ╚════██║     ║" -ForegroundColor Magenta
+    Write-Host "  ║             ╚██████╗██║  ██║███████╗╚██████╗██║  ██╗███████║     ║" -ForegroundColor Magenta
+    Write-Host "  ║              ╚═════╝╚═╝  ╚═╝╚══════╝ ╚═════╝╚═╝  ╚═╝╚══════╝     ║" -ForegroundColor Magenta
+    Write-Host "  ║                                                                   ║" -ForegroundColor Cyan
+    Write-Host "  ║           Unified Compliance Assessment Suite v$script:Version            ║" -ForegroundColor White
+    Write-Host "  ║                                                                   ║" -ForegroundColor Cyan
+    Write-Host "  ╚═══════════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
     Write-Host ""
 }
 
 function Show-MainMenu {
-    Write-Host "  +-----------------------------------------------------------------+" -ForegroundColor Gray
-    Write-Host "  �                         MAIN MENU                               �" -ForegroundColor White
-    Write-Host "  +-----------------------------------------------------------------�" -ForegroundColor Gray
-    Write-Host "  �                                                                 �" -ForegroundColor Gray
-    Write-Host "  �   [1] Quick Assessment      - Run all modules (recommended)    �" -ForegroundColor Yellow
-    Write-Host "  �   [2] Select Modules        - Choose specific modules to run   �" -ForegroundColor Yellow
-    Write-Host "  �   [3] View Last Results     - Open most recent reports         �" -ForegroundColor Yellow
-    Write-Host "  �   [4] Compare Snapshots     - Delta reporting                  �" -ForegroundColor Yellow
-    Write-Host "  �   [5] Manage Snapshots      - View/delete saved snapshots      �" -ForegroundColor Yellow
-    Write-Host "  �   [6] SOC 2 Readiness       - Internal SOC 2 TSC assessment   �" -ForegroundColor Yellow
-    Write-Host "  �   [7] SOC 2 Type 2          - Period coverage from snapshots  �" -ForegroundColor Yellow
-    Write-Host "  �   [8] Active Directory      - On-premises AD security audit  �" -ForegroundColor Yellow
-    Write-Host "  �   [Y] Hybrid Analysis       - Cloud + on-prem + correlation  �" -ForegroundColor Yellow
-    Write-Host "  �                                                                 �" -ForegroundColor Gray
-    Write-Host "  �   [A] Authentication        - Connect to Graph and Azure       �" -ForegroundColor Cyan
-    Write-Host "  �   [D] Disconnect            - Sign out (switch tenant)         �" -ForegroundColor Cyan
-    Write-Host "  �   [S] Settings              - Configure output & preferences   �" -ForegroundColor Cyan
-    Write-Host "  �   [H] Help                  - Documentation & guides           �" -ForegroundColor Cyan
-    Write-Host "  �                                                                 �" -ForegroundColor Gray
-    Write-Host "  �   [Q] Quit                  - Quit and disconnect              �" -ForegroundColor Gray
-    Write-Host "  �                                                                 �" -ForegroundColor Gray
-    Write-Host "  +-----------------------------------------------------------------+" -ForegroundColor Gray
+    Write-Host "  ┌─────────────────────────────────────────────────────────────────┐" -ForegroundColor Gray
+    Write-Host "  │                         MAIN MENU                               │" -ForegroundColor White
+    Write-Host "  ├─────────────────────────────────────────────────────────────────┤" -ForegroundColor Gray
+    Write-Host "  │                                                                 │" -ForegroundColor Gray
+    Write-Host "  │   [1] Quick Assessment      - Run all modules (recommended)    │" -ForegroundColor Yellow
+    Write-Host "  │   [2] Select Modules        - Choose specific modules to run   │" -ForegroundColor Yellow
+    Write-Host "  │   [3] View Last Results     - Open most recent reports         │" -ForegroundColor Yellow
+    Write-Host "  │   [4] Compare Snapshots     - Delta reporting                  │" -ForegroundColor Yellow
+    Write-Host "  │   [5] Manage Snapshots      - View/delete saved snapshots      │" -ForegroundColor Yellow
+    Write-Host "  │   [6] SOC 2 Readiness       - Internal SOC 2 TSC assessment   │" -ForegroundColor Yellow
+    Write-Host "  │   [7] SOC 2 Type 2          - Period coverage from snapshots  │" -ForegroundColor Yellow
+    Write-Host "  │   [8] Active Directory      - On-premises AD security audit  │" -ForegroundColor Yellow
+    Write-Host "  │   [Y] Hybrid Analysis       - Cloud + on-prem + correlation  │" -ForegroundColor Yellow
+    Write-Host "  │                                                                 │" -ForegroundColor Gray
+    Write-Host "  │   [A] Authentication        - Connect to Graph and Azure       │" -ForegroundColor Cyan
+    Write-Host "  │   [D] Disconnect            - Sign out (switch tenant)         │" -ForegroundColor Cyan
+    Write-Host "  │   [S] Settings              - Configure output & preferences   │" -ForegroundColor Cyan
+    Write-Host "  │   [H] Help                  - Documentation & guides           │" -ForegroundColor Cyan
+    Write-Host "  │                                                                 │" -ForegroundColor Gray
+    Write-Host "  │   [Q] Quit                  - Quit and disconnect              │" -ForegroundColor Gray
+    Write-Host "  │                                                                 │" -ForegroundColor Gray
+    Write-Host "  └─────────────────────────────────────────────────────────────────┘" -ForegroundColor Gray
     Write-Host ""
 }
 
 function Show-ModuleMenu {
-    Write-Host "  +-----------------------------------------------------------------+" -ForegroundColor Gray
-    Write-Host "  �                      SELECT MODULES                             �" -ForegroundColor White
-    Write-Host "  +-----------------------------------------------------------------�" -ForegroundColor Gray
-    Write-Host "  �                                                                 �" -ForegroundColor Gray
-    Write-Host "  �   ENTRA ID (Graph API)                                         �" -ForegroundColor Cyan
-    Write-Host "  �   [1] Core Assessment       - 25 foundational checks           �" -ForegroundColor Yellow
-    Write-Host "  �   [2] Identity Protection   - Risk-based checks (P2)           �" -ForegroundColor Yellow
-    Write-Host "  �   [3] Devices and Intune    - Device compliance                �" -ForegroundColor Yellow
-    Write-Host "  �   [4] Secure Score          - Microsoft Secure Score           �" -ForegroundColor Yellow
-    Write-Host "  �                                                                 �" -ForegroundColor Gray
-    Write-Host "  �   AZURE (ARM API)                                              �" -ForegroundColor Cyan
-    Write-Host "  �   [5] Defender for Cloud    - Regulatory compliance            �" -ForegroundColor Yellow
-    Write-Host "  �   [6] Azure Policy          - Policy compliance state          �" -ForegroundColor Yellow
-    Write-Host "  �                                                                 �" -ForegroundColor Gray
-    Write-Host "  �   MICROSOFT 365                                                �" -ForegroundColor Cyan
-    Write-Host "  �   [7] Purview Compliance    - Compliance Manager               �" -ForegroundColor Yellow
-    Write-Host "  �                                                                 �" -ForegroundColor Gray
-    Write-Host "  �   ON-PREMISES                                                  �" -ForegroundColor Cyan
-    Write-Host "  �   [8] Active Directory      - On-prem AD security audit       �" -ForegroundColor Yellow
-    Write-Host "  �                                                                 �" -ForegroundColor Gray
-    Write-Host "  �   [A] Select All            [R] Run Selected                   �" -ForegroundColor Green
-    Write-Host "  �   [C] Clear Selection       [B] Back to Main Menu              �" -ForegroundColor Gray
-    Write-Host "  �                                                                 �" -ForegroundColor Gray
-    Write-Host "  +-----------------------------------------------------------------+" -ForegroundColor Gray
+    Write-Host "  ┌─────────────────────────────────────────────────────────────────┐" -ForegroundColor Gray
+    Write-Host "  │                      SELECT MODULES                             │" -ForegroundColor White
+    Write-Host "  ├─────────────────────────────────────────────────────────────────┤" -ForegroundColor Gray
+    Write-Host "  │                                                                 │" -ForegroundColor Gray
+    Write-Host "  │   ENTRA ID (Graph API)                                         │" -ForegroundColor Cyan
+    Write-Host "  │   [1] Core Assessment       - 25 foundational checks           │" -ForegroundColor Yellow
+    Write-Host "  │   [2] Identity Protection   - Risk-based checks (P2)           │" -ForegroundColor Yellow
+    Write-Host "  │   [3] Devices and Intune    - Device compliance                │" -ForegroundColor Yellow
+    Write-Host "  │   [4] Secure Score          - Microsoft Secure Score           │" -ForegroundColor Yellow
+    Write-Host "  │                                                                 │" -ForegroundColor Gray
+    Write-Host "  │   AZURE (ARM API)                                              │" -ForegroundColor Cyan
+    Write-Host "  │   [5] Defender for Cloud    - Regulatory compliance            │" -ForegroundColor Yellow
+    Write-Host "  │   [6] Azure Policy          - Policy compliance state          │" -ForegroundColor Yellow
+    Write-Host "  │                                                                 │" -ForegroundColor Gray
+    Write-Host "  │   MICROSOFT 365                                                │" -ForegroundColor Cyan
+    Write-Host "  │   [7] Purview Compliance    - Compliance Manager               │" -ForegroundColor Yellow
+    Write-Host "  │                                                                 │" -ForegroundColor Gray
+    Write-Host "  │   ON-PREMISES                                                  │" -ForegroundColor Cyan
+    Write-Host "  │   [8] Active Directory      - On-prem AD security audit       │" -ForegroundColor Yellow
+    Write-Host "  │                                                                 │" -ForegroundColor Gray
+    Write-Host "  │   [A] Select All            [R] Run Selected                   │" -ForegroundColor Green
+    Write-Host "  │   [C] Clear Selection       [B] Back to Main Menu              │" -ForegroundColor Gray
+    Write-Host "  │                                                                 │" -ForegroundColor Gray
+    Write-Host "  └─────────────────────────────────────────────────────────────────┘" -ForegroundColor Gray
     Write-Host ""
 }
 
@@ -549,7 +567,7 @@ function Show-Progress {
     $filled = [math]::Floor($width * $PercentComplete / 100)
     $empty = $width - $filled
     
-    $bar = "�" * $filled + "�" * $empty
+    $bar = "█" * $filled + "░" * $empty
     
     Write-Host "`r  [$bar] $PercentComplete% - $Status" -NoNewline -ForegroundColor Cyan
 }
@@ -1533,7 +1551,7 @@ function Invoke-SOC2ReadinessFromMenu {
 .SYNOPSIS
     Reads the SOC2.Enabled flag from the given config file. Returns $false
     when the file is absent, unparseable, or the flag is missing/false.
-    Pure function � no side effects other than a yellow warning on parse error.
+    Pure function - no side effects other than a yellow warning on parse error.
 
 .DESCRIPTION
     Extracted from Invoke-SOC2ReadinessIfEnabled so the flag-reading logic is
@@ -1570,7 +1588,7 @@ function Get-SOC2EnabledFromConfig {
     hands off to Invoke-SOC2ReadinessFromMenu with -SkipCoreSeed (findings
     already collected by the caller).
 
-    SOC 2 failure NEVER fails the primary Quick Assessment � errors are
+    SOC 2 failure NEVER fails the primary Quick Assessment - errors are
     caught and logged as a yellow warning only.
 
 .PARAMETER TenantName
@@ -1665,7 +1683,7 @@ function Invoke-SOC2TypeTwoFromMenu {
     $reportPrefix = if ($tt -and $tt.ReportFilenamePrefix) { $tt.ReportFilenamePrefix } else { 'SOC2-TypeTwo' }
     $cfgSnapshotDir = if ($tt -and $tt.SnapshotDirectory) { $tt.SnapshotDirectory } else { $SnapshotDirectory }
 
-    # Resolve period from SOC2.TypeTwoPeriod (top-level) � interactive prompt if missing
+    # Resolve period from SOC2.TypeTwoPeriod (top-level) -> interactive prompt if missing
     $startDate = $null
     $endDate = $null
     if ($soc2Cfg -and $soc2Cfg.TypeTwoPeriod) {
@@ -1827,23 +1845,142 @@ function Export-AssessmentResult {
         Export-PurviewComplianceReport -OutputDirectory $reportDir -TenantName $TenantName
     }
     
-    # Generate unified report if requested
+    # Privileged Identity Roster — runs BEFORE the unified report so the
+    # roster can be passed into the renderer. JSON snapshots are also emitted
+    # so auditors get the standalone artefacts even when the full report
+    # pipeline is skipped or fails. (PRs 2/3/4/5 of the roster work.)
+    $script:UnifiedPrivilegedRoster = $null
+    if ($EmitPrivilegedRoster) {
+        # PR 2 — Active Directory roster
+        Write-Host "`n[+] Building privileged identity roster (AD)..." -ForegroundColor Cyan
+        $rosterModuleAD = Join-Path $script:ModulesPath "EntraChecks-PrivilegedIdentityAD.psm1"
+        $adRoster = $null
+        if (Test-Path $rosterModuleAD) {
+            try {
+                Import-Module $rosterModuleAD -Force -DisableNameChecking
+                $adRoster = Get-PrivilegedIdentityRosterAD
+                $rosterJson = Join-Path $reportDir 'PrivilegedIdentityRoster-AD.json'
+                $adRoster | ConvertTo-Json -Depth 6 | Out-File -FilePath $rosterJson -Encoding utf8
+                if ($adRoster.Available) {
+                    Write-Host "    [OK] AD roster: $($adRoster.Statistics.TotalPrincipals) principals · Tier 0=$($adRoster.Statistics.Tier0Count), Tier 1=$($adRoster.Statistics.Tier1Count) -> $rosterJson" -ForegroundColor Green
+                }
+                else {
+                    Write-Host "    [!] AD not available: $($adRoster.FailureReason)" -ForegroundColor Yellow
+                }
+            }
+            catch {
+                Write-Host "    [!] AD roster collection failed: $($_.Exception.Message)" -ForegroundColor Red
+            }
+        }
+        else {
+            Write-Host "    [!] EntraChecks-PrivilegedIdentityAD.psm1 not found" -ForegroundColor Yellow
+        }
+
+        # PR 3 — Entra ID / M365 roster
+        Write-Host "`n[+] Building privileged identity roster (Entra)..." -ForegroundColor Cyan
+        $rosterModuleEntra = Join-Path $script:ModulesPath "EntraChecks-PrivilegedIdentityEntra.psm1"
+        $entraRoster = $null
+        if (Test-Path $rosterModuleEntra) {
+            try {
+                Import-Module $rosterModuleEntra -Force -DisableNameChecking
+                $entraRoster = Get-PrivilegedIdentityRosterEntra
+                $rosterJson = Join-Path $reportDir 'PrivilegedIdentityRoster-Entra.json'
+                $entraRoster | ConvertTo-Json -Depth 6 | Out-File -FilePath $rosterJson -Encoding utf8
+                if ($entraRoster.Available) {
+                    $pimNote = if ($entraRoster.Statistics.PimAvailable) { 'PIM visible' } else { 'PIM not visible (P2 license required)' }
+                    Write-Host "    [OK] Entra roster: $($entraRoster.Statistics.TotalPrincipals) principals · Tier 0=$($entraRoster.Statistics.Tier0Count), Tier 1=$($entraRoster.Statistics.Tier1Count), Tier 2=$($entraRoster.Statistics.Tier2Count), SPs=$($entraRoster.Statistics.ServicePrincipalCount) · $pimNote -> $rosterJson" -ForegroundColor Green
+                }
+                else {
+                    Write-Host "    [!] Entra not available: $($entraRoster.FailureReason)" -ForegroundColor Yellow
+                }
+            }
+            catch {
+                Write-Host "    [!] Entra roster collection failed: $($_.Exception.Message)" -ForegroundColor Red
+            }
+        }
+        else {
+            Write-Host "    [!] EntraChecks-PrivilegedIdentityEntra.psm1 not found" -ForegroundColor Yellow
+        }
+
+        # PR 4 — cross-surface correlation. Runs whenever both rosters returned
+        # something; emits unified JSON + findings even when one side is empty.
+        if ($adRoster -or $entraRoster) {
+            Write-Host "`n[+] Correlating AD <-> Entra privileged identities..." -ForegroundColor Cyan
+            $correlatorModule = Join-Path $script:ModulesPath "EntraChecks-PrivilegedIdentityCorrelator.psm1"
+            if (Test-Path $correlatorModule) {
+                try {
+                    Import-Module $correlatorModule -Force -DisableNameChecking
+                    $mergeArgs = @{
+                        AdRoster = if ($adRoster) { $adRoster } else { @{ Available = $false; Roster = @() } }
+                        EntraRoster = if ($entraRoster) { $entraRoster } else { @{ Available = $false; Roster = @() } }
+                    }
+                    if ($IdentityOverridesPath) { $mergeArgs['IdentityOverridesPath'] = $IdentityOverridesPath }
+                    $unified = Merge-PrivilegedIdentityRosters @mergeArgs
+
+                    $unifiedJson = Join-Path $reportDir 'PrivilegedIdentityRoster-Unified.json'
+                    $unified | ConvertTo-Json -Depth 7 | Out-File -FilePath $unifiedJson -Encoding utf8
+                    Write-Host "    [OK] Unified roster: $($unified.Statistics.Total) identities · CrossSurface=$($unified.Statistics.CrossSurface) · Tier0CrossSurface=$($unified.Statistics.Tier0CrossSurface) · Findings=$(@($unified.Findings).Count) -> $unifiedJson" -ForegroundColor Green
+
+                    foreach ($f in @($unified.Findings)) {
+                        $color = switch ($f.Severity) {
+                            'Critical' { 'Red' }
+                            'High' { 'Yellow' }
+                            default { 'Gray' }
+                        }
+                        Write-Host "      [$($f.Severity)] $($f.Object): $($f.Description)" -ForegroundColor $color
+                    }
+
+                    # Cache for the renderers (PR 5) so the unified report and
+                    # the comprehensive Excel report can show the roster.
+                    $script:UnifiedPrivilegedRoster = $unified
+
+                    # Surface correlator findings in the standard finding stream
+                    # so they appear alongside the rest of the report's findings.
+                    if (Get-Command Add-Finding -ErrorAction SilentlyContinue) {
+                        foreach ($f in @($unified.Findings)) {
+                            $status = switch ($f.Severity) {
+                                'Critical' { 'FAIL' }
+                                'High' { 'FAIL' }
+                                'Medium' { 'WARNING' }
+                                default { 'INFO' }
+                            }
+                            Add-Finding -Status $status -Object $f.Object -Description $f.Description -Remediation 'See Privileged Identity Roster section.' -Source 'Internal'
+                        }
+                    }
+                }
+                catch {
+                    Write-Host "    [!] Correlation failed: $($_.Exception.Message)" -ForegroundColor Red
+                }
+            }
+            else {
+                Write-Host "    [!] EntraChecks-PrivilegedIdentityCorrelator.psm1 not found" -ForegroundColor Yellow
+            }
+        }
+    }
+
+    # Generate unified report if requested. Runs AFTER the roster collection
+    # above so the renderer can include the Privileged Identity Roster section.
     if ($IncludeUnified) {
         $compModule = Join-Path $script:ModulesPath "EntraChecks-Compliance.psm1"
         if (Test-Path $compModule) {
             Import-Module $compModule -Force
-            Export-UnifiedComplianceReport `
-                -OutputDirectory $reportDir `
-                -TenantName $TenantName `
-                -Findings $script:Findings `
-                -IncludeSecureScore:($null -ne $script:SecureScoreData) `
-                -IncludeDefenderCompliance:($null -ne $script:DefenderComplianceData) `
-                -IncludeAzurePolicy:($null -ne $script:AzurePolicyData) `
-                -IncludePurviewCompliance:($null -ne $script:PurviewComplianceData) `
-                -SecureScoreData $script:SecureScoreData `
-                -DefenderComplianceData $script:DefenderComplianceData `
-                -AzurePolicyData $script:AzurePolicyData `
-                -PurviewComplianceData $script:PurviewComplianceData
+            $unifiedArgs = @{
+                OutputDirectory = $reportDir
+                TenantName = $TenantName
+                Findings = $script:Findings
+                IncludeSecureScore = ($null -ne $script:SecureScoreData)
+                IncludeDefenderCompliance = ($null -ne $script:DefenderComplianceData)
+                IncludeAzurePolicy = ($null -ne $script:AzurePolicyData)
+                IncludePurviewCompliance = ($null -ne $script:PurviewComplianceData)
+                SecureScoreData = $script:SecureScoreData
+                DefenderComplianceData = $script:DefenderComplianceData
+                AzurePolicyData = $script:AzurePolicyData
+                PurviewComplianceData = $script:PurviewComplianceData
+            }
+            if ($script:UnifiedPrivilegedRoster) {
+                $unifiedArgs['PrivilegedIdentityRoster'] = $script:UnifiedPrivilegedRoster
+            }
+            Export-UnifiedComplianceReport @unifiedArgs
         }
     }
 
@@ -1862,6 +1999,7 @@ function Export-AssessmentResult {
                     AzurePolicy = $script:AzurePolicyData
                     PurviewCompliance = $script:PurviewComplianceData
                     HybridCorrelation = $script:HybridCorrelationData
+                    PrivilegedIdentityRoster = $script:UnifiedPrivilegedRoster
                 }
 
                 # Include assessment errors in external data for the report
