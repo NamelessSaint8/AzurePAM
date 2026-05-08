@@ -229,6 +229,7 @@ $html = @"
         .metric-card.high { border-left-color: #ff8c00; }
         .metric-card.medium { border-left-color: #ffc83d; }
         .metric-card.low { border-left-color: #107c10; }
+        .metric-card.review { border-left-color: #5c2d91; }
 
         .metric-value {
             font-size: 32px;
@@ -430,6 +431,10 @@ $html += @"
                 <div class="metric-card low">
                     <div class="metric-value">$($RiskSummary.LowCount)</div>
                     <div class="metric-label">Low Risk</div>
+                </div>
+                <div class="metric-card review">
+                    <div class="metric-value">$(if ($null -ne $RiskSummary.ReviewCount) { $RiskSummary.ReviewCount } else { 0 })</div>
+                    <div class="metric-label">To Review</div>
                 </div>
             </div>
         </div>

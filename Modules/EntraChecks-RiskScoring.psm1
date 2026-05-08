@@ -286,8 +286,17 @@ function Add-RiskScoring {
         # Calculate risk score
         $riskScore = Measure-RiskScore -Finding $Finding
 
-        # Determine risk level
-        $riskLevel = Get-RiskLevel -RiskScore $riskScore
+        # Determine risk level. REVIEW-status findings are human-judgment items
+        # that don't fit on the severity axis — override to 'Review' so they
+        # land in the Review Queue rather than the severity-banded triage list.
+        # RiskScore is left intact so the queue can be sorted by underlying
+        # risk magnitude.
+        $riskLevel = if ($Finding.Status -eq 'REVIEW') {
+            'Review'
+        }
+        else {
+            Get-RiskLevel -RiskScore $riskScore
+        }
 
         # Get remediation effort
         $findingType = if ($null -ne $Finding.Type) { $Finding.Type } elseif ($null -ne $Finding.CheckType) { $Finding.CheckType } elseif ($null -ne $Finding.Category) { $Finding.Category } else { 'Default' }
@@ -373,6 +382,9 @@ function Get-PrioritizedFindings {
                 })
             'Priority 5 - Low Risk' = @($scoredFindings | Where-Object {
                     $_.RiskLevel -eq 'Low' -or $_.RiskLevel -eq 'Info'
+                })
+            'Priority 6 - Review Queue' = @($scoredFindings | Where-Object {
+                    $_.RiskLevel -eq 'Review'
                 })
         }
 
@@ -477,6 +489,8 @@ function Get-RiskSummary {
         MediumCount = @($scoredFindings | Where-Object { $_.RiskLevel -eq 'Medium' }).Count
         LowCount = @($scoredFindings | Where-Object { $_.RiskLevel -eq 'Low' }).Count
         InfoCount = @($scoredFindings | Where-Object { $_.RiskLevel -eq 'Info' }).Count
+        # REVIEW = human-judgment items, separate from severity bands
+        ReviewCount = @($scoredFindings | Where-Object { $_.RiskLevel -eq 'Review' }).Count
 
         # Remediation effort
         QuickWinsCount = @($scoredFindings | Where-Object { $_.RemediationEffort -le 3 }).Count
@@ -492,6 +506,7 @@ function Get-RiskSummary {
     $summary['HighPercent'] = [Math]::Round(($summary.HighCount / $total) * 100, 1)
     $summary['MediumPercent'] = [Math]::Round(($summary.MediumCount / $total) * 100, 1)
     $summary['LowPercent'] = [Math]::Round(($summary.LowCount / $total) * 100, 1)
+    $summary['ReviewPercent'] = [Math]::Round(($summary.ReviewCount / $total) * 100, 1)
 
     return $summary
 }

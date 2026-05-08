@@ -503,7 +503,11 @@ $script:TenantCapabilities = @{
 function Add-Finding {
     param(
         [Parameter(Mandatory)]
-        [ValidateSet("OK", "INFO", "WARNING", "FAIL")]
+        # REVIEW = human-judgment item. Distinct from WARNING (clear-policy
+        # violation) and INFO (advisory). Surfaces in the Review Queue
+        # section, not the main Findings list. RiskScore is still computed;
+        # only the RiskLevel band is overridden to 'Review'.
+        [ValidateSet("OK", "INFO", "WARNING", "FAIL", "REVIEW")]
         [string]$Status,
 
         [Parameter(Mandatory)]
@@ -569,6 +573,7 @@ function Add-Finding {
     $logLevel = switch ($Status) {
         "OK" { "INFO" }
         "INFO" { "INFO" }
+        "REVIEW" { "INFO" }
         "WARNING" { "WARN" }
         "FAIL" { "ERROR" }
     }
@@ -591,6 +596,7 @@ function Add-Finding {
     $color = switch ($Status) {
         "OK" { "Green" }
         "INFO" { "Cyan" }
+        "REVIEW" { "Magenta" }
         "WARNING" { "Yellow" }
         "FAIL" { "Red" }
     }
@@ -1123,7 +1129,7 @@ function Test-DirectoryRolesAndMembers {
                             }
                         }
                         "servicePrincipal" {
-                            Add-Finding -Status "WARNING" `
+                            Add-Finding -Status "REVIEW" `
                                 -Object "$($member.displayName) ($($role.displayName))" `
                                 -Description "Service principal '$($member.displayName)' has privileged directory role '$($role.displayName)'. Applications with admin roles should be carefully reviewed." `
                                 -Remediation "Review if this service principal truly requires this role. Consider using more granular app permissions instead of directory roles."
@@ -1444,7 +1450,7 @@ function Test-UserAccountsAndInactivity {
                     $inactiveCount++
                     $daysSinceSignIn = [math]::Round(($now - $lastSignIn).TotalDays, 0)
                     
-                    Add-Finding -Status "WARNING" `
+                    Add-Finding -Status "REVIEW" `
                         -Object $user.userPrincipalName `
                         -Description "User account inactive for $daysSinceSignIn days (last sign-in: $($lastSignIn.ToString('yyyy-MM-dd'))). Threshold: $inactiveDays days." `
                         -Remediation "Review this account. Consider disabling if no longer needed, or verify the user still requires access."
@@ -1456,7 +1462,7 @@ function Test-UserAccountsAndInactivity {
                         $inactiveCount++
                         $daysSinceCreated = [math]::Round(($now - $createdDate).TotalDays, 0)
                         
-                        Add-Finding -Status "WARNING" `
+                        Add-Finding -Status "REVIEW" `
                             -Object $user.userPrincipalName `
                             -Description "User account created $daysSinceCreated days ago but has NEVER signed in." `
                             -Remediation "Investigate why this account exists but has never been used. Consider disabling or removing."
@@ -1962,7 +1968,7 @@ function Test-RoleAssignableGroupOwnership {
                         $ownerList += "$ownerName [User]"
                     }
                     "servicePrincipal" {
-                        Add-Finding -Status "WARNING" `
+                        Add-Finding -Status "REVIEW" `
                             -Object "$($owner.displayName) (Owner of $($group.displayName))" `
                             -Description "Service principal '$($owner.displayName)' is an owner of role-assignable group '$($group.displayName)'. This could be a persistence mechanism." `
                             -Remediation "Review if this service principal should own a role-assignable group. Remove if not explicitly required."
@@ -2096,7 +2102,7 @@ function Test-ApplicationCredentials {
                         elseif ($endDate -gt $longLivedThreshold) {
                             $longLivedCreds++
                             $yearsValid = [math]::Round(($endDate - $now).TotalDays / 365, 1)
-                            Add-Finding -Status "WARNING" `
+                            Add-Finding -Status "REVIEW" `
                                 -Object "$($app.displayName) (Secret: $credName)" `
                                 -Description "Application '$($app.displayName)' has long-lived password credential '$credName' valid for $yearsValid more years (expires: $($endDate.ToString('yyyy-MM-dd'))). Long-lived secrets increase risk." `
                                 -Remediation "Consider shorter credential lifetimes (1 year max recommended) or migrate to certificate-based authentication."
@@ -2106,7 +2112,7 @@ function Test-ApplicationCredentials {
                 
                 # Multiple password credentials warning
                 if ($app.passwordCredentials.Count -gt 2) {
-                    Add-Finding -Status "WARNING" `
+                    Add-Finding -Status "REVIEW" `
                         -Object "$($app.displayName)" `
                         -Description "Application '$($app.displayName)' has $($app.passwordCredentials.Count) password credentials. Multiple credentials may indicate poor rotation practices." `
                         -Remediation "Review credential usage and remove unused credentials. Implement proper credential rotation."
@@ -2512,7 +2518,7 @@ function Test-OAuthConsentGrants {
                 $highRiskGrants++
                 $consentType = if ($isAdminConsent) { "Admin consent (ALL USERS)" } else { "User consent" }
                 
-                Add-Finding -Status "WARNING" `
+                Add-Finding -Status "REVIEW" `
                     -Object "$clientName" `
                     -Description "Application '$clientName' has $consentType for high-risk scopes: $($riskyScopes -join ', '). These permissions allow broad data access." `
                     -Remediation "Review if this application requires these permissions. Consider revoking and re-granting with minimal scopes."
@@ -2526,7 +2532,7 @@ function Test-OAuthConsentGrants {
                 if ($sp.appOwnerOrganizationId -and $sp.appOwnerOrganizationId -ne $tenantId) {
                     # This is a third-party app with admin consent
                     if ($scopes.Count -gt 5) {
-                        Add-Finding -Status "WARNING" `
+                        Add-Finding -Status "REVIEW" `
                             -Object "$clientName (Third-Party)" `
                             -Description "Third-party application '$clientName' has admin consent for $($scopes.Count) permissions: $($grant.scope). Large permission grants to external apps increase risk." `
                             -Remediation "Review all permissions granted to this third-party application. Apply principle of least privilege."
@@ -2656,7 +2662,7 @@ function Test-AppRoleAssignments {
                     -Remediation "Verify this application absolutely requires these permissions. Consider using more granular permissions if possible."
             }
             elseif ($app.Permissions.Count -gt 10) {
-                Add-Finding -Status "WARNING" `
+                Add-Finding -Status "REVIEW" `
                     -Object $app.Name `
                     -Description "Application '$($app.Name)' has $($app.Permissions.Count) Microsoft Graph permissions. Large permission grants may indicate over-privileged configuration." `
                     -Remediation "Review all permissions and remove any that are not actively required."
@@ -4228,7 +4234,7 @@ function Test-DirectoryRoleAssignmentPaths {
                 $stats = $roleStats[$role]
                 
                 if ($stats.Total -gt 5) {
-                    Add-Finding -Status "WARNING" `
+                    Add-Finding -Status "REVIEW" `
                         -Object "Role: $role" `
                         -Description "$role has $($stats.Total) assignments (Users: $($stats.Users), Groups: $($stats.Groups), SPs: $($stats.ServicePrincipals)). High-risk roles should have minimal assignments." `
                         -Remediation "Review all $role assignments. Consider using PIM for just-in-time access instead of permanent assignments."
@@ -4242,7 +4248,7 @@ function Test-DirectoryRoleAssignmentPaths {
                 
                 # Flag if service principals have high-risk roles
                 if ($stats.ServicePrincipals -gt 0) {
-                    Add-Finding -Status "WARNING" `
+                    Add-Finding -Status "REVIEW" `
                         -Object "Role: $role (Service Principals)" `
                         -Description "$($stats.ServicePrincipals) service principal(s) have the $role role. Applications with admin roles are high risk." `
                         -Remediation "Review if these applications truly require $role. Consider using more granular application permissions."
@@ -4349,7 +4355,7 @@ function Test-NamedLocation {
                         }
                         
                         if ($broadRanges.Count -gt 0 -and $isTrusted) {
-                            Add-Finding -Status "WARNING" `
+                            Add-Finding -Status "REVIEW" `
                                 -Object "Location: $($location.displayName)" `
                                 -Description "Trusted IP location '$($location.displayName)' contains overly broad IP ranges: $($broadRanges -join ', '). Broad trusted ranges may include untrusted networks." `
                                 -Remediation "Review and narrow the IP ranges in this trusted location. Use specific corporate IP ranges rather than broad CIDR blocks."
@@ -4377,7 +4383,7 @@ function Test-NamedLocation {
                         -Remediation "Review country list periodically. Consider blocking high-risk countries in Conditional Access."
                     
                     if ($includeUnknown -and $isTrusted) {
-                        Add-Finding -Status "WARNING" `
+                        Add-Finding -Status "REVIEW" `
                             -Object "Location: $($location.displayName)" `
                             -Description "Trusted country location '$($location.displayName)' includes unknown countries/regions. This could allow access from unexpected locations." `
                             -Remediation "Consider not trusting locations that include unknown countries/regions."

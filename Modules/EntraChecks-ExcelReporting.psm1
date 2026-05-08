@@ -181,6 +181,7 @@ function New-ExcelWorkbook {
         [PSCustomObject]@{Metric = 'High Risk Findings'; Value = $riskSummary.HighCount; Details = "$($riskSummary.HighPercent)%" }
         [PSCustomObject]@{Metric = 'Medium Risk Findings'; Value = $riskSummary.MediumCount; Details = "$($riskSummary.MediumPercent)%" }
         [PSCustomObject]@{Metric = 'Low Risk Findings'; Value = $riskSummary.LowCount; Details = "$($riskSummary.LowPercent)%" }
+        [PSCustomObject]@{Metric = 'Items to Review'; Value = $riskSummary.ReviewCount; Details = "$($riskSummary.ReviewPercent)% (require human judgment)" }
         [PSCustomObject]@{Metric = 'Average Risk Score'; Value = $riskSummary.AverageRiskScore; Details = 'Out of 100' }
         [PSCustomObject]@{Metric = 'Max Risk Score'; Value = $riskSummary.MaxRiskScore; Details = 'Out of 100' }
         [PSCustomObject]@{Metric = 'Quick Wins Available'; Value = $riskSummary.QuickWinsCount; Details = 'High impact, low effort' }
@@ -209,7 +210,17 @@ function New-ExcelWorkbook {
     @{N = 'Compliance Frameworks'; E = { $_.ComplianceReference } },
     @{N = 'Source'; E = { if ($_.Source) { $_.Source } else { 'Internal' } } }
 
-    $allFindingsExport | Export-Excel -Path $OutputPath -WorksheetName 'All Findings' -AutoSize -BoldTopRow -FreezeTopRow -AutoFilter
+    # Conditional formatting on the Status column so the workbook is
+    # navigable at a glance. REVIEW gets purple to keep the human-judgment
+    # category visually distinct from the severity colors.
+    $statusConditional = @(
+        New-ConditionalText -Text 'FAIL' -ConditionalTextColor White -BackgroundColor 'Red'
+        New-ConditionalText -Text 'WARNING' -ConditionalTextColor Black -BackgroundColor 'Yellow'
+        New-ConditionalText -Text 'REVIEW' -ConditionalTextColor White -BackgroundColor '#5c2d91'
+        New-ConditionalText -Text 'OK' -ConditionalTextColor White -BackgroundColor 'Green'
+        New-ConditionalText -Text 'INFO' -ConditionalTextColor White -BackgroundColor '#0078d4'
+    )
+    $allFindingsExport | Export-Excel -Path $OutputPath -WorksheetName 'All Findings' -AutoSize -BoldTopRow -FreezeTopRow -AutoFilter -ConditionalText $statusConditional
 
     # 3. Priority Findings Sheet
     Write-Verbose "Creating Priority Findings sheet..."
@@ -312,6 +323,7 @@ function New-ExcelWorkbook {
         [PSCustomObject]@{Category = 'Risk Distribution'; Metric = 'High'; Count = $riskSummary.HighCount; Percentage = "$($riskSummary.HighPercent)%" }
         [PSCustomObject]@{Category = 'Risk Distribution'; Metric = 'Medium'; Count = $riskSummary.MediumCount; Percentage = "$($riskSummary.MediumPercent)%" }
         [PSCustomObject]@{Category = 'Risk Distribution'; Metric = 'Low'; Count = $riskSummary.LowCount; Percentage = "$($riskSummary.LowPercent)%" }
+        [PSCustomObject]@{Category = 'Risk Distribution'; Metric = 'Review'; Count = $riskSummary.ReviewCount; Percentage = "$($riskSummary.ReviewPercent)%" }
         [PSCustomObject]@{Category = ''; Metric = ''; Count = ''; Percentage = '' }
         [PSCustomObject]@{Category = 'Risk Scores'; Metric = 'Average'; Count = $riskSummary.AverageRiskScore; Percentage = 'Out of 100' }
         [PSCustomObject]@{Category = 'Risk Scores'; Metric = 'Maximum'; Count = $riskSummary.MaxRiskScore; Percentage = 'Out of 100' }
@@ -607,6 +619,7 @@ function New-CSVWorkbook {
         [PSCustomObject]@{Metric = 'High Risk Findings'; Value = $riskSummary.HighCount; Details = "$($riskSummary.HighPercent)%" }
         [PSCustomObject]@{Metric = 'Medium Risk Findings'; Value = $riskSummary.MediumCount; Details = "$($riskSummary.MediumPercent)%" }
         [PSCustomObject]@{Metric = 'Low Risk Findings'; Value = $riskSummary.LowCount; Details = "$($riskSummary.LowPercent)%" }
+        [PSCustomObject]@{Metric = 'Items to Review'; Value = $riskSummary.ReviewCount; Details = "$($riskSummary.ReviewPercent)% (require human judgment)" }
         [PSCustomObject]@{Metric = 'Average Risk Score'; Value = $riskSummary.AverageRiskScore; Details = 'Out of 100' }
         [PSCustomObject]@{Metric = 'Max Risk Score'; Value = $riskSummary.MaxRiskScore; Details = 'Out of 100' }
         [PSCustomObject]@{Metric = 'Quick Wins Available'; Value = $riskSummary.QuickWinsCount; Details = 'High impact, low effort' }

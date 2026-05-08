@@ -108,7 +108,8 @@ function Add-ModuleFinding {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
-        [ValidateSet("OK", "INFO", "WARNING", "FAIL")]
+        # See Add-Finding for the REVIEW semantics — keep these two in sync.
+        [ValidateSet("OK", "INFO", "WARNING", "FAIL", "REVIEW")]
         [string]$Status,
         
         [Parameter(Mandatory)]
@@ -141,6 +142,7 @@ function Add-ModuleFinding {
         $color = switch ($Status) {
             "OK" { "Green" }
             "INFO" { "Cyan" }
+            "REVIEW" { "Magenta" }
             "WARNING" { "Yellow" }
             "FAIL" { "Red" }
         }
@@ -291,7 +293,7 @@ function Test-RiskyUsers {
         foreach ($user in $mediumRisk) {
             $riskDetail = if ($user.riskDetail) { $user.riskDetail } else { "Not specified" }
             
-            Add-ModuleFinding -Status "WARNING" `
+            Add-ModuleFinding -Status "REVIEW" `
                 -Object $user.userPrincipalName `
                 -Description "MEDIUM RISK user detected. Risk state: $($user.riskState). Risk detail: $riskDetail." `
                 -Remediation "Investigate this user. Consider requiring password reset or additional authentication verification."
@@ -324,7 +326,7 @@ function Test-RiskyUsers {
         }
         
         if ($staleRisks.Count -gt 0) {
-            Add-ModuleFinding -Status "WARNING" `
+            Add-ModuleFinding -Status "REVIEW" `
                 -Object "Stale Risk Detections" `
                 -Description "$($staleRisks.Count) users have been at risk for over 30 days without remediation or dismissal." `
                 -Remediation "Review stale risks. Either remediate (password reset) or dismiss if investigated and determined to be false positive."
@@ -429,9 +431,9 @@ function Test-RiskySignIns {
             }
         }
         
-        # Medium risk detections - WARNING
+        # Medium risk detections - REVIEW (per-detection investigation needed)
         if ($mediumRiskDetections.Count -gt 0) {
-            Add-ModuleFinding -Status "WARNING" `
+            Add-ModuleFinding -Status "REVIEW" `
                 -Object "Medium Risk Sign-Ins" `
                 -Description "$($mediumRiskDetections.Count) medium risk sign-in(s) detected in the past 7 days." `
                 -Remediation "Review medium-risk sign-ins. Consider requiring MFA or password reset for affected users."
@@ -478,7 +480,7 @@ function Test-RiskySignIns {
         $impossibleTravel = $riskDetections | Where-Object { $_.riskEventType -eq "impossibleTravel" }
         
         if ($impossibleTravel.Count -gt 0) {
-            Add-ModuleFinding -Status "WARNING" `
+            Add-ModuleFinding -Status "REVIEW" `
                 -Object "Impossible Travel Detections" `
                 -Description "$($impossibleTravel.Count) impossible travel detection(s). Users appear to be signing in from geographically distant locations in short time periods." `
                 -Remediation "Review each detection. Some may be VPN usage or legitimate travel. Others may indicate credential sharing or compromise."
@@ -846,7 +848,7 @@ function Test-RiskDetections {
         }
         
         if ($unexpectedCountries.Count -gt 0) {
-            Add-ModuleFinding -Status "WARNING" `
+            Add-ModuleFinding -Status "REVIEW" `
                 -Object "Unexpected Geographic Activity" `
                 -Description "Risk detections from unexpected countries: $($unexpectedCountries -join ', '). This may indicate credential abuse from foreign locations." `
                 -Remediation "Review if these countries are expected for your organization. Consider blocking authentication from unexpected regions."
@@ -918,7 +920,7 @@ function Test-RiskDetections {
                 $changePercent = [math]::Round((($currentCount - $previousCount) / $previousCount) * 100, 0)
                 
                 if ($changePercent -gt 50) {
-                    Add-ModuleFinding -Status "WARNING" `
+                    Add-ModuleFinding -Status "REVIEW" `
                         -Object "Risk Detection Trend" `
                         -Description "Risk detections increased by $changePercent% compared to previous 30 days (from $previousCount to $currentCount). This may indicate increased targeting." `
                         -Remediation "Investigate the increase. Review if new attack campaigns are targeting your organization."

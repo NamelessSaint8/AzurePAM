@@ -419,6 +419,10 @@ function Get-HTMLHead {
         border-left-color: #107c10;
     }
 
+    .metric-card.review {
+        border-left-color: #5c2d91;
+    }
+
     .metric-value {
         font-size: 2.5em;
         font-weight: bold;
@@ -464,6 +468,13 @@ function Get-HTMLHead {
 
     .risk-badge.info {
         background: #0078d4;
+        color: white;
+    }
+
+    /* REVIEW = human-judgment item, not a severity band. Purple keeps it
+       visually distinct from the warning/severity palette (yellow/red/green). */
+    .risk-badge.review {
+        background: #5c2d91;
         color: white;
     }
 
@@ -1528,6 +1539,7 @@ function Get-EntraChecksExecutiveDigest {
 
     $crit = if ($null -ne $RiskSummary.CriticalCount) { [int]$RiskSummary.CriticalCount } else { 0 }
     $high = if ($null -ne $RiskSummary.HighCount) { [int]$RiskSummary.HighCount } else { 0 }
+    $review = if ($null -ne $RiskSummary.ReviewCount) { [int]$RiskSummary.ReviewCount } else { 0 }
     $quickWins = if ($null -ne $RiskSummary.QuickWinsCount) { [int]$RiskSummary.QuickWinsCount } else { 0 }
     $total = $Findings.Count
 
@@ -1572,6 +1584,7 @@ function Get-EntraChecksExecutiveDigest {
         TotalFindings = $total
         CriticalCount = $crit
         HighCount = $high
+        ReviewCount = $review
         QuickWinsCount = $quickWins
         TopFindings = $topFindings
         FrameworkGaps = $frameworkGaps
@@ -1618,7 +1631,7 @@ function Format-ExecutiveDigest {
     return @"
 <section class="exec-digest" id="exec-digest">
     <h2>&#128202; Executive Digest</h2>
-    <p class="verdict-line"><strong>Posture:</strong>$verdictHtml &mdash; $($Digest.TotalFindings) findings total ($($Digest.CriticalCount) critical, $($Digest.HighCount) high). $($Digest.QuickWinsCount) quick wins available.</p>
+    <p class="verdict-line"><strong>Posture:</strong>$verdictHtml &mdash; $($Digest.TotalFindings) findings total ($($Digest.CriticalCount) critical, $($Digest.HighCount) high, $($Digest.ReviewCount) to review). $($Digest.QuickWinsCount) quick wins available.</p>
     $deltaLine
     $topRows
     $gapLine
@@ -1884,6 +1897,12 @@ function Get-ExecutiveDashboard {
             <div class="metric-label">Quick Wins Available</div>
             <div class="metric-value">$($RiskSummary.QuickWinsCount)</div>
             <div>High impact, low effort</div>
+        </div>
+
+        <div class="metric-card review">
+            <div class="metric-label">Items to Review</div>
+            <div class="metric-value">$(if ($null -ne $RiskSummary.ReviewCount) { $RiskSummary.ReviewCount } else { 0 })</div>
+            <div>Require human judgment</div>
         </div>
     </div>
     $deltaRow
@@ -2348,7 +2367,9 @@ function Get-DetailedFindingsSection {
 
     # Build category accordions
     $categoryAccordions = ""
-    $statusOrder = @('FAIL', 'WARNING', 'INFO', 'OK')
+    # REVIEW sits between WARNING and INFO — visible above advisory items but
+    # below the broken-state findings that demand action.
+    $statusOrder = @('FAIL', 'WARNING', 'REVIEW', 'INFO', 'OK')
 
     foreach ($catGroup in $categoryGroups) {
         $catName = $catGroup.Name

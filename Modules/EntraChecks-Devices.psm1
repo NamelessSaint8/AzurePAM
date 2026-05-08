@@ -312,7 +312,7 @@ function Test-DeviceOverview {
         $nonCompliant = $devices | Where-Object { $_.isCompliant -eq $false }
         
         if ($nonCompliant.Count -gt 0) {
-            Add-ModuleFinding -Status "WARNING" `
+            Add-ModuleFinding -Status "REVIEW" `
                 -Object "Non-Compliant Devices" `
                 -Description "$($nonCompliant.Count) devices are marked as non-compliant. These devices may not meet security requirements." `
                 -Remediation "Review non-compliant devices in Intune. Identify compliance failures and remediate or block access."
@@ -470,7 +470,7 @@ function Test-StaleDevices {
             $staleByOS = $stale | Group-Object -Property operatingSystem | Sort-Object Count -Descending
             $osSummary = ($staleByOS | ForEach-Object { "$($_.Name): $($_.Count)" }) -join ", "
             
-            Add-ModuleFinding -Status "WARNING" `
+            Add-ModuleFinding -Status "REVIEW" `
                 -Object "Stale Devices ($($script:StaleDeviceThresholdDays)-$($script:CriticalStaleDeviceThresholdDays) days)" `
                 -Description "$($stale.Count) devices haven't signed in for $script:StaleDeviceThresholdDays-$script:CriticalStaleDeviceThresholdDays days. By OS: $osSummary." `
                 -Remediation "Review these devices. They may be seasonal users, on leave, or decommissioned. Plan for cleanup if not reactivated."
@@ -484,7 +484,7 @@ function Test-StaleDevices {
             }
             
             if ($oldNeverSignedIn.Count -gt 0) {
-                Add-ModuleFinding -Status "WARNING" `
+                Add-ModuleFinding -Status "REVIEW" `
                     -Object "Never Signed In Devices" `
                     -Description "$($oldNeverSignedIn.Count) devices were registered over $script:StaleDeviceThresholdDays days ago but have never signed in." `
                     -Remediation "These may be test devices, failed enrollments, or abandoned registrations. Review and remove if not needed."
@@ -650,7 +650,7 @@ function Test-DeviceComplianceStatus {
         
         # Devices with conflicts
         if ($conflict.Count -gt 0) {
-            Add-ModuleFinding -Status "WARNING" `
+            Add-ModuleFinding -Status "REVIEW" `
                 -Object "Compliance Policy Conflicts" `
                 -Description "$($conflict.Count) devices have conflicting compliance policies." `
                 -Remediation "Review policy assignments in Intune. Conflicting settings between policies can cause unexpected behavior."
@@ -664,7 +664,7 @@ function Test-DeviceComplianceStatus {
         }
         
         if ($notSynced.Count -gt 0) {
-            Add-ModuleFinding -Status "WARNING" `
+            Add-ModuleFinding -Status "REVIEW" `
                 -Object "Devices Not Syncing" `
                 -Description "$($notSynced.Count) devices haven't synced with Intune in over 7 days. Compliance status may be outdated." `
                 -Remediation "Investigate why devices aren't syncing. May indicate network issues, device problems, or users avoiding compliance."
@@ -1072,7 +1072,7 @@ function Test-DeviceRegistrationPolicy {
         $azureADJoinAppliesTo = $azureADJoinSetting.appliesTo
         
         if ($azureADJoinAllowed -and $azureADJoinAppliesTo -eq "all") {
-            Add-ModuleFinding -Status "WARNING" `
+            Add-ModuleFinding -Status "REVIEW" `
                 -Object "Azure AD Join - All Users" `
                 -Description "All users are allowed to join devices to Azure AD. This includes personal devices that could be joined to the corporate directory." `
                 -Remediation "Consider restricting Azure AD Join to specific groups (IT admins, specific user groups) to control which devices join your directory."
@@ -1129,7 +1129,7 @@ function Test-DeviceRegistrationPolicy {
         
         if ($userDeviceQuota -and $userDeviceQuota -gt 0) {
             if ($userDeviceQuota -gt 20) {
-                Add-ModuleFinding -Status "WARNING" `
+                Add-ModuleFinding -Status "REVIEW" `
                     -Object "Device Limit Per User" `
                     -Description "Users can register up to $userDeviceQuota devices. A high limit increases risk of device sprawl." `
                     -Remediation "Consider reducing the device limit. Most users need 3-5 devices maximum (laptop, phone, tablet)."

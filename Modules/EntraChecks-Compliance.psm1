@@ -2690,6 +2690,7 @@ $(if (Get-Command Get-PrivilegedIdentityRosterCss -ErrorAction SilentlyContinue)
     # Findings Summary Dashboard
     $fFailCount = @($Findings | Where-Object { $_.Status -eq 'FAIL' }).Count
     $fWarnCount = @($Findings | Where-Object { $_.Status -eq 'WARNING' }).Count
+    $fReviewCount = @($Findings | Where-Object { $_.Status -eq 'REVIEW' }).Count
     $fOkCount = @($Findings | Where-Object { $_.Status -eq 'OK' }).Count
     $fInfoCount = @($Findings | Where-Object { $_.Status -eq 'INFO' }).Count
 
@@ -2706,6 +2707,11 @@ $(if (Get-Command Get-PrivilegedIdentityRosterCss -ErrorAction SilentlyContinue)
                 <div class="source">Recommended improvements</div>
                 <div class="framework-score warn">$fWarnCount</div>
             </div>
+            <div class="framework-card" style="border-top-color: var(--purple);">
+                <h3>To Review</h3>
+                <div class="source">Require human judgment</div>
+                <div class="framework-score" style="color: var(--purple);">$fReviewCount</div>
+            </div>
             <div class="framework-card" style="border-top-color: var(--success);">
                 <h3>Passed</h3>
                 <div class="source">Correctly configured</div>
@@ -2721,6 +2727,9 @@ $(if (Get-Command Get-PrivilegedIdentityRosterCss -ErrorAction SilentlyContinue)
 
     # All Assessment Findings — expandable rows. FAIL/WARNING findings expand
     # to show portal/PowerShell remediation pulled from EntraChecks-RemediationGuidance.
+    # REVIEW findings are rendered separately below in the Review Queue section
+    # (per Review-Status-Plan PR 4 — keeps the main table focused on broken-state
+    # items, gives auditor-judgment items their own home).
     if ($Findings -and $Findings.Count -gt 0) {
         # Enrich findings with detailed remediation guidance when the module is
         # available. Add-RemediationGuidance is idempotent — if a finding
@@ -2729,6 +2738,9 @@ $(if (Get-Command Get-PrivilegedIdentityRosterCss -ErrorAction SilentlyContinue)
             @($Findings | ForEach-Object { $_ | Add-RemediationGuidance })
         }
         else { @($Findings) }
+
+        $mainFindings = @($enrichedFindings | Where-Object { $_.Status -ne 'REVIEW' })
+        $reviewFindings = @($enrichedFindings | Where-Object { $_.Status -eq 'REVIEW' })
 
         $sourceClassMap = @{
             'Internal' = 'source-internal'
@@ -2745,30 +2757,14 @@ $(if (Get-Command Get-PrivilegedIdentityRosterCss -ErrorAction SilentlyContinue)
             'PurviewCompliance' = 'Purview'
         }
 
-        $html += @"
-
-        <h2 class="section-title">All Assessment Findings ($($enrichedFindings.Count))</h2>
-        <div class="uf-headers">
-            <div>Status</div>
-            <div>Check</div>
-            <div>Object</div>
-            <div>Source</div>
-            <div>Description</div>
-            <div>Remediation</div>
-            <div></div>
-        </div>
-        <div class="uf-findings-list">
-"@
-
-        $sortedFindings = $enrichedFindings | Sort-Object @{Expression = {
-                switch ($_.Status) { 'FAIL' { 0 } 'WARNING' { 1 } 'INFO' { 2 } 'OK' { 3 } default { 4 } }
-            }
-        }
-
-        foreach ($f in $sortedFindings) {
+        # Shared row renderer — used by both the main Findings table and the
+        # Review Queue. Captures the maps above via closure.
+        $renderFindingRow = {
+            param($f)
             $fStatusBadge = switch ($f.Status) {
                 'FAIL' { '<span class="badge badge-danger">FAIL</span>' }
                 'WARNING' { '<span class="badge badge-warning">WARNING</span>' }
+                'REVIEW' { '<span class="badge" style="background:var(--purple);color:white;">REVIEW</span>' }
                 'OK' { '<span class="badge badge-success">OK</span>' }
                 default { '<span class="badge" style="background:#e0e0e0;color:#333;">INFO</span>' }
             }
@@ -2783,14 +2779,9 @@ $(if (Get-Command Get-PrivilegedIdentityRosterCss -ErrorAction SilentlyContinue)
             $sourceLbl = if ($sourceLabelMap.ContainsKey($sourceKey)) { $sourceLabelMap[$sourceKey] } else { $sourceKey }
             $sourceBadgeHtml = "<a class=`"uf-source-link`" href=`"#data-source-$sourceKey`" title=`"Jump to $sourceLbl provenance card`"><span class=`"source-badge $sourceCss`">$sourceLbl</span></a>"
 
-            # Body is meaningful only for FAIL/WARNING; OK/INFO render a static
-            # row with no expand affordance to keep the list scannable.
-            $hasFlyout = ($f.Status -in @('FAIL', 'WARNING'))
+            $hasFlyout = ($f.Status -in @('FAIL', 'WARNING', 'REVIEW'))
             $caret = if ($hasFlyout) { '&#9660;' } else { '' }
-            $finOpen = '<details class="uf-finding">'
-            if (-not $hasFlyout) {
-                $finOpen = '<details class="uf-finding uf-finding-static">'
-            }
+            $finOpen = if ($hasFlyout) { '<details class="uf-finding">' } else { '<details class="uf-finding uf-finding-static">' }
 
             $bodyHtml = ''
             if ($hasFlyout) {
@@ -2851,7 +2842,7 @@ $(if (Get-Command Get-PrivilegedIdentityRosterCss -ErrorAction SilentlyContinue)
 "@
             }
 
-            $html += @"
+            return @"
         $finOpen
             <summary>
                 <div>$fStatusBadge</div>
@@ -2866,9 +2857,63 @@ $(if (Get-Command Get-PrivilegedIdentityRosterCss -ErrorAction SilentlyContinue)
         </details>
 "@
         }
-        $html += @"
+
+        if ($mainFindings.Count -gt 0) {
+            $html += @"
+
+        <h2 class="section-title">All Assessment Findings ($($mainFindings.Count))</h2>
+        <div class="uf-headers">
+            <div>Status</div>
+            <div>Check</div>
+            <div>Object</div>
+            <div>Source</div>
+            <div>Description</div>
+            <div>Remediation</div>
+            <div></div>
+        </div>
+        <div class="uf-findings-list">
+"@
+
+            $sortedFindings = $mainFindings | Sort-Object @{Expression = {
+                    switch ($_.Status) { 'FAIL' { 0 } 'WARNING' { 1 } 'INFO' { 3 } 'OK' { 4 } default { 5 } }
+                }
+            }
+
+            foreach ($f in $sortedFindings) {
+                $html += (& $renderFindingRow $f)
+            }
+            $html += @"
         </div>
 "@
+        }
+
+        # Review Queue — REVIEW findings sorted by RiskScore (descending). Same
+        # row renderer as the main table; distinct header band ties it visually
+        # to the purple "To Review" tile in the summary dashboard.
+        if ($reviewFindings.Count -gt 0) {
+            $html += @"
+
+        <h2 class="section-title" style="border-bottom-color: var(--purple);">Review Queue ($($reviewFindings.Count))</h2>
+        <p style="margin-bottom: 16px; color: var(--gray-600);">These findings need human judgment to determine if action is required &mdash; sorted by risk score.</p>
+        <div class="uf-headers">
+            <div>Status</div>
+            <div>Check</div>
+            <div>Object</div>
+            <div>Source</div>
+            <div>Description</div>
+            <div>Recommendation</div>
+            <div></div>
+        </div>
+        <div class="uf-findings-list">
+"@
+            $sortedReview = $reviewFindings | Sort-Object @{Expression = { if ($null -ne $_.RiskScore) { [int]$_.RiskScore } else { 0 } }; Descending = $true }
+            foreach ($f in $sortedReview) {
+                $html += (& $renderFindingRow $f)
+            }
+            $html += @"
+        </div>
+"@
+        }
     }
 
     # Privileged Identity Roster — rendered between Findings and Compliance Overview.

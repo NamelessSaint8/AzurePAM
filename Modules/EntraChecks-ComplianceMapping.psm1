@@ -831,6 +831,7 @@ function Get-ComplianceGapReport {
     $gapReport = @{
         TotalFindings = $Findings.Count
         FailedFindings = @($Findings | Where-Object { $_.Status -eq 'FAIL' -or $_.Status -eq 'WARNING' }).Count
+        ManualReviewFindings = @($Findings | Where-Object { $_.Status -eq 'REVIEW' }).Count
         FrameworkGaps = @{}
     }
 
@@ -839,45 +840,50 @@ function Get-ComplianceGapReport {
 
     foreach ($fw in $frameworks) {
         $controlsAffected = @{}
+        $controlsManualReview = @{}
 
         foreach ($finding in $Findings) {
-            if ($finding.Status -eq 'FAIL' -or $finding.Status -eq 'WARNING') {
-                $findingType = if ($null -ne $finding.Type) { $finding.Type } elseif ($null -ne $finding.CheckType) { $finding.CheckType } else { $finding.Category }
-                if ($findingType) {
-                    $mapping = Get-ComplianceMapping -FindingType $findingType -Framework $fw
+            $isFailing = $finding.Status -eq 'FAIL' -or $finding.Status -eq 'WARNING'
+            $isReview = $finding.Status -eq 'REVIEW'
+            if (-not ($isFailing -or $isReview)) { continue }
 
-                    if ($mapping.Count -gt 0) {
-                        $controlKey = switch ($fw) {
-                            'CIS' { 'Controls' }
-                            'NIST' { 'Functions' }
-                            'SOC2' { 'Criteria' }
-                            'PCIDSS' { 'Requirements' }
-                        }
+            $findingType = if ($null -ne $finding.Type) { $finding.Type } elseif ($null -ne $finding.CheckType) { $finding.CheckType } else { $finding.Category }
+            if (-not $findingType) { continue }
 
-                        $frameworkKey = switch ($fw) {
-                            'CIS' { 'CIS_M365' }
-                            'NIST' { 'NIST_CSF' }
-                            'SOC2' { 'SOC2' }
-                            'PCIDSS' { 'PCI_DSS_4' }
-                        }
+            $mapping = Get-ComplianceMapping -FindingType $findingType -Framework $fw
+            if ($mapping.Count -eq 0) { continue }
 
-                        if ($mapping[$frameworkKey]) {
-                            $controls = $mapping[$frameworkKey][$controlKey]
-                            foreach ($control in $controls) {
-                                if (-not $controlsAffected.ContainsKey($control)) {
-                                    $controlsAffected[$control] = @()
-                                }
-                                $controlsAffected[$control] += $finding
-                            }
-                        }
-                    }
+            $controlKey = switch ($fw) {
+                'CIS' { 'Controls' }
+                'NIST' { 'Functions' }
+                'SOC2' { 'Criteria' }
+                'PCIDSS' { 'Requirements' }
+            }
+
+            $frameworkKey = switch ($fw) {
+                'CIS' { 'CIS_M365' }
+                'NIST' { 'NIST_CSF' }
+                'SOC2' { 'SOC2' }
+                'PCIDSS' { 'PCI_DSS_4' }
+            }
+
+            if (-not $mapping[$frameworkKey]) { continue }
+
+            $controls = $mapping[$frameworkKey][$controlKey]
+            $bucket = if ($isReview) { $controlsManualReview } else { $controlsAffected }
+            foreach ($control in $controls) {
+                if (-not $bucket.ContainsKey($control)) {
+                    $bucket[$control] = @()
                 }
+                $bucket[$control] += $finding
             }
         }
 
         $gapReport.FrameworkGaps[$fw] = @{
             ControlsAffected = $controlsAffected.Count
             Controls = $controlsAffected
+            ManualReviewControlsCount = $controlsManualReview.Count
+            ManualReviewControls = $controlsManualReview
         }
     }
 

@@ -2767,6 +2767,7 @@ function Get-SOC2Summary {
         $entry['Pass'] = 0
         $entry['Fail'] = 0
         $entry['Warning'] = 0
+        $entry['Review'] = 0
         $entry['Info'] = 0
         # Phase 3 PR 3: per-family count of SOC2_LicensingGap_* findings.
         # Additive — gaps continue to also count toward Info for byte-stable
@@ -2857,6 +2858,7 @@ function Get-SOC2Summary {
                 'OK' { $byFamily[$family]['Pass']++ }
                 'FAIL' { $byFamily[$family]['Fail']++ }
                 'WARNING' { $byFamily[$family]['Warning']++ }
+                'REVIEW' { $byFamily[$family]['Review']++ }
                 default { $byFamily[$family]['Info']++ }
             }
         }

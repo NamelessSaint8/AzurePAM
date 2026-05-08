@@ -486,6 +486,13 @@ function Compare-ComplianceSnapshots {
             ResolvedIssues = @()
             StatusChanges = @()
             Unchanged = @()
+            # REVIEW status (PR 4 of Review-Status-Plan): WARNING<->REVIEW
+            # transitions for the same CheckName+Object are recategorisations,
+            # not improvements/regressions. Tracked separately to keep the
+            # Issues counters meaningful.
+            RecategorisedFindings = @()
+            NewReviewItems = @()
+            ResolvedReviewItems = @()
         }
         
         # Control changes by source
@@ -504,6 +511,10 @@ function Compare-ComplianceSnapshots {
             ResolvedIssueCount = 0
             ScoreImprovements = 0
             ScoreRegressions = 0
+            # PR 4 of Review-Status-Plan
+            RecategorisedCount = 0
+            NewReviewCount = 0
+            ResolvedReviewCount = 0
         }
     }
     
@@ -603,7 +614,7 @@ function Compare-ComplianceSnapshots {
         # Find new issues (in current but not baseline, or status changed to worse)
         foreach ($key in $currentFindings.Keys) {
             $current = $currentFindings[$key]
-            
+
             if (-not $baselineFindings.ContainsKey($key)) {
                 # New finding
                 if ($current.Status -in @("FAIL", "WARNING")) {
@@ -616,37 +627,72 @@ function Compare-ComplianceSnapshots {
                     }
                     $delta.Summary.NewIssueCount++
                 }
+                elseif ($current.Status -eq 'REVIEW') {
+                    # New REVIEW item — tracked separately from issues
+                    $delta.FindingChanges.NewReviewItems += [PSCustomObject]@{
+                        CheckName = $current.CheckName
+                        Object = $current.Object
+                        Description = $current.Description
+                        Type = "NewReview"
+                    }
+                    $delta.Summary.NewReviewCount++
+                }
             }
             else {
                 $baseline = $baselineFindings[$key]
-                
+
                 if ($current.Status -ne $baseline.Status) {
-                    # Status changed
-                    $statusRank = @{ "OK" = 0; "INFO" = 1; "WARNING" = 2; "FAIL" = 3 }
-                    $improved = $statusRank[$current.Status] -lt $statusRank[$baseline.Status]
-                    
-                    $delta.FindingChanges.StatusChanges += [PSCustomObject]@{
-                        CheckName = $current.CheckName
-                        Object = $current.Object
-                        OldStatus = $baseline.Status
-                        NewStatus = $current.Status
-                        Direction = if ($improved) { "improved" } else { "regressed" }
-                    }
-                    
-                    if ($improved) {
-                        $delta.Summary.ImprovementCount++
+                    # PR 4: WARNING<->REVIEW transitions are recategorisations,
+                    # not improvements/regressions. Don't pollute the trend
+                    # counters with the global PR 3 reclassification or with
+                    # an admin promoting a REVIEW item to a clear violation.
+                    $isRecategorisation = (
+                        ($baseline.Status -eq 'WARNING' -and $current.Status -eq 'REVIEW') -or
+                        ($baseline.Status -eq 'REVIEW' -and $current.Status -eq 'WARNING')
+                    )
+
+                    if ($isRecategorisation) {
+                        $delta.FindingChanges.RecategorisedFindings += [PSCustomObject]@{
+                            CheckName = $current.CheckName
+                            Object = $current.Object
+                            OldStatus = $baseline.Status
+                            NewStatus = $current.Status
+                            Description = $current.Description
+                            Type = "Recategorised"
+                        }
+                        $delta.Summary.RecategorisedCount++
                     }
                     else {
-                        $delta.Summary.RegressionCount++
+                        # Status changed in the severity dimension. REVIEW is
+                        # placed between INFO and WARNING in the rank — not a
+                        # severity itself but a sortable position so transitions
+                        # to/from FAIL/OK still register direction correctly.
+                        $statusRank = @{ "OK" = 0; "INFO" = 1; "REVIEW" = 2; "WARNING" = 3; "FAIL" = 4 }
+                        $improved = $statusRank[$current.Status] -lt $statusRank[$baseline.Status]
+
+                        $delta.FindingChanges.StatusChanges += [PSCustomObject]@{
+                            CheckName = $current.CheckName
+                            Object = $current.Object
+                            OldStatus = $baseline.Status
+                            NewStatus = $current.Status
+                            Direction = if ($improved) { "improved" } else { "regressed" }
+                        }
+
+                        if ($improved) {
+                            $delta.Summary.ImprovementCount++
+                        }
+                        else {
+                            $delta.Summary.RegressionCount++
+                        }
                     }
                 }
             }
         }
-        
+
         # Find resolved issues (in baseline but not current, or status improved to OK)
         foreach ($key in $baselineFindings.Keys) {
             $baseline = $baselineFindings[$key]
-            
+
             if (-not $currentFindings.ContainsKey($key)) {
                 if ($baseline.Status -in @("FAIL", "WARNING")) {
                     $delta.FindingChanges.ResolvedIssues += [PSCustomObject]@{
@@ -657,6 +703,16 @@ function Compare-ComplianceSnapshots {
                         Type = "Resolved"
                     }
                     $delta.Summary.ResolvedIssueCount++
+                }
+                elseif ($baseline.Status -eq 'REVIEW') {
+                    # REVIEW item disappeared — tracked separately
+                    $delta.FindingChanges.ResolvedReviewItems += [PSCustomObject]@{
+                        CheckName = $baseline.CheckName
+                        Object = $baseline.Object
+                        Description = $baseline.Description
+                        Type = "ResolvedReview"
+                    }
+                    $delta.Summary.ResolvedReviewCount++
                 }
             }
         }
