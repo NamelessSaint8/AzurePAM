@@ -8,6 +8,33 @@ EntraChecks now includes enterprise-ready reporting capabilities designed for IT
 2. ✅ **Hard to prioritize what to fix** → Risk scoring and priority recommendations
 3. ✅ **Difficult to map to compliance frameworks** → Automatic mapping to CIS M365, NIST CSF, SOC2, PCI-DSS
 
+## v2 Finding Schema — what's new in the reports
+
+Every report consumes the central v2 finding schema (`SchemaVersion='2.0'`). Each finding now carries a stable `FindingId`, derived `Disposition`, analyst-overlaid `Owner` / `Exception` / `ReviewStatus`, framework-flattened `ControlMappings`, and an `Evidence` chain of references. Legacy code paths still work; v2 fields are additive.
+
+**Excel workbook** ([Modules/EntraChecks-ExcelReporting.psm1](../Modules/EntraChecks-ExcelReporting.psm1)) — `All Findings` gains FindingId / Disposition / Owner / Exception / Review State / Tags columns. Six new sheets are emitted automatically when v2 fields are populated:
+
+| Sheet | Contents | Filter rule |
+|---|---|---|
+| **Analyst Queue** | Actionable items only | Disposition ∈ {Open, ActionRequired, Review, ExpiredException}; excludes accepted exceptions |
+| **Review Queue** | Human-judgment items | Status=REVIEW OR ReviewStatus.State ∈ {NeedsReview, InReview, ActionRequired} |
+| **Control Register** | One row per (finding × framework × control) | Sorted by Framework, ControlId |
+| **Evidence Register** | Provenance audit trail | One row per Evidence reference with Hash + RedactionStatus |
+| **Exceptions** | Risk-acceptance lifecycle | Every finding with non-None Exception.Status |
+| **Remediation Plan** | Roadmap | Actionable items sorted by PriorityScore desc, with flattened RemediationDetail |
+
+**Unified HTML report** ([Modules/EntraChecks-Compliance.psm1](../Modules/EntraChecks-Compliance.psm1)) — adds:
+- New **Action Queue** and **Exceptions** tiles in the Findings Summary Overview (with anchor links).
+- New **Action Queue** section above All Assessment Findings — filtered actionable items, sorted by `-PriorityScore`.
+- New **Exceptions Lifecycle** table — sorted Expired → Revoked → Approved (by expiry asc) → Requested → Rejected.
+- Finding row body surfaces Owner / Disposition / Exception / Evidence count / FindingId (HTML-encoded).
+
+**CSV** — flat-row shape via `ConvertTo-FindingFlatRow` (no more `@{...}` cells). Owner/Exception/ReviewStatus flatten to prefixed scalar columns; ControlMappings/Evidence/Tags/Links flatten to semicolon-joined strings (`CIS_M365:1.1.1;NIST_CSF:PR.AC-1`).
+
+**JSON** — full v2 finding objects emitted at `-Depth 15`. `Metadata.SchemaVersion='2.0'` on the envelope. The legacy `FindingHash` is superseded by `FindingId`.
+
+For the complete schema reference + analyst-state workflow, see [Finding-Schema-Guide.md](Finding-Schema-Guide.md).
+
 ## What's New
 
 ### New Modules

@@ -202,5 +202,9 @@
       "ProbeHTTP": true,
       "HTTPProbeTimeoutSeconds": 10
     }
+  },
+  "GRC": {
+    "_comment": "Central Finding Schema (v2.0) workflow. FindingStatePath points to a local JSON file with per-finding analyst state (Owner / Exception / ReviewStatus / Tags / Links) keyed by FindingId. The file is gitignored by default. Set to empty string to disable state merging.",
+    "FindingStatePath": ".\\config\\finding-state.local.json"
   }
 }

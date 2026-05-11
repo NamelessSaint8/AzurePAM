@@ -599,16 +599,35 @@ function Compare-ComplianceSnapshots {
     if ($BaselineSnapshot.Sources.Findings.Data -and $CurrentSnapshot.Sources.Findings.Data) {
         $baselineFindings = @{}
         $currentFindings = @{}
-        
-        # Index by CheckName+Object for comparison
+
+        # PR 2 of Central-Finding-Schema-GRC-Plan: prefer FindingId for
+        # snapshot keying when both sides carry it. Falls back to the legacy
+        # CheckName|Object key when either side is missing FindingId, so
+        # pre-PR2 snapshots still diff correctly. A FindingId of the form
+        # ECF-<20 hex chars> is the stable identity across casing/rename
+        # changes that CheckName|Object can't survive.
+        $useFindingIdKey = $true
         foreach ($finding in $BaselineSnapshot.Sources.Findings.Data) {
-            $key = "$($finding.CheckName)|$($finding.Object)"
-            $baselineFindings[$key] = $finding
+            if (-not $finding.FindingId) { $useFindingIdKey = $false; break }
         }
-        
+        if ($useFindingIdKey) {
+            foreach ($finding in $CurrentSnapshot.Sources.Findings.Data) {
+                if (-not $finding.FindingId) { $useFindingIdKey = $false; break }
+            }
+        }
+
+        # Index by chosen key
+        $keyFor = if ($useFindingIdKey) {
+            { param($f) [string]$f.FindingId }
+        } else {
+            { param($f) "$($f.CheckName)|$($f.Object)" }
+        }
+
+        foreach ($finding in $BaselineSnapshot.Sources.Findings.Data) {
+            $baselineFindings[(& $keyFor $finding)] = $finding
+        }
         foreach ($finding in $CurrentSnapshot.Sources.Findings.Data) {
-            $key = "$($finding.CheckName)|$($finding.Object)"
-            $currentFindings[$key] = $finding
+            $currentFindings[(& $keyFor $finding)] = $finding
         }
         
         # Find new issues (in current but not baseline, or status changed to worse)

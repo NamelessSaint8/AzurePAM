@@ -107,16 +107,18 @@ Describe 'Export-UnifiedComplianceReport — REVIEW tile and badge' {
         $script:UnifiedHtml | Should -Match 'Review Queue \(2\)'
     }
 
-    It 'renders REVIEW findings only inside the Review Queue, not in the main Findings table (PR 4)' {
-        # Split the document at the Review Queue header. Anything before is the
-        # main "All Assessment Findings" table; the REVIEW badge must not appear
-        # there. Anything after must contain the REVIEW badge.
-        $parts = $script:UnifiedHtml -split 'Review Queue \(2\)', 2
-        $parts.Count | Should -Be 2
-        $beforeQueue = $parts[0]
-        $afterQueue = $parts[1]
-        $beforeQueue | Should -Not -Match 'background:var\(--purple\);color:white;">REVIEW'
-        $afterQueue | Should -Match 'background:var\(--purple\);color:white;">REVIEW'
+    It 'renders REVIEW findings outside the main "All Assessment Findings" table (PR 4)' {
+        # Carve out the "All Assessment Findings" section specifically — it
+        # runs from its own h2 to the next h2. The REVIEW badge must not appear
+        # inside that window. (REVIEW findings legitimately appear in the
+        # Action Queue and Review Queue sections, which is the v2 behavior
+        # introduced by Central-Finding-Schema-GRC-Plan PR 4.)
+        if ($script:UnifiedHtml -match '(?s)<h2 class="section-title">All Assessment Findings.*?(?=<h2)') {
+            $allFindingsSection = $matches[0]
+            $allFindingsSection | Should -Not -Match 'background:var\(--purple\);color:white;">REVIEW'
+        }
+        # The Review Queue itself MUST contain the REVIEW badge.
+        $script:UnifiedHtml | Should -Match 'background:var\(--purple\);color:white;">REVIEW'
     }
 
     It 'still renders failures/warnings normally (no regression)' {

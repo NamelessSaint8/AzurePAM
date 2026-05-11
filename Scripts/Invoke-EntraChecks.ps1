@@ -521,7 +521,19 @@ function Add-Finding {
         # Provenance: which data source produced this finding. Optional —
         # auto-derived from the call stack when omitted (sources are mapped
         # by .psm1 file name in EntraChecks-DataSources.psm1).
-        [string]$Source
+        [string]$Source,
+
+        # v2 schema metadata (PR 2 of Central-Finding-Schema-GRC-Plan).
+        # All optional and additive — checks that don't supply them get
+        # default values from the normalizer at report time.
+        [string]$FindingKey = '',         # disambiguator for multi-finding-per-object checks
+        [string]$ObjectId = '',           # stable Entra/Graph object id (preferred over $Object)
+        [string]$ObjectType = '',         # 'User'|'ServicePrincipal'|'Application'|'Device'|...
+        [string]$ResourceId = '',         # Azure resource ID for Defender/Policy/Purview findings
+        [string]$TenantId = '',           # supplied when multiple tenants are scanned
+        [string]$SubscriptionId = '',     # supplied for Azure-scoped findings
+        $OwnerHint,                       # hashtable or string — fed to Resolve-FindingOwner
+        [object[]]$Evidence               # optional: pre-built evidence rows
     )
 
     # Auto-capture calling function name for CIS/NIST compliance mapping
@@ -565,6 +577,16 @@ function Add-Finding {
         Description = $Description
         Remediation = $Remediation
         Source = $resolvedSource
+        # v2 schema metadata — empty defaults when caller didn't supply.
+        # The normalizer (Initialize-FindingsForReport) fills the rest.
+        FindingKey = $FindingKey
+        ObjectId = $ObjectId
+        ObjectType = $ObjectType
+        ResourceId = $ResourceId
+        TenantId = $TenantId
+        SubscriptionId = $SubscriptionId
+        OwnerHint = $OwnerHint
+        Evidence = $Evidence
     }
 
     $script:Findings += $finding
@@ -4436,7 +4458,25 @@ function Export-Finding {
     $ExportJson = Join-Path $ReportDir "EntraSecurityFindings-$CheckName-$script:TimeVal.json"
     
     $findingsToExport = @($script:Findings) | Where-Object { $null -ne $_ }
-    
+
+    # Normalize to v2 schema (PR 2 of Central-Finding-Schema-GRC-Plan).
+    # Idempotent — already-v2 findings pass through unchanged. Optional state
+    # merge picks up GRC.FindingStatePath from the loaded config when present.
+    # Guarded behind Get-Command so legacy installs without the schema module
+    # remain functional.
+    if (Get-Command Initialize-FindingsForReport -ErrorAction SilentlyContinue) {
+        $tenantIdForSchema = ''
+        if ($script:TenantCapabilities -and $script:TenantCapabilities.TenantId) {
+            $tenantIdForSchema = [string]$script:TenantCapabilities.TenantId
+        }
+        $grcCfg = $null
+        if ($script:Config -and $script:Config.GRC) { $grcCfg = $script:Config.GRC }
+        $findingsToExport = Initialize-FindingsForReport `
+            -Findings $findingsToExport `
+            -DefaultTenantId $tenantIdForSchema `
+            -ConfigGrc $grcCfg
+    }
+
     # Determine which formats to export
     $formats = $OutputFormat
     if ($formats -contains "All") {
@@ -4450,17 +4490,30 @@ function Export-Finding {
     $failCount = ($findingsToExport | Where-Object { $_.Status -eq "FAIL" }).Count
     
     if ($findingsToExport.Count -gt 0) {
-        
+
         # === CSV Export ===
+        # PR 5 of Central-Finding-Schema-GRC-Plan: flatten v2 nested objects
+        # (Owner, Exception, ReviewStatus, ControlMappings, Evidence, Tags)
+        # into scalar columns. Falls back to the raw Export-Csv shape when the
+        # schema module is unavailable.
         if ($formats -contains "CSV") {
-            $findingsToExport | Export-Csv -Path $ExportCsv -NoTypeInformation
+            if (Get-Command ConvertTo-FindingFlatRow -ErrorAction SilentlyContinue) {
+                $findingsToExport | ConvertTo-FindingFlatRow | Export-Csv -Path $ExportCsv -NoTypeInformation -Encoding UTF8
+            }
+            else {
+                $findingsToExport | Export-Csv -Path $ExportCsv -NoTypeInformation
+            }
             Write-Host "    CSV: $ExportCsv" -ForegroundColor Gray
         }
-        
-        # === JSON Export (with metadata for comparison) ===
+
+        # === JSON Export (full v2 schema for machine-readable consumption) ===
+        # PR 5: emit the canonical v2 finding objects directly. -Depth 15 is
+        # enough to round-trip ControlMappings + Evidence + RemediationDetail.
+        # Legacy findings render with whatever fields they carry — additive.
         if ($formats -contains "JSON") {
             $jsonOutput = @{
                 Metadata = @{
+                    SchemaVersion = '2.0'
                     Timestamp = (Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ")
                     TenantId = $script:TenantCapabilities.TenantId
                     TenantName = $script:TenantCapabilities.TenantName
@@ -4480,24 +4533,14 @@ function Export-Finding {
                         RecentDays = $script:RecentDays
                     }
                 }
-                Findings = $findingsToExport | ForEach-Object {
-                    @{
-                        Time = $_.Time
-                        Status = $_.Status
-                        Object = $_.Object
-                        Description = $_.Description
-                        Remediation = $_.Remediation
-                        # Add a hash for comparison purposes
-                        FindingHash = [System.BitConverter]::ToString(
-                            [System.Security.Cryptography.SHA256]::Create().ComputeHash(
-                                [System.Text.Encoding]::UTF8.GetBytes("$($_.Status)|$($_.Object)|$($_.Description)")
-                            )
-                        ).Replace("-", "").Substring(0, 16)
-                    }
-                }
+                # Emit the full v2 finding objects (Owner / Exception /
+                # ReviewStatus / ControlMappings / Evidence / etc.) directly.
+                # The schema module's FindingId replaces the legacy
+                # FindingHash for snapshot comparison.
+                Findings = $findingsToExport
             }
-            
-            $jsonOutput | ConvertTo-Json -Depth 10 | Set-Content -Path $ExportJson
+
+            $jsonOutput | ConvertTo-Json -Depth 15 | Set-Content -Path $ExportJson
             Write-Host "    JSON: $ExportJson" -ForegroundColor Gray
         }
         

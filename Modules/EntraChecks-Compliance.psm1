@@ -2694,6 +2694,36 @@ $(if (Get-Command Get-PrivilegedIdentityRosterCss -ErrorAction SilentlyContinue)
     $fOkCount = @($Findings | Where-Object { $_.Status -eq 'OK' }).Count
     $fInfoCount = @($Findings | Where-Object { $_.Status -eq 'INFO' }).Count
 
+    # Action Queue: actionable findings only — used both for the summary tile
+    # and the dedicated Action Queue section below. Filter rule (PR 4 of
+    # Central-Finding-Schema-GRC-Plan):
+    #   - Disposition in {Open, ActionRequired, Review, ExpiredException} — IN
+    #   - Disposition in {Passing, Informational, AcceptedRisk,
+    #     CompensatingControl, FalsePositive, OutOfScope, Resolved, Suppressed} — OUT
+    #   - For legacy findings without Disposition, fall back to Status in
+    #     {FAIL, WARNING, REVIEW}. That keeps pre-v2 snapshots renderable.
+    $actionableDispositions = @('Open', 'ActionRequired', 'Review', 'ExpiredException')
+    $script:ActionQueueFindings = @($Findings | Where-Object {
+            $disp = if ($_.PSObject.Properties['Disposition']) { [string]$_.Disposition } else { '' }
+            if ($disp) {
+                return ($disp -in $actionableDispositions)
+            }
+            # Legacy fallback
+            return ($_.Status -in @('FAIL', 'WARNING', 'REVIEW'))
+        })
+    $fActionCount = $script:ActionQueueFindings.Count
+
+    # Exception lifecycle counter — every finding whose Exception.Status is
+    # not None gets a row in the Exceptions section. Powers the lifecycle
+    # tile.
+    $script:ExceptionFindings = @($Findings | Where-Object {
+            $ex = $_.PSObject.Properties['Exception']
+            if (-not $ex -or -not $_.Exception) { return $false }
+            $st = [string]$_.Exception.Status
+            return ($st -and $st -ne 'None')
+        })
+    $fExceptionCount = $script:ExceptionFindings.Count
+
     $html += @"
         <h2 class="section-title">Security Findings Overview</h2>
         <div class="framework-grid">
@@ -2711,6 +2741,16 @@ $(if (Get-Command Get-PrivilegedIdentityRosterCss -ErrorAction SilentlyContinue)
                 <h3>To Review</h3>
                 <div class="source">Require human judgment</div>
                 <div class="framework-score" style="color: var(--purple);">$fReviewCount</div>
+            </div>
+            <div class="framework-card" style="border-top-color: #ff6b35;">
+                <h3>Action Queue</h3>
+                <div class="source">Actionable items (excludes accepted exceptions)</div>
+                <div class="framework-score" style="color: #ff6b35;"><a href="#action-queue" style="color: inherit; text-decoration: none;">$fActionCount</a></div>
+            </div>
+            <div class="framework-card" style="border-top-color: #6c757d;">
+                <h3>Exceptions</h3>
+                <div class="source">Risk-accepted &middot; lifecycle tracked</div>
+                <div class="framework-score" style="color: #6c757d;"><a href="#exceptions-lifecycle" style="color: inherit; text-decoration: none;">$fExceptionCount</a></div>
             </div>
             <div class="framework-card" style="border-top-color: var(--success);">
                 <h3>Passed</h3>
@@ -2828,16 +2868,82 @@ $(if (Get-Command Get-PrivilegedIdentityRosterCss -ErrorAction SilentlyContinue)
                 }
                 else { '' }
 
+                # v2 schema badges (PR 4 of Central-Finding-Schema-GRC-Plan).
+                # Render only when present; legacy findings render unchanged.
+                $dispositionBadge = ''
+                if ($f.PSObject.Properties['Disposition'] -and $f.Disposition) {
+                    $dispSafe = [System.Net.WebUtility]::HtmlEncode([string]$f.Disposition)
+                    $dispColor = switch ([string]$f.Disposition) {
+                        'AcceptedRisk' { '#6c757d' }
+                        'CompensatingControl' { '#6c757d' }
+                        'FalsePositive' { '#6c757d' }
+                        'OutOfScope' { '#6c757d' }
+                        'ExpiredException' { 'var(--warning)' }
+                        'Resolved' { 'var(--success)' }
+                        'Suppressed' { '#6c757d' }
+                        'Review' { 'var(--purple)' }
+                        default { 'var(--gray-600)' }
+                    }
+                    $dispositionBadge = "<div><strong>Disposition:</strong> <span style=`"color: $dispColor; font-weight: 600;`">$dispSafe</span></div>"
+                }
+
+                $ownerLine = ''
+                $owner = if ($f.PSObject.Properties['Owner']) { $f.Owner } else { $null }
+                if ($owner -and ([string]$owner.OwnerType) -and ($owner.OwnerType -ne 'Unknown')) {
+                    $ownerName = [System.Net.WebUtility]::HtmlEncode([string]$owner.DisplayName)
+                    $ownerEmail = [System.Net.WebUtility]::HtmlEncode([string]$owner.Email)
+                    $ownerSrc = [System.Net.WebUtility]::HtmlEncode([string]$owner.Source)
+                    $ownerDue = [System.Net.WebUtility]::HtmlEncode([string]$owner.DueDate)
+                    $ownerDisplay = if ($ownerName -and $ownerEmail) { "$ownerName ($ownerEmail)" } elseif ($ownerName) { $ownerName } elseif ($ownerEmail) { $ownerEmail } else { [System.Net.WebUtility]::HtmlEncode([string]$owner.OwnerType) }
+                    $ownerLine = "<p><strong>Owner:</strong> $ownerDisplay <span style=`"font-size:0.85em;color:var(--gray-600);`">[$ownerSrc]</span>"
+                    if ($ownerDue) { $ownerLine += " &middot; <strong>Due:</strong> $ownerDue" }
+                    $ownerLine += '</p>'
+                }
+
+                $exceptionLine = ''
+                $ex = if ($f.PSObject.Properties['Exception']) { $f.Exception } else { $null }
+                if ($ex -and ([string]$ex.Status) -and ($ex.Status -ne 'None')) {
+                    $exStatus = [System.Net.WebUtility]::HtmlEncode([string]$ex.Status)
+                    $exType = [System.Net.WebUtility]::HtmlEncode([string]$ex.Type)
+                    $exExpires = [System.Net.WebUtility]::HtmlEncode([string]$ex.ExpiresAt)
+                    $exJustification = [System.Net.WebUtility]::HtmlEncode([string]$ex.Justification)
+                    $exParts = @("<strong>Exception:</strong> $exStatus")
+                    if ($exType) { $exParts += $exType }
+                    if ($exExpires) { $exParts += "expires $exExpires" }
+                    $exLine = $exParts -join ' &middot; '
+                    if ($exJustification) { $exLine += "<br/><span style=`"font-size:0.85em;color:var(--gray-600);`">$exJustification</span>" }
+                    $exceptionLine = "<p>$exLine</p>"
+                }
+
+                $evidenceLine = ''
+                if ($f.PSObject.Properties['Evidence'] -and $f.Evidence) {
+                    $evCount = @($f.Evidence).Count
+                    if ($evCount -gt 0) {
+                        $evidenceLine = "<p style=`"font-size:0.85em;color:var(--gray-600);`"><strong>Evidence:</strong> $evCount reference$(if ($evCount -ne 1) {'s'}) captured (see Evidence Register in the Excel workbook)</p>"
+                    }
+                }
+
+                $findingIdLine = ''
+                if ($f.PSObject.Properties['FindingId'] -and $f.FindingId) {
+                    $idSafe = [System.Net.WebUtility]::HtmlEncode([string]$f.FindingId)
+                    $findingIdLine = "<p style=`"font-size:0.78em;color:var(--gray-600);margin-top:6px;`"><code>$idSafe</code></p>"
+                }
+
                 $bodyHtml = @"
         <div class="uf-finding-body">
             <div class="uf-finding-meta">
                 <div><strong>Object:</strong> $fObj</div>
                 <div><strong>Source:</strong> $sourceLbl</div>
                 <div><strong>Status:</strong> $($f.Status)</div>
+                $dispositionBadge
             </div>
             <p><strong>Description:</strong> $fDesc</p>
+            $ownerLine
+            $exceptionLine
             <p><strong>Quick remediation:</strong> $fRem</p>
             $remediationBlock
+            $evidenceLine
+            $findingIdLine
         </div>
 "@
             }
@@ -2855,6 +2961,43 @@ $(if (Get-Command Get-PrivilegedIdentityRosterCss -ErrorAction SilentlyContinue)
             </summary>
             $bodyHtml
         </details>
+"@
+        }
+
+        # Action Queue — the focused triage view (PR 4 of Central-Finding-Schema-GRC-Plan).
+        # Same row renderer as the main table; filtered by the actionable
+        # Disposition set + legacy fallback. Header anchor matches the
+        # "Action Queue" tile in the Findings Summary Overview.
+        $actionableInEnriched = @($enrichedFindings | Where-Object {
+                $disp = if ($_.PSObject.Properties['Disposition']) { [string]$_.Disposition } else { '' }
+                if ($disp) { return ($disp -in $actionableDispositions) }
+                return ($_.Status -in @('FAIL', 'WARNING', 'REVIEW'))
+            })
+        if ($actionableInEnriched.Count -gt 0) {
+            $html += @"
+
+        <h2 class="section-title" id="action-queue" style="border-bottom-color: #ff6b35;">Action Queue ($($actionableInEnriched.Count))</h2>
+        <p style="margin-bottom: 16px; color: var(--gray-600);">Findings that need attention right now &mdash; sorted by priority. Approved non-expired exceptions are excluded; expired exceptions are listed here so they don't fall through.</p>
+        <div class="uf-headers">
+            <div>Status</div>
+            <div>Check</div>
+            <div>Object</div>
+            <div>Source</div>
+            <div>Description</div>
+            <div>Remediation</div>
+            <div></div>
+        </div>
+        <div class="uf-findings-list">
+"@
+            $sortedAction = $actionableInEnriched | Sort-Object @{Expression = { if ($null -ne $_.PriorityScore) { -1 * [double]$_.PriorityScore } else { 0 } } }, @{Expression = {
+                    switch ($_.Status) { 'FAIL' { 0 } 'WARNING' { 1 } 'REVIEW' { 2 } default { 3 } }
+                }
+            }
+            foreach ($f in $sortedAction) {
+                $html += (& $renderFindingRow $f)
+            }
+            $html += @"
+        </div>
 "@
         }
 
@@ -2912,6 +3055,86 @@ $(if (Get-Command Get-PrivilegedIdentityRosterCss -ErrorAction SilentlyContinue)
             }
             $html += @"
         </div>
+"@
+        }
+
+        # Exceptions Lifecycle — every finding with a non-None Exception.Status.
+        # Auditor-facing view with full lifecycle metadata. Sort: expired first
+        # (highest urgency), then approved-soonest-to-expire, then pending.
+        $exceptionFindings = @($enrichedFindings | Where-Object {
+                $exProp = $_.PSObject.Properties['Exception']
+                if (-not $exProp -or -not $_.Exception) { return $false }
+                $exSt = [string]$_.Exception.Status
+                return ($exSt -and $exSt -ne 'None')
+            })
+        if ($exceptionFindings.Count -gt 0) {
+            $sortedExceptions = $exceptionFindings | Sort-Object @{
+                Expression = {
+                    # Status priority: Expired/Revoked first, then Approved (sorted by ExpiresAt asc),
+                    # then Requested/Rejected.
+                    switch ([string]$_.Exception.Status) {
+                        'Expired' { 0 }
+                        'Revoked' { 1 }
+                        'Approved' { 2 }
+                        'Requested' { 3 }
+                        'Rejected' { 4 }
+                        default { 5 }
+                    }
+                }
+            }, @{
+                Expression = { if ($_.Exception.ExpiresAt) { [string]$_.Exception.ExpiresAt } else { 'zzz' } }
+            }
+
+            $html += @"
+
+        <h2 class="section-title" id="exceptions-lifecycle" style="border-bottom-color: #6c757d;">Exceptions Lifecycle ($($exceptionFindings.Count))</h2>
+        <p style="margin-bottom: 16px; color: var(--gray-600);">Risk-acceptance and scoping decisions, with full audit trail. Sorted by status urgency (expired first, then by expiry date).</p>
+        <table class="control-table">
+            <thead>
+                <tr>
+                    <th>Status</th>
+                    <th>Type</th>
+                    <th>Object</th>
+                    <th>Approver</th>
+                    <th>Approved</th>
+                    <th>Expires</th>
+                    <th>Justification</th>
+                </tr>
+            </thead>
+            <tbody>
+"@
+            foreach ($ef in $sortedExceptions) {
+                $exObj = [System.Net.WebUtility]::HtmlEncode([string]$ef.Object)
+                $exStatus = [System.Net.WebUtility]::HtmlEncode([string]$ef.Exception.Status)
+                $exType = [System.Net.WebUtility]::HtmlEncode([string]$ef.Exception.Type)
+                $exApprover = [System.Net.WebUtility]::HtmlEncode([string]$ef.Exception.Approver)
+                $exApprovedAt = [System.Net.WebUtility]::HtmlEncode([string]$ef.Exception.ApprovedAt)
+                $exExpiresAt = [System.Net.WebUtility]::HtmlEncode([string]$ef.Exception.ExpiresAt)
+                $exJustification = [System.Net.WebUtility]::HtmlEncode([string]$ef.Exception.Justification)
+
+                $statusColor = switch ([string]$ef.Exception.Status) {
+                    'Expired' { 'var(--warning)' }
+                    'Revoked' { 'var(--danger)' }
+                    'Approved' { 'var(--success)' }
+                    'Requested' { '#0078d4' }
+                    'Rejected' { 'var(--danger)' }
+                    default { 'var(--gray-600)' }
+                }
+                $html += @"
+                <tr>
+                    <td><span style="color: $statusColor; font-weight: 600;">$exStatus</span></td>
+                    <td>$exType</td>
+                    <td>$exObj</td>
+                    <td>$exApprover</td>
+                    <td>$exApprovedAt</td>
+                    <td>$exExpiresAt</td>
+                    <td>$exJustification</td>
+                </tr>
+"@
+            }
+            $html += @"
+            </tbody>
+        </table>
 "@
         }
     }

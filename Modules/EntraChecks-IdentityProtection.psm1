@@ -111,19 +111,44 @@ function Add-ModuleFinding {
         # See Add-Finding for the REVIEW semantics — keep these two in sync.
         [ValidateSet("OK", "INFO", "WARNING", "FAIL", "REVIEW")]
         [string]$Status,
-        
+
         [Parameter(Mandatory)]
         [string]$Object,
-        
+
         [Parameter(Mandatory)]
         [string]$Description,
-        
-        [string]$Remediation = ""
+
+        [string]$Remediation = "",
+
+        # v2 schema metadata (PR 2 of Central-Finding-Schema-GRC-Plan).
+        # Mirror the surface from Add-Finding so module checks can supply
+        # rich identity/owner/evidence inline.
+        [string]$FindingKey = '',
+        [string]$ObjectId = '',
+        [string]$ObjectType = '',
+        [string]$ResourceId = '',
+        [string]$TenantId = '',
+        [string]$SubscriptionId = '',
+        $OwnerHint,
+        [object[]]$Evidence
     )
-    
-    # Try to use main script's Add-Finding if available
+
+    # Try to use main script's Add-Finding if available — forward the new
+    # params via splatting so we don't drift from the canonical surface.
     if (Get-Command -Name "Add-Finding" -ErrorAction SilentlyContinue) {
-        Add-Finding -Status $Status -Object $Object -Description $Description -Remediation $Remediation
+        $forwardArgs = @{
+            Status = $Status
+            Object = $Object
+            Description = $Description
+            Remediation = $Remediation
+        }
+        foreach ($k in 'FindingKey', 'ObjectId', 'ObjectType', 'ResourceId', 'TenantId', 'SubscriptionId') {
+            $val = (Get-Variable -Name $k -ValueOnly)
+            if ($val) { $forwardArgs[$k] = $val }
+        }
+        if ($OwnerHint) { $forwardArgs['OwnerHint'] = $OwnerHint }
+        if ($Evidence) { $forwardArgs['Evidence'] = $Evidence }
+        Add-Finding @forwardArgs
     }
     else {
         # Standalone mode - add to local collection
@@ -134,10 +159,18 @@ function Add-ModuleFinding {
             Description = $Description
             Remediation = $Remediation
             Module = $script:ModuleName
+            FindingKey = $FindingKey
+            ObjectId = $ObjectId
+            ObjectType = $ObjectType
+            ResourceId = $ResourceId
+            TenantId = $TenantId
+            SubscriptionId = $SubscriptionId
+            OwnerHint = $OwnerHint
+            Evidence = $Evidence
         }
-        
+
         $script:Findings += $finding
-        
+
         # Color-coded console output
         $color = switch ($Status) {
             "OK" { "Green" }

@@ -28,6 +28,249 @@ Import-Module (Join-Path $modulePath "EntraChecks-RiskScoring.psm1") -Force
 Import-Module (Join-Path $modulePath "EntraChecks-RemediationGuidance.psm1") -Force
 Import-Module (Join-Path $modulePath "EntraChecks-DataSources.psm1") -Force -DisableNameChecking
 Import-Module (Join-Path $modulePath "EntraChecks-PrivilegedIdentityRender.psm1") -Force -DisableNameChecking -ErrorAction SilentlyContinue
+# Schema module is optional — workbook still renders for legacy findings
+# without v2 fields. Helpers below use defensive accessors.
+Import-Module (Join-Path $modulePath "EntraChecks-FindingSchema.psm1") -Force -ErrorAction SilentlyContinue
+
+#region Schema-aware helpers (PR 3 of Central-Finding-Schema-GRC-Plan)
+
+function Get-EcfAnyProp {
+    <#
+    Defensive property reader. Tolerates [pscustomobject], [hashtable], and
+    $null inputs. Returns $null when the property is absent — the workbook
+    surfaces blank cells for findings that weren't run through the
+    Initialize-FindingsForReport normalizer (e.g. external snapshots).
+    #>
+    param([AllowNull()] $Source, [Parameter(Mandatory)][string]$Name)
+    if ($null -eq $Source) { return $null }
+    if ($Source -is [hashtable]) {
+        if ($Source.ContainsKey($Name)) { return $Source[$Name] }
+        return $null
+    }
+    if ($Source.PSObject -and $Source.PSObject.Properties[$Name]) {
+        return $Source.$Name
+    }
+    return $null
+}
+
+function Format-EcfOwnerLabel {
+    <#
+    Renders an Owner object as a single human-readable cell value:
+    "DisplayName (Email/UPN) [Source]". Returns '' for an empty/Unknown
+    owner so the column doesn't shout 'Unknown' at every cell.
+    #>
+    param([AllowNull()] $Owner)
+    if ($null -eq $Owner) { return '' }
+    $type = [string](Get-EcfAnyProp $Owner 'OwnerType')
+    if (-not $type -or $type -eq 'Unknown') { return '' }
+    $name = [string](Get-EcfAnyProp $Owner 'DisplayName')
+    $email = [string](Get-EcfAnyProp $Owner 'Email')
+    $upn = [string](Get-EcfAnyProp $Owner 'UserPrincipalName')
+    $contact = if ($email) { $email } elseif ($upn) { $upn } else { '' }
+    $source = [string](Get-EcfAnyProp $Owner 'Source')
+    if ($name -and $contact) { return "$name ($contact) [$source]" }
+    if ($name) { return "$name [$source]" }
+    if ($contact) { return "$contact [$source]" }
+    return $type
+}
+
+function Format-EcfExceptionLabel {
+    <#
+    Renders Exception state as a single human-readable cell value:
+    "Approved/AcceptedRisk expires 2026-08-08". Returns '' for None state
+    so the column stays quiet for the majority of rows.
+    #>
+    param([AllowNull()] $Exception)
+    if ($null -eq $Exception) { return '' }
+    $st = [string](Get-EcfAnyProp $Exception 'Status')
+    if (-not $st -or $st -eq 'None') { return '' }
+    $type = [string](Get-EcfAnyProp $Exception 'Type')
+    $expires = [string](Get-EcfAnyProp $Exception 'ExpiresAt')
+    $parts = @($st)
+    if ($type) { $parts += $type }
+    if ($expires) { $parts += "expires $expires" }
+    return ($parts -join ' / ')
+}
+
+function Test-EcfIsAnalystQueue {
+    <#
+    Analyst Queue filter (decision rule in plan §9):
+      - Include: Status in {FAIL, WARNING, REVIEW}
+      - Exclude: approved-non-expired exceptions, OK, INFO, Suppressed/Resolved
+    #>
+    param([Parameter(Mandatory)] $Finding)
+    $status = [string](Get-EcfAnyProp $Finding 'Status')
+    if ($status -in @('OK', 'INFO')) { return $false }
+
+    $disposition = [string](Get-EcfAnyProp $Finding 'Disposition')
+    # Active exception (AcceptedRisk/CompensatingControl/FalsePositive/OutOfScope)
+    # is OUT of the action queue. ExpiredException is back IN.
+    if ($disposition -in @('AcceptedRisk', 'CompensatingControl', 'FalsePositive', 'OutOfScope', 'Resolved', 'Suppressed', 'Passing', 'Informational')) {
+        return $false
+    }
+    return $true
+}
+
+function Test-EcfIsReviewQueue {
+    param([Parameter(Mandatory)] $Finding)
+    $status = [string](Get-EcfAnyProp $Finding 'Status')
+    if ($status -eq 'REVIEW') { return $true }
+    $rs = Get-EcfAnyProp $Finding 'ReviewStatus'
+    if ($rs) {
+        $state = [string](Get-EcfAnyProp $rs 'State')
+        if ($state -in @('NeedsReview', 'InReview', 'ActionRequired')) { return $true }
+    }
+    return $false
+}
+
+function Export-EcfAnalystQueueSheet {
+    param([Parameter(Mandatory)][array]$Findings, [Parameter(Mandatory)][string]$OutputPath)
+    $queue = @($Findings | Where-Object { Test-EcfIsAnalystQueue $_ })
+    if ($queue.Count -eq 0) { return }
+    Write-Verbose "Creating Analyst Queue sheet ($($queue.Count) rows)..."
+    $rows = $queue | Sort-Object @{Expression = { Get-EcfAnyProp $_ 'PriorityScore' }; Descending = $true } | Select-Object `
+    @{N = 'FindingId'; E = { Get-EcfAnyProp $_ 'FindingId' } },
+    @{N = 'Status'; E = { $_.Status } },
+    @{N = 'Disposition'; E = { Get-EcfAnyProp $_ 'Disposition' } },
+    @{N = 'Priority Score'; E = { Get-EcfAnyProp $_ 'PriorityScore' } },
+    @{N = 'Risk Score'; E = { Get-EcfAnyProp $_ 'RiskScore' } },
+    @{N = 'Object'; E = { $_.Object } },
+    @{N = 'Description'; E = { $_.Description } },
+    @{N = 'Owner'; E = { Format-EcfOwnerLabel (Get-EcfAnyProp $_ 'Owner') } },
+    @{N = 'Due Date'; E = { Get-EcfAnyProp (Get-EcfAnyProp $_ 'Owner') 'DueDate' } },
+    @{N = 'Remediation'; E = { $_.Remediation } },
+    @{N = 'Source'; E = { if ($_.Source) { $_.Source } else { 'Internal' } } }
+    $rows | Export-Excel -Path $OutputPath -WorksheetName 'Analyst Queue' -AutoSize -BoldTopRow -FreezeTopRow -AutoFilter
+}
+
+function Export-EcfReviewQueueSheet {
+    param([Parameter(Mandatory)][array]$Findings, [Parameter(Mandatory)][string]$OutputPath)
+    $queue = @($Findings | Where-Object { Test-EcfIsReviewQueue $_ })
+    if ($queue.Count -eq 0) { return }
+    Write-Verbose "Creating Review Queue sheet ($($queue.Count) rows)..."
+    $rows = $queue | Sort-Object @{Expression = { Get-EcfAnyProp $_ 'RiskScore' }; Descending = $true } | Select-Object `
+    @{N = 'FindingId'; E = { Get-EcfAnyProp $_ 'FindingId' } },
+    @{N = 'Risk Score'; E = { Get-EcfAnyProp $_ 'RiskScore' } },
+    @{N = 'Object'; E = { $_.Object } },
+    @{N = 'Description'; E = { $_.Description } },
+    @{N = 'Review State'; E = { Get-EcfAnyProp (Get-EcfAnyProp $_ 'ReviewStatus') 'State' } },
+    @{N = 'Reviewer'; E = { Get-EcfAnyProp (Get-EcfAnyProp $_ 'ReviewStatus') 'Reviewer' } },
+    @{N = 'Notes'; E = { Get-EcfAnyProp (Get-EcfAnyProp $_ 'ReviewStatus') 'Notes' } },
+    @{N = 'Next Review'; E = { Get-EcfAnyProp (Get-EcfAnyProp $_ 'ReviewStatus') 'NextReviewDate' } },
+    @{N = 'Owner'; E = { Format-EcfOwnerLabel (Get-EcfAnyProp $_ 'Owner') } },
+    @{N = 'Recommendation'; E = { $_.Remediation } },
+    @{N = 'Source'; E = { if ($_.Source) { $_.Source } else { 'Internal' } } }
+    $rows | Export-Excel -Path $OutputPath -WorksheetName 'Review Queue' -AutoSize -BoldTopRow -FreezeTopRow -AutoFilter
+}
+
+function Export-EcfControlRegisterSheet {
+    param([Parameter(Mandatory)][array]$Findings, [Parameter(Mandatory)][string]$OutputPath)
+    $registerRows = New-Object System.Collections.Generic.List[object]
+    foreach ($f in $Findings) {
+        $mappings = Get-EcfAnyProp $f 'ControlMappings'
+        if (-not $mappings -or @($mappings).Count -eq 0) { continue }
+        foreach ($m in @($mappings)) {
+            $row = [pscustomobject]@{
+                Framework = [string](Get-EcfAnyProp $m 'Framework')
+                ControlId = [string](Get-EcfAnyProp $m 'ControlId')
+                ControlTitle = [string](Get-EcfAnyProp $m 'ControlTitle')
+                AssessmentRole = [string](Get-EcfAnyProp $m 'AssessmentRole')
+                Confidence = [string](Get-EcfAnyProp $m 'MappingConfidence')
+                FindingId = [string](Get-EcfAnyProp $f 'FindingId')
+                Status = [string](Get-EcfAnyProp $f 'Status')
+                Disposition = [string](Get-EcfAnyProp $f 'Disposition')
+                Object = [string](Get-EcfAnyProp $f 'Object')
+                Description = [string](Get-EcfAnyProp $f 'Description')
+            }
+            $registerRows.Add($row)
+        }
+    }
+    if ($registerRows.Count -eq 0) { return }
+    Write-Verbose "Creating Control Register sheet ($($registerRows.Count) rows)..."
+    $sorted = $registerRows | Sort-Object Framework, ControlId
+    $sorted | Export-Excel -Path $OutputPath -WorksheetName 'Control Register' -AutoSize -BoldTopRow -FreezeTopRow -AutoFilter
+}
+
+function Export-EcfEvidenceRegisterSheet {
+    param([Parameter(Mandatory)][array]$Findings, [Parameter(Mandatory)][string]$OutputPath)
+    $evidenceRows = New-Object System.Collections.Generic.List[object]
+    foreach ($f in $Findings) {
+        $evidence = Get-EcfAnyProp $f 'Evidence'
+        if (-not $evidence -or @($evidence).Count -eq 0) { continue }
+        foreach ($e in @($evidence)) {
+            $row = [pscustomobject]@{
+                EvidenceId = [string](Get-EcfAnyProp $e 'EvidenceId')
+                FindingId = [string](Get-EcfAnyProp $f 'FindingId')
+                Source = [string](Get-EcfAnyProp $e 'Source')
+                Provider = [string](Get-EcfAnyProp $e 'Provider')
+                Cmdlet = [string](Get-EcfAnyProp $e 'Cmdlet')
+                QueryScope = [string](Get-EcfAnyProp $e 'QueryScope')
+                TenantId = [string](Get-EcfAnyProp $e 'TenantId')
+                SubscriptionId = [string](Get-EcfAnyProp $e 'SubscriptionId')
+                ResourceId = [string](Get-EcfAnyProp $e 'ResourceId')
+                CapturedAtUtc = [string](Get-EcfAnyProp $e 'CapturedAtUtc')
+                DataClassification = [string](Get-EcfAnyProp $e 'DataClassification')
+                Hash = [string](Get-EcfAnyProp $e 'Hash')
+                RedactionStatus = [string](Get-EcfAnyProp $e 'RedactionStatus')
+            }
+            $evidenceRows.Add($row)
+        }
+    }
+    if ($evidenceRows.Count -eq 0) { return }
+    Write-Verbose "Creating Evidence Register sheet ($($evidenceRows.Count) rows)..."
+    $evidenceRows | Export-Excel -Path $OutputPath -WorksheetName 'Evidence Register' -AutoSize -BoldTopRow -FreezeTopRow -AutoFilter
+}
+
+function Export-EcfExceptionsSheet {
+    param([Parameter(Mandatory)][array]$Findings, [Parameter(Mandatory)][string]$OutputPath)
+    $rows = @($Findings | Where-Object {
+            $ex = Get-EcfAnyProp $_ 'Exception'
+            if (-not $ex) { return $false }
+            $st = [string](Get-EcfAnyProp $ex 'Status')
+            return ($st -and $st -ne 'None')
+        })
+    if ($rows.Count -eq 0) { return }
+    Write-Verbose "Creating Exceptions sheet ($($rows.Count) rows)..."
+    $exportRows = $rows | Select-Object `
+    @{N = 'FindingId'; E = { Get-EcfAnyProp $_ 'FindingId' } },
+    @{N = 'Object'; E = { $_.Object } },
+    @{N = 'Description'; E = { $_.Description } },
+    @{N = 'Exception Status'; E = { Get-EcfAnyProp (Get-EcfAnyProp $_ 'Exception') 'Status' } },
+    @{N = 'Exception Type'; E = { Get-EcfAnyProp (Get-EcfAnyProp $_ 'Exception') 'Type' } },
+    @{N = 'Justification'; E = { Get-EcfAnyProp (Get-EcfAnyProp $_ 'Exception') 'Justification' } },
+    @{N = 'Requested By'; E = { Get-EcfAnyProp (Get-EcfAnyProp $_ 'Exception') 'RequestedBy' } },
+    @{N = 'Approver'; E = { Get-EcfAnyProp (Get-EcfAnyProp $_ 'Exception') 'Approver' } },
+    @{N = 'Requested At'; E = { Get-EcfAnyProp (Get-EcfAnyProp $_ 'Exception') 'RequestedAt' } },
+    @{N = 'Approved At'; E = { Get-EcfAnyProp (Get-EcfAnyProp $_ 'Exception') 'ApprovedAt' } },
+    @{N = 'Expires At'; E = { Get-EcfAnyProp (Get-EcfAnyProp $_ 'Exception') 'ExpiresAt' } },
+    @{N = 'Disposition'; E = { Get-EcfAnyProp $_ 'Disposition' } },
+    @{N = 'Underlying Status'; E = { $_.Status } }
+    $exportRows | Export-Excel -Path $OutputPath -WorksheetName 'Exceptions' -AutoSize -BoldTopRow -FreezeTopRow -AutoFilter
+}
+
+function Export-EcfRemediationPlanSheet {
+    param([Parameter(Mandatory)][array]$Findings, [Parameter(Mandatory)][string]$OutputPath)
+    $candidates = @($Findings | Where-Object { Test-EcfIsAnalystQueue $_ })
+    if ($candidates.Count -eq 0) { return }
+    Write-Verbose "Creating Remediation Plan sheet ($($candidates.Count) rows)..."
+    $rows = $candidates | Sort-Object @{Expression = { Get-EcfAnyProp $_ 'PriorityScore' }; Descending = $true } | Select-Object `
+    @{N = 'FindingId'; E = { Get-EcfAnyProp $_ 'FindingId' } },
+    @{N = 'Priority Score'; E = { Get-EcfAnyProp $_ 'PriorityScore' } },
+    @{N = 'Risk Level'; E = { Get-EcfAnyProp $_ 'RiskLevel' } },
+    @{N = 'Effort'; E = { Get-EcfAnyProp $_ 'RemediationEffortDescription' } },
+    @{N = 'Description'; E = { $_.Description } },
+    @{N = 'Quick Remediation'; E = { $_.Remediation } },
+    @{N = 'Portal Steps'; E = { (@(Get-EcfAnyProp (Get-EcfAnyProp $_ 'RemediationDetail') 'PortalSteps') -join ' | ') } },
+    @{N = 'PowerShell'; E = { Get-EcfAnyProp (Get-EcfAnyProp $_ 'RemediationDetail') 'PowerShell' } },
+    @{N = 'Validation Steps'; E = { (@(Get-EcfAnyProp (Get-EcfAnyProp $_ 'RemediationDetail') 'ValidationSteps') -join ' | ') } },
+    @{N = 'Automation Safety'; E = { Get-EcfAnyProp (Get-EcfAnyProp $_ 'RemediationDetail') 'AutomationSafety' } },
+    @{N = 'Requires Approval'; E = { Get-EcfAnyProp (Get-EcfAnyProp $_ 'RemediationDetail') 'RequiresApproval' } },
+    @{N = 'Owner'; E = { Format-EcfOwnerLabel (Get-EcfAnyProp $_ 'Owner') } },
+    @{N = 'Due Date'; E = { Get-EcfAnyProp (Get-EcfAnyProp $_ 'Owner') 'DueDate' } }
+    $rows | Export-Excel -Path $OutputPath -WorksheetName 'Remediation Plan' -AutoSize -BoldTopRow -FreezeTopRow -AutoFilter
+}
+
+#endregion
 
 #region Excel Generation Functions
 
@@ -195,20 +438,29 @@ function New-ExcelWorkbook {
 
     $execData | Export-Excel -Path $OutputPath -WorksheetName 'Executive Summary' -AutoSize -BoldTopRow -FreezeTopRow
 
-    # 2. All Findings Sheet
+    # 2. All Findings Sheet — v2 schema columns surfaced for GRC workflow
+    # (PR 3 of Central-Finding-Schema-GRC-Plan). Findings without v2 fields
+    # render with empty cells; the Initialize-FindingsForReport hook in
+    # Start-EntraChecks fills v2 fields before this function is called.
     Write-Verbose "Creating All Findings sheet..."
     $allFindingsExport = $Findings | Select-Object `
+    @{N = 'FindingId'; E = { Get-EcfAnyProp $_ 'FindingId' } },
     @{N = 'Time'; E = { $_.Time } },
     @{N = 'Status'; E = { $_.Status } },
+    @{N = 'Disposition'; E = { Get-EcfAnyProp $_ 'Disposition' } },
     @{N = 'Object'; E = { $_.Object } },
     @{N = 'Description'; E = { $_.Description } },
+    @{N = 'Owner'; E = { Format-EcfOwnerLabel (Get-EcfAnyProp $_ 'Owner') } },
+    @{N = 'Exception'; E = { Format-EcfExceptionLabel (Get-EcfAnyProp $_ 'Exception') } },
+    @{N = 'Review State'; E = { Get-EcfAnyProp (Get-EcfAnyProp $_ 'ReviewStatus') 'State' } },
     @{N = 'Remediation'; E = { $_.Remediation } },
     @{N = 'Risk Level'; E = { $_.RiskLevel } },
     @{N = 'Risk Score'; E = { $_.RiskScore } },
     @{N = 'Priority Score'; E = { $_.PriorityScore } },
     @{N = 'Remediation Effort'; E = { $_.RemediationEffortDescription } },
     @{N = 'Compliance Frameworks'; E = { $_.ComplianceReference } },
-    @{N = 'Source'; E = { if ($_.Source) { $_.Source } else { 'Internal' } } }
+    @{N = 'Source'; E = { if ($_.Source) { $_.Source } else { 'Internal' } } },
+    @{N = 'Tags'; E = { (@(Get-EcfAnyProp $_ 'Tags') -join '; ') } }
 
     # Conditional formatting on the Status column so the workbook is
     # navigable at a glance. REVIEW gets purple to keep the human-judgment
@@ -221,6 +473,35 @@ function New-ExcelWorkbook {
         New-ConditionalText -Text 'INFO' -ConditionalTextColor White -BackgroundColor '#0078d4'
     )
     $allFindingsExport | Export-Excel -Path $OutputPath -WorksheetName 'All Findings' -AutoSize -BoldTopRow -FreezeTopRow -AutoFilter -ConditionalText $statusConditional
+
+    # 2a. Analyst Queue — actionable items only (PR 3). Excludes approved
+    # non-expired exceptions, OK/INFO/Passing/Informational dispositions.
+    # The default analyst landing page when triaging a fresh assessment.
+    Export-EcfAnalystQueueSheet -Findings $Findings -OutputPath $OutputPath
+
+    # 2b. Review Queue — human-judgment items (PR 3). Anything where Status
+    # is REVIEW or the ReviewStatus.State requires analyst eyes.
+    Export-EcfReviewQueueSheet -Findings $Findings -OutputPath $OutputPath
+
+    # 2c. Control Register — flattened ControlMappings rows, one per
+    # (finding, framework, control) tuple. Audit-friendly view that maps
+    # which findings impact which controls across all frameworks.
+    Export-EcfControlRegisterSheet -Findings $Findings -OutputPath $OutputPath
+
+    # 2d. Evidence Register — flattened Evidence rows for provenance audit.
+    # Each row carries the source/cmdlet/scope/hash/redaction status so an
+    # auditor can trace any finding back to the API call that produced it.
+    Export-EcfEvidenceRegisterSheet -Findings $Findings -OutputPath $OutputPath
+
+    # 2e. Exceptions — every finding with a non-None Exception.Status.
+    # Includes Approved, Expired, Requested, Rejected, and Revoked so the
+    # exception lifecycle is visible in one place.
+    Export-EcfExceptionsSheet -Findings $Findings -OutputPath $OutputPath
+
+    # 2f. Remediation Plan — actionable items sorted by PriorityScore desc,
+    # with the structured RemediationDetail (Portal/PowerShell/Impact)
+    # flattened into spreadsheet columns. Drives roadmap conversations.
+    Export-EcfRemediationPlanSheet -Findings $Findings -OutputPath $OutputPath
 
     # 3. Priority Findings Sheet
     Write-Verbose "Creating Priority Findings sheet..."

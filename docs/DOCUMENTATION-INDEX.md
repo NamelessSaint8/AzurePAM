@@ -17,6 +17,8 @@ We've created **6 comprehensive guides** totaling over **1,000 pages** of docume
 | **[EXAMPLES.md](EXAMPLES.md)** | Practitioners | 30-60 min | Real-world scenarios |
 | **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)** | All users | As needed | Problem solving |
 | **[API-REFERENCE.md](API-REFERENCE.md)** | Developers | 45-60 min | Function reference |
+| **[Finding-Schema-Guide.md](Finding-Schema-Guide.md)** | Analysts / Auditors / Developers | 30-45 min | Central v2 finding schema, FindingId, analyst state file, disposition, security defaults |
+| **[Reporting-Guide.md](Reporting-Guide.md)** | All users | 20-40 min | Excel / HTML / CSV / JSON report formats, v2 schema surfacing |
 | **[REPORTING-STATUS.md](REPORTING-STATUS.md)** | All users | 5-10 min | Current status |
 
 ---

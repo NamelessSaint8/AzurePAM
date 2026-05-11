@@ -282,6 +282,7 @@ subfolder containing:
 |-----------|---------------------------------------------------------------|
 | **FAIL**  | Security control is missing or misconfigured. Fix this.       |
 | **WARNING** | Partial implementation or best-practice deviation. Review.  |
+| **REVIEW** | Needs human judgment (e.g. OAuth grants, stale accounts).    |
 | **OK**    | Control is properly configured. No action needed.             |
 | **INFO**  | Informational finding. No security impact.                    |
 
@@ -293,6 +294,20 @@ subfolder containing:
 | **High**     | 60-79       | Fix within days — significant exposure               |
 | **Medium**   | 40-59       | Fix within weeks — moderate concern                  |
 | **Low**      | 0-39        | Address during next review cycle                     |
+| **Review**   | n/a         | Human-judgment items; sorted by underlying RiskScore |
+
+---
+
+## Central Finding Schema & GRC Workflow
+
+Every finding is normalised to a stable v2 schema (`SchemaVersion='2.0'`) before reports are emitted. Each finding carries a deterministic `FindingId` (`ECF-<20 hex>`), derived `Disposition`, framework-flattened `ControlMappings`, and an `Evidence` chain of provenance references.
+
+Analyst workflow state (Owner / Exception / ReviewStatus / Tags) lives in a local JSON file (`config/finding-state.local.json`, gitignored) and is overlaid onto findings at report time **without** mutating the raw assessment record. Audit facts stay immutable; analyst overlays show up in the Excel `Analyst Queue` / `Exceptions` sheets and the HTML `Action Queue` / `Exceptions Lifecycle` sections.
+
+- **Full reference:** [docs/Finding-Schema-Guide.md](docs/Finding-Schema-Guide.md)
+- **Reporting surfaces:** [docs/Reporting-Guide.md](docs/Reporting-Guide.md)
+- **Example state file:** [config/finding-state.example.json](config/finding-state.example.json)
+- **Example workflow:** [Examples/Example-FindingState.ps1](Examples/Example-FindingState.ps1)
 
 ---
 

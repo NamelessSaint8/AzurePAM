@@ -1,0 +1,34 @@
+{
+  "Version": "1.0",
+  "Description": "Example local analyst state for the v2 finding schema. Copy this to finding-state.local.json (gitignored) and edit the per-finding entries by FindingId. The schema module's Merge-FindingState applies these overlays at report time without ever overwriting raw assessment results (Status, RiskScore, Source, Description, etc.).",
+  "Findings": {
+    "ECF-1234567890abcdef1234": {
+      "Owner": {
+        "OwnerType": "Team",
+        "DisplayName": "Identity Platform",
+        "Email": "identity-platform@example.com",
+        "Source": "StateOverride",
+        "Confidence": "High",
+        "DueDate": "2026-06-30"
+      },
+      "ReviewStatus": {
+        "State": "InReview",
+        "Reviewer": "analyst@example.com",
+        "Notes": "Waiting for app owner confirmation.",
+        "NextReviewDate": "2026-05-22"
+      },
+      "Exception": {
+        "Status": "Approved",
+        "Type": "AcceptedRisk",
+        "Justification": "Compensating detection is active.",
+        "Approver": "ciso@example.com",
+        "ApprovedAt": "2026-05-08T20:00:00Z",
+        "ExpiresAt": "2026-08-08T20:00:00Z"
+      },
+      "Tags": ["quarterly-review", "tier-1"],
+      "Links": [
+        "https://internal-wiki.example.com/findings/ECF-1234567890abcdef1234"
+      ]
+    }
+  }
+}

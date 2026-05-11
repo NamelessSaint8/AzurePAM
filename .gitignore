@@ -50,3 +50,7 @@ Comprehensive-Assessment-*.html
 *credentials*
 *secrets*
 *.env
+
+# Local analyst state for the v2 finding schema (per-tenant business
+# context, exceptions, owner assignments). The example is tracked.
+config/finding-state.local.json

@@ -684,6 +684,49 @@ Write-Host "Summary posted to Microsoft Teams!" -ForegroundColor Green
 
 ---
 
+## GRC Workflow Examples
+
+### Example 14: Author analyst state for the v2 finding schema
+
+The central finding schema (`SchemaVersion='2.0'`) carries a deterministic `FindingId` per finding. Analyst workflow state — Owner / Exception / ReviewStatus / Tags / Links — lives in a local JSON file keyed by `FindingId`, overlaid at report time without mutating raw assessment results.
+
+Run the end-to-end walkthrough:
+
+```powershell
+pwsh -File Examples/Example-FindingState.ps1
+```
+
+The script:
+1. Constructs three synthetic legacy findings.
+2. Normalizes them to v2 (assigning each a stable `ECF-<20 hex>` FindingId).
+3. Writes a temp state file mapping each `FindingId` to Owner / Exception / ReviewStatus overlays.
+4. Re-normalizes with the state file applied and prints the resulting Disposition for each finding.
+5. Confirms raw assessment fields (Status, Source, Description) are immutable.
+6. Dumps one finding's complete v2 object as JSON.
+
+For real-world use:
+
+```powershell
+# 1. Copy the tracked example to the gitignored local path.
+Copy-Item config/finding-state.example.json config/finding-state.local.json
+
+# 2. Edit finding-state.local.json — replace the example ECF-... key with
+#    a real FindingId from your last assessment's JSON export.
+
+# 3. Re-run the assessment. The orchestrator reads GRC.FindingStatePath
+#    from entrachecks.config.json and applies the overlay automatically.
+.\Start-EntraChecks.ps1 -Mode Quick -Modules All
+
+# 4. Inspect the Excel "Analyst Queue" / "Exceptions" sheets or the HTML
+#    "Action Queue" / "Exceptions Lifecycle" sections — your overlays
+#    appear as Owner badges, Exception lifecycle rows, and Disposition
+#    transitions.
+```
+
+**Reference:** [docs/Finding-Schema-Guide.md](../docs/Finding-Schema-Guide.md) covers the full schema + workflow.
+
+---
+
 ## Pro Tips
 
 ### Tip 1: Create a Master Assessment Function

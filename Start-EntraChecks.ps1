@@ -272,6 +272,17 @@ if (Test-Path $dsModule) {
     Import-Module $dsModule -Force -DisableNameChecking -ErrorAction SilentlyContinue
 }
 
+# Import the v2 finding schema module (PR 2 of Central-Finding-Schema-GRC-Plan).
+# Initialize-FindingsForReport runs at report-generation time to normalize
+# every finding to schema v2 and merge optional analyst state. Loaded with
+# -ErrorAction SilentlyContinue so legacy installs without the module still
+# function — Initialize-FindingsForReport is invoked behind a Get-Command
+# guard at the consumer sites.
+$schemaModule = Join-Path $script:ModulesPath "EntraChecks-FindingSchema.psm1"
+if (Test-Path $schemaModule) {
+    Import-Module $schemaModule -Force -ErrorAction SilentlyContinue
+}
+
 # Initialize logging subsystem (from config or defaults)
 if ($script:Config -and $script:Config.Logging) {
     $logConfig = $script:Config.Logging
@@ -1964,10 +1975,27 @@ function Export-AssessmentResult {
         $compModule = Join-Path $script:ModulesPath "EntraChecks-Compliance.psm1"
         if (Test-Path $compModule) {
             Import-Module $compModule -Force
+
+            # Normalize findings to v2 + apply analyst state before the
+            # unified renderer reads them (PR 2 of Central-Finding-Schema-GRC-Plan).
+            $normalizedUnifiedFindings = $script:Findings
+            if (Get-Command Initialize-FindingsForReport -ErrorAction SilentlyContinue) {
+                $tenantIdForSchema = ''
+                if ($script:TenantCapabilities -and $script:TenantCapabilities.TenantId) {
+                    $tenantIdForSchema = [string]$script:TenantCapabilities.TenantId
+                }
+                $grcCfg = $null
+                if ($script:Config -and $script:Config.GRC) { $grcCfg = $script:Config.GRC }
+                $normalizedUnifiedFindings = Initialize-FindingsForReport `
+                    -Findings @($script:Findings) `
+                    -DefaultTenantId $tenantIdForSchema `
+                    -ConfigGrc $grcCfg
+            }
+
             $unifiedArgs = @{
                 OutputDirectory = $reportDir
                 TenantName = $TenantName
-                Findings = $script:Findings
+                Findings = $normalizedUnifiedFindings
                 IncludeSecureScore = ($null -ne $script:SecureScoreData)
                 IncludeDefenderCompliance = ($null -ne $script:DefenderComplianceData)
                 IncludeAzurePolicy = ($null -ne $script:AzurePolicyData)
@@ -2014,9 +2042,26 @@ function Export-AssessmentResult {
                     $externalData['FailedModules'] = $failedMods
                 }
 
+                # Normalize to v2 + apply analyst state before handing off
+                # to the comprehensive report generator (PR 2 of
+                # Central-Finding-Schema-GRC-Plan).
+                $normalizedFindings = $script:Findings
+                if (Get-Command Initialize-FindingsForReport -ErrorAction SilentlyContinue) {
+                    $tenantIdForSchema = ''
+                    if ($script:TenantCapabilities -and $script:TenantCapabilities.TenantId) {
+                        $tenantIdForSchema = [string]$script:TenantCapabilities.TenantId
+                    }
+                    $grcCfg = $null
+                    if ($script:Config -and $script:Config.GRC) { $grcCfg = $script:Config.GRC }
+                    $normalizedFindings = Initialize-FindingsForReport `
+                        -Findings @($script:Findings) `
+                        -DefaultTenantId $tenantIdForSchema `
+                        -ConfigGrc $grcCfg
+                }
+
                 # Build parameters for comprehensive report
                 $comprehensiveParams = @{
-                    Findings = $script:Findings
+                    Findings = $normalizedFindings
                     TenantName = $TenantName
                     OutputDirectory = $reportDir
                     ExternalData = $externalData
