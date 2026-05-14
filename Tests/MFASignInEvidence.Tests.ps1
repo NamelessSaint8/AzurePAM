@@ -21,6 +21,8 @@
 
 BeforeAll {
     $repoRoot = Split-Path -Parent $PSScriptRoot
+    # Stubs must be in scope before the module imports — see Helpers file.
+    . (Join-Path $PSScriptRoot 'Helpers/Stub-CloudCmdlets.ps1')
     Import-Module (Join-Path $repoRoot 'Modules/EntraChecks-AuthMethodCatalog.psm1') -Force -DisableNameChecking
     Import-Module (Join-Path $repoRoot 'Modules/EntraChecks-MFASignInEvidence.psm1') -Force -DisableNameChecking
 }

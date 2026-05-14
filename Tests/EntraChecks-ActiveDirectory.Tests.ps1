@@ -87,7 +87,7 @@ BeforeAll {
     }
 }
 
-Describe 'Test-ADEnvironment degradation paths' {
+Describe 'Test-ADEnvironment degradation paths' -Tag 'WindowsOnly' {
 
     It 'returns IsAvailable=$false when ActiveDirectory module is not present' {
         InModuleScope EntraChecks-ActiveDirectory {
@@ -121,7 +121,7 @@ Describe 'Test-ADEnvironment degradation paths' {
     }
 }
 
-Describe 'Invoke-ActiveDirectoryAssessment entry point' {
+Describe 'Invoke-ActiveDirectoryAssessment entry point' -Tag 'WindowsOnly' {
 
     It 'returns a single INFO finding when environment is unavailable' {
         InModuleScope EntraChecks-ActiveDirectory {
@@ -213,7 +213,7 @@ Describe 'Invoke-ActiveDirectoryAssessment entry point' {
     }
 }
 
-Describe 'Finding schema compliance' {
+Describe 'Finding schema compliance' -Tag 'WindowsOnly' {
 
     It 'every finding carries the 13 required fields' {
         InModuleScope EntraChecks-ActiveDirectory {
@@ -265,7 +265,7 @@ Describe 'Finding schema compliance' {
     }
 }
 
-Describe 'Test-KerberosPreAuthDisabled' {
+Describe 'Test-KerberosPreAuthDisabled' -Tag 'WindowsOnly' {
 
     It 'emits FAIL for each enabled user with DoesNotRequirePreAuth=$true' {
         InModuleScope EntraChecks-ActiveDirectory {
@@ -300,7 +300,7 @@ Describe 'Test-KerberosPreAuthDisabled' {
     }
 }
 
-Describe 'Test-UnconstrainedDelegation' {
+Describe 'Test-UnconstrainedDelegation' -Tag 'WindowsOnly' {
 
     It 'escalates to Critical severity when a FAIL is emitted' {
         InModuleScope EntraChecks-ActiveDirectory {
@@ -317,7 +317,7 @@ Describe 'Test-UnconstrainedDelegation' {
     }
 }
 
-Describe 'Test-PasswordNeverExpires' {
+Describe 'Test-PasswordNeverExpires' -Tag 'WindowsOnly' {
 
     It 'flags enabled users with PasswordNeverExpires and PASSes otherwise' {
         InModuleScope EntraChecks-ActiveDirectory {
@@ -335,7 +335,7 @@ Describe 'Test-PasswordNeverExpires' {
     }
 }
 
-Describe 'Test-DuplicateSPNs' {
+Describe 'Test-DuplicateSPNs' -Tag 'WindowsOnly' {
 
     It 'flags SPN values assigned to more than one object' {
         InModuleScope EntraChecks-ActiveDirectory {
@@ -369,7 +369,7 @@ Describe 'Test-DuplicateSPNs' {
     }
 }
 
-Describe 'Test-KrbTgtAccountAge' {
+Describe 'Test-KrbTgtAccountAge' -Tag 'WindowsOnly' {
 
     It 'emits FAIL when KRBTGT password is older than threshold' {
         InModuleScope EntraChecks-ActiveDirectory {
@@ -408,7 +408,7 @@ Describe 'Test-KrbTgtAccountAge' {
     }
 }
 
-Describe 'Test-ADStaleAccounts' {
+Describe 'Test-ADStaleAccounts' -Tag 'WindowsOnly' {
 
     It 'flags inactive and stale-password accounts' {
         InModuleScope EntraChecks-ActiveDirectory {
@@ -428,7 +428,7 @@ Describe 'Test-ADStaleAccounts' {
     }
 }
 
-Describe 'Test-ADPasswordPolicy' {
+Describe 'Test-ADPasswordPolicy' -Tag 'WindowsOnly' {
 
     It 'FAILs when complexity is disabled or reversible encryption is on' {
         InModuleScope EntraChecks-ActiveDirectory {
@@ -474,7 +474,7 @@ Describe 'Test-ADPasswordPolicy' {
     }
 }
 
-Describe 'Test-UserAccountsWithSPN' {
+Describe 'Test-UserAccountsWithSPN' -Tag 'WindowsOnly' {
 
     It 'WARNs for enabled users with SPNs set' {
         InModuleScope EntraChecks-ActiveDirectory {
@@ -492,7 +492,7 @@ Describe 'Test-UserAccountsWithSPN' {
     }
 }
 
-Describe 'Test-ShadowGroupNames' {
+Describe 'Test-ShadowGroupNames' -Tag 'WindowsOnly' {
 
     It 'flags suspicious lookalike group names' {
         InModuleScope EntraChecks-ActiveDirectory {
@@ -516,7 +516,7 @@ Describe 'Test-ShadowGroupNames' {
 # PR 2 additions — LAPS, DCSecurity, Kerberoastable, DirSync
 # ============================================================================
 
-Describe 'Test-LAPSDeployment' {
+Describe 'Test-LAPSDeployment' -Tag 'WindowsOnly' {
 
     It 'FAILs when neither legacy nor Windows LAPS schema is present' {
         InModuleScope EntraChecks-ActiveDirectory {
@@ -583,7 +583,7 @@ Describe 'Test-LAPSDeployment' {
     }
 }
 
-Describe 'Test-KerberoastableAccounts' {
+Describe 'Test-KerberoastableAccounts' -Tag 'WindowsOnly' {
 
     It 'escalates to Critical severity for privileged SPN-bearer with RC4-capable hash' {
         InModuleScope EntraChecks-ActiveDirectory {
@@ -643,7 +643,7 @@ Describe 'Test-KerberoastableAccounts' {
     }
 }
 
-Describe 'Test-DirSyncAccountSecurity' {
+Describe 'Test-DirSyncAccountSecurity' -Tag 'WindowsOnly' {
 
     It 'FAILs when MSOL_ account is a member of a disallowed group' {
         InModuleScope EntraChecks-ActiveDirectory {
@@ -695,7 +695,7 @@ Describe 'Test-DirSyncAccountSecurity' {
 # PR 4a additions - Credential Hygiene (Group A) + ACL Abuse Paths (Group B)
 # ============================================================================
 
-Describe 'Test-LMHashStorage' {
+Describe 'Test-LMHashStorage' -Tag 'WindowsOnly' {
 
     It 'FAILs when NoLMHash is 0 on a DC' {
         InModuleScope EntraChecks-ActiveDirectory {
@@ -730,7 +730,7 @@ Describe 'Test-LMHashStorage' {
     }
 }
 
-Describe 'Test-NTLMv1Allowed' {
+Describe 'Test-NTLMv1Allowed' -Tag 'WindowsOnly' {
 
     It 'FAILs when LmCompatibilityLevel is 2' {
         InModuleScope EntraChecks-ActiveDirectory {
@@ -763,7 +763,7 @@ Describe 'Test-NTLMv1Allowed' {
     }
 }
 
-Describe 'Test-DCLegacyEncryption' {
+Describe 'Test-DCLegacyEncryption' -Tag 'WindowsOnly' {
 
     It 'FAILs when DES bits are set in the encryption-types mask' {
         InModuleScope EntraChecks-ActiveDirectory {
@@ -806,7 +806,7 @@ Describe 'Test-DCLegacyEncryption' {
     }
 }
 
-Describe 'Test-NullSessionShares' {
+Describe 'Test-NullSessionShares' -Tag 'WindowsOnly' {
 
     It 'FAILs when RestrictAnonymous is 0 on a DC' {
         InModuleScope EntraChecks-ActiveDirectory {
@@ -845,7 +845,7 @@ Describe 'Test-NullSessionShares' {
     }
 }
 
-Describe 'Test-DomainEncryptionTypesPolicy' {
+Describe 'Test-DomainEncryptionTypesPolicy' -Tag 'WindowsOnly' {
 
     It 'FAILs when domain msDS-SupportedEncryptionTypes is RC4-only' {
         InModuleScope EntraChecks-ActiveDirectory {
@@ -878,7 +878,7 @@ Describe 'Test-DomainEncryptionTypesPolicy' {
     }
 }
 
-Describe 'Test-IsAuthorizedPrincipal' {
+Describe 'Test-IsAuthorizedPrincipal' -Tag 'WindowsOnly' {
 
     It 'returns $true for Domain Admins' {
         InModuleScope EntraChecks-ActiveDirectory {
@@ -901,7 +901,7 @@ Describe 'Test-IsAuthorizedPrincipal' {
     }
 }
 
-Describe 'Test-WritablePrivilegedACLs' {
+Describe 'Test-WritablePrivilegedACLs' -Tag 'WindowsOnly' {
 
     It 'FAILs when a non-admin has GenericAll on a privileged container' {
         InModuleScope EntraChecks-ActiveDirectory {
@@ -946,7 +946,7 @@ Describe 'Test-WritablePrivilegedACLs' {
     }
 }
 
-Describe 'Test-ShadowCredentialsVulnerable' {
+Describe 'Test-ShadowCredentialsVulnerable' -Tag 'WindowsOnly' {
 
     It 'FAILs when a non-admin has WriteProperty on a privileged user (all-properties scope)' {
         InModuleScope EntraChecks-ActiveDirectory {
@@ -996,7 +996,7 @@ Describe 'Test-ShadowCredentialsVulnerable' {
     }
 }
 
-Describe 'Test-RBCDConfigured' {
+Describe 'Test-RBCDConfigured' -Tag 'WindowsOnly' {
 
     It 'FAILs when RBCD is set on a DC' {
         InModuleScope EntraChecks-ActiveDirectory {
@@ -1061,7 +1061,7 @@ Describe 'Test-RBCDConfigured' {
     }
 }
 
-Describe 'Test-GenericWriteToSensitive' {
+Describe 'Test-GenericWriteToSensitive' -Tag 'WindowsOnly' {
 
     It 'FAILs when a non-admin has GenericWrite on a Domain Admin user' {
         InModuleScope EntraChecks-ActiveDirectory {
@@ -1120,7 +1120,7 @@ Describe 'Test-GenericWriteToSensitive' {
 # PR 4b additions - Attack path lite + DnsAdmins + audit hygiene + DFSR
 # ---------------------------------------------------------------------------
 
-Describe 'Test-AuthenticatedUsersDACLReach' {
+Describe 'Test-AuthenticatedUsersDACLReach' -Tag 'WindowsOnly' {
 
     It 'FAILs Critical on direct (1-hop) non-admin write rights to a DA member' {
         InModuleScope EntraChecks-ActiveDirectory {
@@ -1186,7 +1186,7 @@ Describe 'Test-AuthenticatedUsersDACLReach' {
     }
 }
 
-Describe 'Test-DNSAdminsPrivilege' {
+Describe 'Test-DNSAdminsPrivilege' -Tag 'WindowsOnly' {
 
     It 'PASSes when DnsAdmins has no members' {
         InModuleScope EntraChecks-ActiveDirectory {
@@ -1238,7 +1238,7 @@ Describe 'Test-DNSAdminsPrivilege' {
     }
 }
 
-Describe 'Test-EventAuditPolicy' {
+Describe 'Test-EventAuditPolicy' -Tag 'WindowsOnly' {
 
     It 'PASSes when every required subcategory is enabled' {
         InModuleScope EntraChecks-ActiveDirectory {
@@ -1285,7 +1285,7 @@ Describe 'Test-EventAuditPolicy' {
     }
 }
 
-Describe 'Test-DFSRSYSVOLHealth' {
+Describe 'Test-DFSRSYSVOLHealth' -Tag 'WindowsOnly' {
 
     It 'INFOs when the DFSR module is not available' {
         InModuleScope EntraChecks-ActiveDirectory {

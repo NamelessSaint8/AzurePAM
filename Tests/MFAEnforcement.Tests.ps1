@@ -28,6 +28,7 @@
 
 BeforeAll {
     $repoRoot = Split-Path -Parent $PSScriptRoot
+    . (Join-Path $PSScriptRoot 'Helpers/Stub-CloudCmdlets.ps1')
     Import-Module (Join-Path $repoRoot 'Modules/EntraChecks-AuthMethodCatalog.psm1') -Force -DisableNameChecking
     Import-Module (Join-Path $repoRoot 'Modules/EntraChecks-MFAEnforcement.psm1') -Force -DisableNameChecking
 

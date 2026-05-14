@@ -69,7 +69,7 @@ BeforeAll {
     }
 }
 
-Describe 'Get-PrivilegedIdentityRosterAD — environment gating' {
+Describe 'Get-PrivilegedIdentityRosterAD — environment gating' -Tag 'WindowsOnly' {
 
     It 'returns Available=$false with a FailureReason when AD is unavailable' {
         Mock -CommandName Test-PrivilegedIdentityADEnvironment -ModuleName EntraChecks-PrivilegedIdentityAD -MockWith {
@@ -82,7 +82,7 @@ Describe 'Get-PrivilegedIdentityRosterAD — environment gating' {
     }
 }
 
-Describe 'Get-PrivilegedIdentityRosterAD — direct and nested membership' {
+Describe 'Get-PrivilegedIdentityRosterAD — direct and nested membership' -Tag 'WindowsOnly' {
 
     BeforeAll {
         # Synthetic domain — Authenticate environment probe as available.
@@ -207,7 +207,7 @@ Describe 'Get-PrivilegedIdentityRosterAD — direct and nested membership' {
     }
 }
 
-Describe 'Group-PrivilegedIdentitiesByTier' {
+Describe 'Group-PrivilegedIdentitiesByTier' -Tag 'WindowsOnly' {
 
     It 'splits roster rows into the four tier buckets' {
         $synthetic = @(

@@ -265,7 +265,9 @@ Describe 'Test-CaPolicyAppliesTo — applicability resolution' {
             $pol = & $MakePolicy -IncludeUsers @('All') -ExcludeUsers @('break-glass-1')
             $r = Test-CaPolicyAppliesTo -User @{ Id = 'break-glass-1'; UserType = 'Member'; Groups = @(); Roles = @() } -Policy $pol
             $r.Applies | Should -BeFalse
-            $r.Reason  | Should -Match 'excluded'
+            # Source string is "User is in policy excludeUsers" — match the
+            # exclusion-path token rather than the past-participle word.
+            $r.Reason  | Should -Match 'excludeUsers'
         }
     }
 

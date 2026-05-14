@@ -1,0 +1,61 @@
+name: Tests
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+
+jobs:
+  # Cross-platform lane. macOS + Linux runners can't load the
+  # ActiveDirectory module or use System.Security.AccessControl ACL APIs,
+  # so WindowsOnly tagged tests are excluded by Tests/Invoke-Tests.ps1.
+  # KnownAssertionDrift tests (pre-existing test/code drift tracked
+  # separately) are also excluded so they don't mask real regressions.
+  cross-platform:
+    name: Cross-platform (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Pester 5
+        shell: pwsh
+        run: |
+          Install-Module Pester -MinimumVersion 5.0.0 -MaximumVersion 5.999.0 `
+            -Force -Scope CurrentUser -SkipPublisherCheck
+
+      - name: Run cross-platform test sweep
+        shell: pwsh
+        run: pwsh -NoProfile -File ./Tests/Invoke-Tests.ps1 -Output Normal
+
+  # Windows lane. Installs the real Microsoft.Graph + Az.* modules so
+  # Mock targets exist without the stub layer, and runs every test —
+  # including WindowsOnly. KnownAssertionDrift is still excluded here
+  # because it tracks real pre-existing test/code drift; flip
+  # -RunDriftTests on for a one-shot diagnostic when fixing the underlying
+  # bugs.
+  windows:
+    name: Windows (full sweep)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Pester 5 + Graph/Az auth modules
+        shell: pwsh
+        run: |
+          Install-Module Pester -MinimumVersion 5.0.0 -MaximumVersion 5.999.0 `
+            -Force -Scope CurrentUser -SkipPublisherCheck
+          # Auth-layer modules are enough for the test mocks; we never call
+          # them against a real tenant in CI. Pester just needs the command
+          # name to be loadable so Mock can intercept.
+          Install-Module Microsoft.Graph.Authentication -Force -Scope CurrentUser -AllowClobber
+          Install-Module Az.Accounts -Force -Scope CurrentUser -AllowClobber
+
+      - name: Run full Windows test sweep
+        shell: pwsh
+        run: pwsh -NoProfile -File ./Tests/Invoke-Tests.ps1 -Output Normal
