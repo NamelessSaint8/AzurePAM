@@ -1690,20 +1690,46 @@ function New-EntraChecksAnalystHtmlReport {
 
     # Enrich findings — same pipeline as New-EnhancedHTMLReport so the cockpit
     # consumes identical data shapes.
-    $enhancedFindings = @()
+    #
+    # Performance note (2026-05-14):
+    # When the orchestrator runs Initialize-FindingsForReport upstream (which
+    # is the default code path), every finding already carries RiskScore,
+    # ComplianceMappings, and RemediationGuidance. Running the Add-* cmdlets
+    # again was pure overhead — at 1,200 findings it added ~5s on top of the
+    # ~5s normalize cost (total ~10s).
+    #
+    # We now check per-finding whether enrichment is needed and pipe only the
+    # un-enriched ones through the Add-* cmdlets. For external callers that
+    # bypass Initialize-FindingsForReport (e.g. invoking
+    # New-EntraChecksAnalystHtmlReport directly with raw findings), the
+    # missing fields trigger normal enrichment so the behavior is unchanged
+    # for that path. Collections use List[object] to avoid O(n^2) array
+    # growth on the += operator.
+    $enrichedList = New-Object System.Collections.Generic.List[object]
     foreach ($finding in $Findings) {
-        $enhanced = $finding | Add-RiskScoring | Add-ComplianceMapping | Add-RemediationGuidance
-        $enhancedFindings += $enhanced
+        $hasRisk = $finding.PSObject.Properties['RiskScore'] -and $null -ne $finding.RiskScore
+        $hasMap = $finding.PSObject.Properties['ComplianceMappings'] -and $null -ne $finding.ComplianceMappings
+        $hasRem = $finding.PSObject.Properties['RemediationGuidance'] -and $null -ne $finding.RemediationGuidance
+        if ($hasRisk -and $hasMap -and $hasRem) {
+            # Already enriched (typically by Initialize-FindingsForReport) —
+            # pass through without re-running the Add-* cmdlets.
+            $enrichedList.Add($finding)
+        }
+        else {
+            $enrichedList.Add(($finding | Add-RiskScoring | Add-ComplianceMapping | Add-RemediationGuidance))
+        }
     }
 
     # Dedupe (Description + Object) — identical heuristic to the existing report.
-    $seen = @{}
-    $deduped = @()
-    foreach ($f in $enhancedFindings) {
+    # HashSet + List[object] avoids the array += quadratic blowup the
+    # previous implementation suffered at 1,000+ findings.
+    $seenSet = New-Object System.Collections.Generic.HashSet[string]
+    $dedupedList = New-Object System.Collections.Generic.List[object]
+    foreach ($f in $enrichedList) {
         $key = "$($f.Description)|$($f.Object)"
-        if (-not $seen.ContainsKey($key)) { $seen[$key] = $true; $deduped += $f }
+        if ($seenSet.Add($key)) { $dedupedList.Add($f) }
     }
-    $enhancedFindings = $deduped
+    $enhancedFindings = $dedupedList.ToArray()
 
     # Summaries
     $riskSummary = Get-RiskSummary -Findings $enhancedFindings

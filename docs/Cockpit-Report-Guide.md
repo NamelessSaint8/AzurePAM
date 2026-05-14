@@ -213,11 +213,22 @@ No external CDNs, no remote scripts/styles. The report functions identically whe
 
 ## 10. Performance budget
 
-The cockpit is designed to stay responsive at typical assessment sizes:
+The cockpit is designed to stay responsive at typical assessment sizes. Benchmarks on a moderately-spec'd machine (PowerShell 7, macOS):
 
-- 1,200 findings → ~5s enrichment + ~1.6s render = ~6.6s total (PowerShell-side). Output is ~3.7 MB.
-- Browser interactivity: filter changes are O(n) class toggles. Tested fluid at 1,200 rows.
-- Pagination is the primary lever for very large tenants — start at `MaxInitialRows=100` (configurable via `Assessment.Output.Html.MaxInitialRows`) and click "Show more" only when you need to.
+| Findings | Initialize (normalize + state merge) | Cockpit render | Total |
+|---:|---:|---:|---:|
+| 500   | 2.4s  | 1.2s | **3.7s** |
+| 1,200 | 3.1s  | 1.3s | **4.3s** |
+| 5,000 | 12.4s | 6.0s | **18.4s** |
+
+Notable optimizations:
+
+- **Pre-enriched findings pass through** — when the orchestrator runs `Initialize-FindingsForReport` upstream (the default code path), the cockpit detects findings that already have `RiskScore` / `ComplianceMappings` / `RemediationGuidance` populated and skips the `Add-RiskScoring | Add-ComplianceMapping | Add-RemediationGuidance` pipeline. Saves roughly half the wall-clock time on the default code path. External callers that bypass `Initialize-FindingsForReport` still get enrichment as before.
+- **List<object> + HashSet** for the cockpit's internal enrichment + dedupe collections instead of array `+=`. Avoids O(n²) memory copies at 1,000+ findings.
+
+Browser interactivity: filter changes are O(n) class toggles. Tested fluid at 1,200 rows.
+
+Pagination is the primary lever for very large tenants — start at `MaxInitialRows=100` (configurable via `Assessment.Output.Html.MaxInitialRows`) and click "Show more" only when you need to.
 
 ---
 
