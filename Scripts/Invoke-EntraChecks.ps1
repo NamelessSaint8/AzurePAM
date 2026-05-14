@@ -159,9 +159,21 @@ if (!(Test-Path $ReportDir)) {
 $script:TimeVal = Get-Date -UFormat "%Y-%m-%d-%H-%M"
 $LogFile = Join-Path $ReportDir "InvokeEntraChecks-LogFile-$script:TimeVal.log"
 
-# Import and initialize logging module
+# Import and initialize logging module.
+# This script lives at Scripts/Invoke-EntraChecks.ps1; the modules live at
+# repo-root/Modules. When Start-EntraChecks.ps1 dot-sources us the parent
+# already loaded these modules, but direct invocation (`pwsh Scripts/Invoke-EntraChecks.ps1`)
+# needs us to find them ourselves. Resolve repo root by walking up from this
+# script's directory until we see a Modules/ folder.
 $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $modulesPath = Join-Path $scriptRoot "Modules"
+if (-not (Test-Path $modulesPath)) {
+    # Sibling Modules/ doesn't exist — try the parent directory (the
+    # repo-root layout: Scripts/<this>.ps1 + Modules/).
+    $parentRoot = Split-Path -Parent $scriptRoot
+    $candidate = Join-Path $parentRoot "Modules"
+    if (Test-Path $candidate) { $modulesPath = $candidate }
+}
 $loggingModule = Join-Path $modulesPath "EntraChecks-Logging.psm1"
 
 if (Test-Path $loggingModule) {
@@ -180,6 +192,17 @@ if (Test-Path $loggingModule) {
     Write-AuditLog -EventType "SessionStarted" -Description "EntraChecks assessment session started" -Details @{
         ReportDirectory = $ReportDir
         OutputFormat = ($OutputFormat -join ', ')
+    }
+}
+
+# Schema (v2 finding shape + flat-row exporter) and DataSources (canonical
+# Source resolver) are used throughout the legacy AddFinding helpers via
+# Get-Command guards. When invoked from the orchestrator they're already in
+# the session; ensure direct invocation also gets them.
+foreach ($extra in @('EntraChecks-FindingSchema.psm1', 'EntraChecks-DataSources.psm1')) {
+    $extraPath = Join-Path $modulesPath $extra
+    if (Test-Path $extraPath) {
+        Import-Module $extraPath -Force -DisableNameChecking -ErrorAction SilentlyContinue
     }
 }
 
