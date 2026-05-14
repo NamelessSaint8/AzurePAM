@@ -1043,6 +1043,37 @@ $rowsHtml
 "@
 }
 
+function Get-CockpitDueDateBucket {
+    <#
+    .SYNOPSIS
+        Converts a v2 Owner.DueDate into a stable bucket value for the
+        Full Findings due-date filter.
+    .DESCRIPTION
+        Buckets:
+          'overdue'   — date is in the past
+          'due-0-7'   — within the next 7 days inclusive
+          'due-8-30'  — 8 to 30 days out
+          'due-31+'   — more than 30 days out
+          'no-due'    — empty / unparseable
+
+        Computed in PowerShell at render time so the JS filter is a simple
+        exact-match against `data-due-bucket`. Computing in JS would
+        require shipping a date library or doing parsing in every render.
+    .OUTPUTS
+        Stable lowercase bucket key.
+    #>
+    [OutputType([string])]
+    param([AllowNull()][string]$IsoDate)
+    if ([string]::IsNullOrWhiteSpace($IsoDate)) { return 'no-due' }
+    [datetime]$parsed = [datetime]::MinValue
+    if (-not [datetime]::TryParse($IsoDate, [ref]$parsed)) { return 'no-due' }
+    $daysOut = ($parsed.ToUniversalTime() - (Get-Date).ToUniversalTime()).TotalDays
+    if ($daysOut -lt 0) { return 'overdue' }
+    if ($daysOut -le 7) { return 'due-0-7' }
+    if ($daysOut -le 30) { return 'due-8-30' }
+    return 'due-31+'
+}
+
 function Get-CockpitFullFindingsSection {
     <#
     .SYNOPSIS
@@ -1054,14 +1085,18 @@ function Get-CockpitFullFindingsSection {
         positives, out-of-scope, resolved items, the lot. The plan §10.7
         rule: "Avoid hidden findings."
 
-        Filters offered: text search, status, risk level, disposition, source.
+        Filters (plan §10.7 complete set): text search, status, risk level,
+        disposition, source, owner, framework, control, exception status,
+        review state, due date bucket.
+
         Pagination: shows first `-MaxInitialRows` (default 100); "Show more"
         button bumps the visible window by 100 each click.
 
         Performance: rows are rendered statically with `data-*` attributes;
         the JS in Get-CockpitJavaScript filters by toggling a `filtered-out`
-        class. This keeps 1,200-finding reports responsive under
-        `file://` without external JS.
+        class. Multi-value attributes (frameworks, controls) use space-padded
+        values so the JS `data-filter-mode="contains"` substring match acts
+        as an exact-word match.
     #>
     [OutputType([string])]
     param(
@@ -1079,10 +1114,37 @@ function Get-CockpitFullFindingsSection {
     )
     $sorted = $EnhancedFindings | Sort-Object -Property $sortKeys
 
+    # Collect option sets for the dropdowns. Each filter's value space is
+    # whatever shows up in this run — never offer a value that no row has,
+    # because that confuses analysts ("why does this filter not match anything?").
     $statusOpts = ($sorted | ForEach-Object { [string]$_.Status } | Where-Object { $_ } | Sort-Object -Unique)
     $riskOpts = ($sorted | ForEach-Object { [string]$_.RiskLevel } | Where-Object { $_ } | Sort-Object -Unique)
     $dispOpts = ($sorted | ForEach-Object { [string]$_.Disposition } | Where-Object { $_ } | Sort-Object -Unique)
     $sourceOpts = ($sorted | ForEach-Object { [string]$_.Source } | Where-Object { $_ } | Sort-Object -Unique)
+
+    $ownerOpts = ($sorted | ForEach-Object {
+            if ($_.PSObject.Properties['Owner'] -and $_.Owner -and $_.Owner.OwnerType -and $_.Owner.OwnerType -ne 'Unknown' -and [string]$_.Owner.DisplayName) {
+                [string]$_.Owner.DisplayName
+            }
+        } | Where-Object { $_ } | Sort-Object -Unique)
+
+    $frameworkOpts = ($sorted | ForEach-Object {
+            if ($_.PSObject.Properties['ControlMappings'] -and $_.ControlMappings) {
+                @($_.ControlMappings) | ForEach-Object { if ($_) { [string]$_.Framework } }
+            }
+        } | Where-Object { $_ } | Sort-Object -Unique)
+
+    $exceptionOpts = ($sorted | ForEach-Object {
+            if ($_.PSObject.Properties['Exception'] -and $_.Exception -and [string]$_.Exception.Status -and $_.Exception.Status -ne 'None') {
+                [string]$_.Exception.Status
+            }
+        } | Where-Object { $_ } | Sort-Object -Unique)
+
+    $reviewStateOpts = ($sorted | ForEach-Object {
+            if ($_.PSObject.Properties['ReviewStatus'] -and $_.ReviewStatus -and [string]$_.ReviewStatus.State) {
+                [string]$_.ReviewStatus.State
+            }
+        } | Where-Object { $_ } | Sort-Object -Unique)
 
     $mkOpts = {
         param($opts)
@@ -1091,6 +1153,16 @@ function Get-CockpitFullFindingsSection {
             "<option value=`"$($v.ToLowerInvariant())`">$v</option>"
         }) -join ''
     }
+
+    # Due-date bucket dropdown is a fixed set, not derived. Use friendly
+    # labels but stable lowercase values for the data-* attribute.
+    $dueBucketOptionsHtml = @(
+        '<option value="overdue">Overdue</option>'
+        '<option value="due-0-7">Due in 0-7 days</option>'
+        '<option value="due-8-30">Due in 8-30 days</option>'
+        '<option value="due-31+">Due in 31+ days</option>'
+        '<option value="no-due">No due date</option>'
+    ) -join ''
 
     $rowsHtml = ($sorted | ForEach-Object {
             $status = [string]$_.Status
@@ -1108,9 +1180,54 @@ function Get-CockpitFullFindingsSection {
             $obj = ConvertTo-SafeHtml -Text ([string]$_.Object)
             $desc = ConvertTo-SafeHtml -Text ([string]$_.Description)
             $searchHay = ConvertTo-SafeHtmlAttribute -Text (Get-CockpitFindingRowSearchHay -Finding $_)
+
+            # v2 filter attributes (plan §10.7 expansion).
+            $ownerNameAttr = ''
+            $dueBucketAttr = 'no-due'
+            if ($_.PSObject.Properties['Owner'] -and $_.Owner -and $_.Owner.OwnerType -and $_.Owner.OwnerType -ne 'Unknown') {
+                $ownerNameAttr = ConvertTo-SafeHtmlAttribute -Text ([string]$_.Owner.DisplayName).ToLowerInvariant()
+                $dueBucketAttr = Get-CockpitDueDateBucket -IsoDate ([string]$_.Owner.DueDate)
+            }
+
+            $exceptionStatusAttr = 'none'
+            if ($_.PSObject.Properties['Exception'] -and $_.Exception -and [string]$_.Exception.Status) {
+                $exceptionStatusAttr = ConvertTo-SafeHtmlAttribute -Text ([string]$_.Exception.Status).ToLowerInvariant()
+            }
+
+            $reviewStateAttr = ''
+            if ($_.PSObject.Properties['ReviewStatus'] -and $_.ReviewStatus -and [string]$_.ReviewStatus.State) {
+                $reviewStateAttr = ConvertTo-SafeHtmlAttribute -Text ([string]$_.ReviewStatus.State).ToLowerInvariant()
+            }
+
+            # Multi-value attributes for frameworks + controls. Space-padded
+            # so the JS contains-mode does exact-word matching: a needle of
+            # 'cis_m365' wrapped in spaces matches " cis_m365 " but never
+            # accidentally matches a longer prefix.
+            $frameworkTokens = New-Object System.Collections.Generic.List[string]
+            $controlTokens = New-Object System.Collections.Generic.List[string]
+            if ($_.PSObject.Properties['ControlMappings'] -and $_.ControlMappings) {
+                foreach ($m in @($_.ControlMappings)) {
+                    if (-not $m) { continue }
+                    $fw = [string]$m.Framework
+                    $cid = [string]$m.ControlId
+                    if ($fw) {
+                        $tok = $fw.ToLowerInvariant() -replace '\s+', '_'
+                        if ($frameworkTokens -notcontains $tok) { $frameworkTokens.Add($tok) }
+                    }
+                    if ($fw -and $cid) {
+                        $tok = "${fw}:${cid}".ToLowerInvariant() -replace '\s+', '_'
+                        $controlTokens.Add($tok)
+                    }
+                }
+            }
+            $frameworksAttr = if ($frameworkTokens.Count -gt 0) { ' ' + ($frameworkTokens -join ' ') + ' ' } else { '' }
+            $controlsAttr = if ($controlTokens.Count -gt 0) { ' ' + ($controlTokens -join ' ') + ' ' } else { '' }
+            $frameworksAttr = ConvertTo-SafeHtmlAttribute -Text $frameworksAttr
+            $controlsAttr = ConvertTo-SafeHtmlAttribute -Text $controlsAttr
+
             $bodyHtml = Get-CockpitFindingRowBody -Finding $_
             @"
-<div class="cockpit-row" data-status="$statusAttr" data-disposition="$dispAttr" data-risk="$riskAttr" data-source="$sourceAttr" data-search="$searchHay">
+<div class="cockpit-row" data-status="$statusAttr" data-disposition="$dispAttr" data-risk="$riskAttr" data-source="$sourceAttr" data-owner="$ownerNameAttr" data-frameworks="$frameworksAttr" data-controls="$controlsAttr" data-exception-status="$exceptionStatusAttr" data-review-state="$reviewStateAttr" data-due-bucket="$dueBucketAttr" data-search="$searchHay">
     <div class="cockpit-row-header">
         <span class="cockpit-badge status-$statusAttr">$statusSafe</span>
         <span class="cockpit-badge risk-$riskAttr">$riskSafe</span>
@@ -1125,6 +1242,16 @@ function Get-CockpitFullFindingsSection {
 "@
         }) -join "`n"
 
+    # Pre-build dropdown HTML so the section literal stays readable.
+    $statusOptionsHtml = & $mkOpts $statusOpts
+    $riskOptionsHtml = & $mkOpts $riskOpts
+    $dispOptionsHtml = & $mkOpts $dispOpts
+    $sourceOptionsHtml = & $mkOpts $sourceOpts
+    $ownerOptionsHtml = & $mkOpts $ownerOpts
+    $frameworkOptionsHtml = & $mkOpts $frameworkOpts
+    $exceptionOptionsHtml = & $mkOpts $exceptionOpts
+    $reviewStateOptionsHtml = & $mkOpts $reviewStateOpts
+
     return @"
 <section class="cockpit-section cockpit-interactive" id="full-findings" data-max-initial-rows="$MaxInitialRows">
     <h2 class="cockpit-section-title">Full Findings (<span class="cockpit-total-count">$($sorted.Count)</span>)</h2>
@@ -1133,19 +1260,40 @@ function Get-CockpitFullFindingsSection {
         <input type="search" placeholder="Search description, object, owner..." data-filter-key="_search" aria-label="Search Full Findings" />
         <select data-filter-key="status" aria-label="Filter by status">
             <option value="">All statuses</option>
-            $(& $mkOpts $statusOpts)
+            $statusOptionsHtml
         </select>
         <select data-filter-key="risk" aria-label="Filter by risk level">
             <option value="">All risk levels</option>
-            $(& $mkOpts $riskOpts)
+            $riskOptionsHtml
         </select>
         <select data-filter-key="disposition" aria-label="Filter by disposition">
             <option value="">All dispositions</option>
-            $(& $mkOpts $dispOpts)
+            $dispOptionsHtml
         </select>
         <select data-filter-key="source" aria-label="Filter by source">
             <option value="">All sources</option>
-            $(& $mkOpts $sourceOpts)
+            $sourceOptionsHtml
+        </select>
+        <select data-filter-key="owner" aria-label="Filter by owner">
+            <option value="">All owners</option>
+            $ownerOptionsHtml
+        </select>
+        <select data-filter-key="frameworks" data-filter-mode="contains" aria-label="Filter by framework">
+            <option value="">All frameworks</option>
+            $frameworkOptionsHtml
+        </select>
+        <input type="search" placeholder="Filter by control id (e.g. 1.1.1)" data-filter-key="controls" data-filter-mode="contains" aria-label="Filter by control id" />
+        <select data-filter-key="exception-status" aria-label="Filter by exception status">
+            <option value="">All exception states</option>
+            $exceptionOptionsHtml
+        </select>
+        <select data-filter-key="review-state" aria-label="Filter by review state">
+            <option value="">All review states</option>
+            $reviewStateOptionsHtml
+        </select>
+        <select data-filter-key="due-bucket" aria-label="Filter by due date">
+            <option value="">All due dates</option>
+            $dueBucketOptionsHtml
         </select>
         <span class="cockpit-counter" aria-live="polite"></span>
     </div>
@@ -1204,10 +1352,24 @@ function Get-CockpitJavaScript {
     if (!section) return;
     var filterEls = section.querySelectorAll('[data-filter-key]');
     var filters = {};
+    // Track each filter's mode alongside its value. The two non-default
+    // modes are documented on the filter element itself via data-filter-mode:
+    //   - "contains" → substring match on the row's matching data-* attribute
+    //                  (used for multi-value attributes like data-frameworks
+    //                  which the renderer space-pads; the needle is wrapped
+    //                  with leading+trailing spaces so the match is on a
+    //                  whole token, not a prefix).
+    //   - "substring" → raw indexOf, no padding (for free-text inputs like
+    //                   control id where "1.1.1" should also match "1.1.10").
+    //   - default → exact match (existing single-value enums).
+    var filterModes = {};
     for (var i = 0; i < filterEls.length; i++) {
       var key = filterEls[i].getAttribute('data-filter-key');
       var raw = (filterEls[i].value || '').toLowerCase().trim();
-      if (raw) filters[key] = raw;
+      if (raw) {
+        filters[key] = raw;
+        filterModes[key] = filterEls[i].getAttribute('data-filter-mode') || '';
+      }
     }
     var rows = section.querySelectorAll('.cockpit-row');
     var matchedCount = 0;
@@ -1220,6 +1382,14 @@ function Get-CockpitJavaScript {
         if (key === '_search') {
           var hay = (row.getAttribute('data-search') || '').toLowerCase();
           if (hay.indexOf(needle) === -1) { matches = false; break; }
+        } else if (filterModes[key] === 'contains') {
+          var rowMulti = (row.getAttribute('data-' + key) || '').toLowerCase();
+          // Space-wrap needle for whole-token match against the
+          // space-padded attribute. Falls back to raw indexOf when the
+          // attribute isn't space-padded (e.g. control id text input).
+          if (rowMulti.indexOf(' ' + needle + ' ') === -1 && rowMulti.indexOf(needle) === -1) {
+            matches = false; break;
+          }
         } else {
           var rowVal = (row.getAttribute('data-' + key) || '').toLowerCase();
           if (rowVal !== needle) { matches = false; break; }
