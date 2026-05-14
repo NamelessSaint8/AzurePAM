@@ -137,6 +137,15 @@ The filter controls above each section are wired in via inline JavaScript. No ex
 - **Pagination** is per-section. The visible window starts at `MaxInitialRows`; "Show more" adds 100 rows each click. "Showing X of Y" counter updates live.
 - **Print stylesheet** hides filter controls and the "Show more" button, and force-expands all row bodies for clean printable output.
 
+### Keyboard and screen-reader access
+
+- Every row header is a real `<button>` — Space/Enter toggles expand, Tab navigates between rows, no separate keydown handler required.
+- Buttons publish state via `aria-expanded` (`"false"` collapsed → `"true"` expanded) and `aria-controls="cockpit-body-<hash>"` pointing at the matching body region, so screen readers can jump straight to the revealed detail.
+- A "Skip to main content" link is the first focusable element on the page; visible only while focused, it jumps past the report header straight to the cockpit sections.
+- Page content lives inside a single `<main id="main-content">` landmark.
+- The keyboard focus ring uses `:focus-visible` (3px Microsoft-blue outline) so it only appears for keyboard users — mouse users see no extra chrome.
+- Severity is conveyed via badge text **and** color, never color alone.
+
 ---
 
 ## 6. SOC 2 reports are still separate

@@ -748,14 +748,41 @@ function Get-CockpitFindingRowSearchHay {
     return (($parts | Where-Object { $_ }) -join ' ').ToLowerInvariant()
 }
 
+function Get-CockpitFindingRowBodyId {
+    <#
+    Returns a stable, ASCII-safe DOM id for a finding's expandable body.
+    The matching <button class="cockpit-row-header"> uses this id as the
+    target of aria-controls so screen readers know which content the
+    expand button controls. Stable across runs so deep links survive.
+    #>
+    [OutputType([string])]
+    param([Parameter(Mandatory)] $Finding)
+    # Prefer FindingId when present — it's already a deterministic hash.
+    # Otherwise derive from (Description|Object) like the legacy
+    # Get-DetailedFindingsSection anchor.
+    $basis = if ($Finding.PSObject.Properties['FindingId'] -and $Finding.FindingId) {
+        [string]$Finding.FindingId
+    } else {
+        "$($Finding.Description)|$($Finding.Object)"
+    }
+    return New-SafeElementId -InputText $basis -Prefix 'cockpit-body-'
+}
+
 function Get-CockpitFindingRowBody {
     <#
     Renders the expandable row body shared by all 3 queue sections — surfaces
     v2 metadata that's too verbose for the always-visible summary row.
     Every dynamic value goes through ConvertTo-SafeHtml so XSS attempts
     via Description/Owner/etc. are neutralised.
+
+    -BodyId is the DOM id the parent button's aria-controls points at.
+    Get it via Get-CockpitFindingRowBodyId so the renderer and button
+    stay in sync.
     #>
-    param([Parameter(Mandatory)] $Finding)
+    param(
+        [Parameter(Mandatory)] $Finding,
+        [Parameter(Mandatory)][string]$BodyId
+    )
     $obj = ConvertTo-SafeHtml -Text ([string]$Finding.Object)
     $desc = ConvertTo-SafeHtml -Text ([string]$Finding.Description)
     $rem = ConvertTo-SafeHtml -Text ([string]$Finding.Remediation)
@@ -802,8 +829,10 @@ function Get-CockpitFindingRowBody {
         $findingIdLine = "<p class=`"cockpit-finding-id`"><code>$idSafe</code></p>"
     }
 
+    $bodyIdSafe = ConvertTo-SafeHtml -Text $BodyId
+
     return @"
-<div class="cockpit-row-body">
+<div class="cockpit-row-body" id="$bodyIdSafe" role="region">
     <div class="cockpit-row-body-grid">
         <div><strong>Object:</strong> $obj</div>
         <div><strong>Source:</strong> $src</div>
@@ -908,18 +937,20 @@ function Get-CockpitActionQueueSection {
                 $owner = ConvertTo-SafeHtml -Text ([string]$_.Owner.DisplayName)
             }
             $searchHay = ConvertTo-SafeHtmlAttribute -Text (Get-CockpitFindingRowSearchHay -Finding $_)
-            $bodyHtml = Get-CockpitFindingRowBody -Finding $_
+            $bodyId = Get-CockpitFindingRowBodyId -Finding $_
+            $bodyIdAttr = ConvertTo-SafeHtmlAttribute -Text $bodyId
+            $bodyHtml = Get-CockpitFindingRowBody -Finding $_ -BodyId $bodyId
             @"
 <div class="cockpit-row" data-status="$statusAttr" data-disposition="$dispAttr" data-risk="$riskAttr" data-search="$searchHay">
-    <div class="cockpit-row-header">
+    <button type="button" class="cockpit-row-header" aria-expanded="false" aria-controls="$bodyIdAttr">
         <span class="cockpit-badge status-$statusAttr">$statusSafe</span>
         <span class="cockpit-badge risk-$riskAttr">$riskSafe</span>
         <span class="cockpit-cell-object">$obj</span>
         <span class="cockpit-cell-desc">$desc</span>
         <span class="cockpit-cell-owner">$owner</span>
         <span class="cockpit-cell-disposition">$dispSafe</span>
-        <span class="cockpit-caret">&#9660;</span>
-    </div>
+        <span class="cockpit-caret" aria-hidden="true">&#9660;</span>
+    </button>
     $bodyHtml
 </div>
 "@
@@ -1003,17 +1034,19 @@ function Get-CockpitReviewQueueSection {
             $obj = ConvertTo-SafeHtml -Text ([string]$_.Object)
             $desc = ConvertTo-SafeHtml -Text ([string]$_.Description)
             $searchHay = ConvertTo-SafeHtmlAttribute -Text (Get-CockpitFindingRowSearchHay -Finding $_)
-            $bodyHtml = Get-CockpitFindingRowBody -Finding $_
+            $bodyId = Get-CockpitFindingRowBodyId -Finding $_
+            $bodyIdAttr = ConvertTo-SafeHtmlAttribute -Text $bodyId
+            $bodyHtml = Get-CockpitFindingRowBody -Finding $_ -BodyId $bodyId
             @"
 <div class="cockpit-row" data-risk="$riskAttr" data-reviewstate="$stateAttr" data-search="$searchHay">
-    <div class="cockpit-row-header">
+    <button type="button" class="cockpit-row-header" aria-expanded="false" aria-controls="$bodyIdAttr">
         <span class="cockpit-badge risk-$riskAttr">$riskSafe</span>
         <span class="cockpit-cell-score">$riskScoreSafe</span>
         <span class="cockpit-cell-state">$stateSafe</span>
         <span class="cockpit-cell-object">$obj</span>
         <span class="cockpit-cell-desc">$desc</span>
-        <span class="cockpit-caret">&#9660;</span>
-    </div>
+        <span class="cockpit-caret" aria-hidden="true">&#9660;</span>
+    </button>
     $bodyHtml
 </div>
 "@
@@ -1225,18 +1258,20 @@ function Get-CockpitFullFindingsSection {
             $frameworksAttr = ConvertTo-SafeHtmlAttribute -Text $frameworksAttr
             $controlsAttr = ConvertTo-SafeHtmlAttribute -Text $controlsAttr
 
-            $bodyHtml = Get-CockpitFindingRowBody -Finding $_
+            $bodyId = Get-CockpitFindingRowBodyId -Finding $_
+            $bodyIdAttr = ConvertTo-SafeHtmlAttribute -Text $bodyId
+            $bodyHtml = Get-CockpitFindingRowBody -Finding $_ -BodyId $bodyId
             @"
 <div class="cockpit-row" data-status="$statusAttr" data-disposition="$dispAttr" data-risk="$riskAttr" data-source="$sourceAttr" data-owner="$ownerNameAttr" data-frameworks="$frameworksAttr" data-controls="$controlsAttr" data-exception-status="$exceptionStatusAttr" data-review-state="$reviewStateAttr" data-due-bucket="$dueBucketAttr" data-search="$searchHay">
-    <div class="cockpit-row-header">
+    <button type="button" class="cockpit-row-header" aria-expanded="false" aria-controls="$bodyIdAttr">
         <span class="cockpit-badge status-$statusAttr">$statusSafe</span>
         <span class="cockpit-badge risk-$riskAttr">$riskSafe</span>
         <span class="cockpit-cell-object">$obj</span>
         <span class="cockpit-cell-desc">$desc</span>
         <span class="cockpit-cell-disposition">$dispSafe</span>
         <span class="cockpit-cell-source">$sourceSafe</span>
-        <span class="cockpit-caret">&#9660;</span>
-    </div>
+        <span class="cockpit-caret" aria-hidden="true">&#9660;</span>
+    </button>
     $bodyHtml
 </div>
 "@
@@ -1442,15 +1477,22 @@ function Get-CockpitJavaScript {
   function toggleRow(headerEl) {
     var row = headerEl.parentElement;
     if (!row) return;
-    row.classList.toggle('expanded');
+    var expanded = row.classList.toggle('expanded');
+    // Mirror visual state into ARIA so screen readers announce the change.
+    // The button itself owns aria-expanded; aria-controls already points
+    // at the body so assistive tech can jump straight to the revealed
+    // content.
+    headerEl.setAttribute('aria-expanded', expanded ? 'true' : 'false');
     var caret = headerEl.querySelector('.cockpit-caret');
     if (caret) {
-      caret.innerHTML = row.classList.contains('expanded') ? '&#9650;' : '&#9660;';
+      caret.innerHTML = expanded ? '&#9650;' : '&#9660;';
     }
   }
 
   document.addEventListener('DOMContentLoaded', function () {
     // Click handler for every row header (expand/collapse).
+    // Headers are <button> elements, so Space/Enter fire click natively —
+    // no separate keydown handler needed.
     var headers = document.querySelectorAll('.cockpit-row-header');
     for (var i = 0; i < headers.length; i++) {
       (function (h) {
@@ -1792,7 +1834,8 @@ function New-EntraChecksAnalystHtmlReport {
     $cockpitCss
 </head>
 <body>
-    <div class="container">
+    <a class="skip-link" href="#main-content">Skip to main content</a>
+    <main id="main-content" class="container">
         <header class="report-header">
             <h1>$reportTitle</h1>
             <div class="tenant-info">
@@ -1826,7 +1869,7 @@ function New-EntraChecksAnalystHtmlReport {
         $deepDiveHtml
 
         $integrityHtml
-    </div>
+    </main>
     $cockpitJs
 </body>
 </html>
@@ -1892,9 +1935,11 @@ function Get-CockpitCss {
 .cockpit-row { background: #fff; border: 1px solid #e5e7eb; border-radius: 4px; transition: box-shadow 0.15s; }
 .cockpit-row.filtered-out, .cockpit-row.paginated-out { display: none; }
 .cockpit-row:hover { box-shadow: 0 2px 4px rgba(0,0,0,0.06); }
-.cockpit-row-header { display: grid; grid-template-columns: auto auto 1fr 2fr auto auto auto; gap: 10px; align-items: center; padding: 8px 12px; cursor: pointer; user-select: none; font-size: 0.9em; }
+.cockpit-row-header { display: grid; grid-template-columns: auto auto 1fr 2fr auto auto auto; gap: 10px; align-items: center; padding: 8px 12px; cursor: pointer; user-select: none; font-size: 0.9em; width: 100%; background: transparent; border: 0; text-align: left; font-family: inherit; color: inherit; }
 .cockpit-row-header:hover { background: #f7f9fb; }
-.cockpit-row-header:focus { outline: 2px solid #0078d4; outline-offset: -2px; }
+.cockpit-row-header:focus { outline: none; }
+.cockpit-row-header:focus-visible { outline: 3px solid #0078d4; outline-offset: -3px; box-shadow: inset 0 0 0 1px #fff; }
+.cockpit-row[aria-expanded] .cockpit-caret, .cockpit-row-header[aria-expanded="true"] .cockpit-caret { transform: rotate(180deg); }
 .cockpit-badge { display: inline-block; padding: 2px 8px; border-radius: 3px; font-size: 0.78em; font-weight: 600; }
 .cockpit-badge.status-fail { background: #fde7e9; color: #a4373a; }
 .cockpit-badge.status-warning { background: #fff4ce; color: #8a5a00; }
@@ -1948,11 +1993,37 @@ function Get-HTMLHead {
         line-height: 1.6;
     }
 
+    /* Skip link: hidden until a keyboard user tabs to it, then jumps to the
+       main content. Required by WCAG 2.4.1 (Bypass Blocks). */
+    .skip-link {
+        position: absolute;
+        left: -10000px;
+        top: auto;
+        width: 1px;
+        height: 1px;
+        overflow: hidden;
+        background: #0078d4;
+        color: #fff;
+        padding: 8px 16px;
+        border-radius: 0 0 4px 0;
+        font-weight: 600;
+        z-index: 1000;
+    }
+    .skip-link:focus {
+        left: 0;
+        top: 0;
+        width: auto;
+        height: auto;
+        outline: 3px solid #ffd166;
+        outline-offset: 2px;
+    }
+
     .container {
         max-width: 1400px;
         margin: 0 auto;
         padding: 20px;
     }
+    main.container { display: block; }
 
     .report-header {
         background: linear-gradient(135deg, #0078d4 0%, #0053a6 100%);
