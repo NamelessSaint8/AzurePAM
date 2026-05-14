@@ -143,7 +143,19 @@ param(
     # asserted AD-SID <-> Entra-Object-ID equivalences. Used by the cross-
     # surface correlator to harden weak/no auto-match cases.
     # Schema: [{ "AdSid": "...", "EntraObjectId": "...", "CanonicalId": "..." }]
-    [string]$IdentityOverridesPath
+    [string]$IdentityOverridesPath,
+
+    # PR 4 of HTML-Reporting-Consolidation-Plan — HTML output routing.
+    # Default flipped to 'Cockpit': one analyst-focused HTML per run.
+    # Deep dives are opt-in via -HtmlDeepDiveDomains. 'LegacyAll' restores
+    # the pre-PR-4 multi-report behavior for users who depend on it.
+    [Parameter()]
+    [ValidateSet('Cockpit', 'CockpitAndDeepDives', 'DeepDivesOnly', 'LegacyAll')]
+    [string]$HtmlReportSet,
+
+    [Parameter()]
+    [ValidateSet('SecureScore', 'DefenderCompliance', 'AzurePolicy', 'PurviewCompliance', 'Delta', 'PrivilegedIdentity')]
+    [string[]]$HtmlDeepDiveDomains
 )
 
 # Default comprehensive report and executive summary to enabled
@@ -153,6 +165,12 @@ if (-not $PSBoundParameters.ContainsKey('GenerateComprehensiveReport')) {
 if (-not $PSBoundParameters.ContainsKey('GenerateExecutiveSummary')) {
     $GenerateExecutiveSummary = [switch]::new($true)
 }
+
+# HTML reporting defaults (PR 4 of HTML-Reporting-Consolidation-Plan).
+# Param > config block > hard default. The config block is read after the
+# config-file load below — we re-apply the precedence then.
+if (-not $PSBoundParameters.ContainsKey('HtmlReportSet')) { $HtmlReportSet = 'Cockpit' }
+if (-not $PSBoundParameters.ContainsKey('HtmlDeepDiveDomains')) { $HtmlDeepDiveDomains = @() }
 
 #region ==================== ENCODING FIX ====================
 # Fix console encoding to properly display Unicode characters
@@ -232,6 +250,21 @@ if ($ConfigFile) {
                 $ExportFormat = "All"
             } else {
                 $ExportFormat = $script:Config.Assessment.Output.Formats[0]
+            }
+        }
+
+        # PR 4 of HTML-Reporting-Consolidation-Plan: HTML routing overrides from
+        # the Assessment.Output.Html block. Param > config > hard default.
+        $htmlCfg = $null
+        if ($script:Config.Assessment.Output -and $script:Config.Assessment.Output.PSObject.Properties['Html']) {
+            $htmlCfg = $script:Config.Assessment.Output.Html
+        }
+        if ($htmlCfg) {
+            if (-not $PSBoundParameters.ContainsKey('HtmlReportSet') -and $htmlCfg.ReportSet) {
+                $HtmlReportSet = [string]$htmlCfg.ReportSet
+            }
+            if (-not $PSBoundParameters.ContainsKey('HtmlDeepDiveDomains') -and $htmlCfg.DeepDiveDomains) {
+                $HtmlDeepDiveDomains = @($htmlCfg.DeepDiveDomains)
             }
         }
 
@@ -1814,7 +1847,10 @@ function Export-AssessmentResult {
         [switch]$GenerateComprehensiveReport,
         [switch]$GenerateExecutiveSummary,
         [switch]$GenerateExcelReport,
-        [switch]$GenerateRemediationScripts
+        [switch]$GenerateRemediationScripts,
+        # PR 4 of HTML-Reporting-Consolidation-Plan
+        [string]$HtmlReportSet = 'Cockpit',
+        [string[]]$HtmlDeepDiveDomains = @()
     )
 
     Write-Host "`n[+] Generating reports..." -ForegroundColor Cyan
@@ -1822,6 +1858,8 @@ function Export-AssessmentResult {
         OutputDirectory = $OutputDir
         TenantName = $TenantName
         IncludeUnified = $IncludeUnified.IsPresent
+        HtmlReportSet = $HtmlReportSet
+        HtmlDeepDiveDomains = ($HtmlDeepDiveDomains -join ',')
     }
 
     $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
@@ -1830,30 +1868,75 @@ function Export-AssessmentResult {
     if (-not (Test-Path $reportDir)) {
         New-Item -Path $reportDir -ItemType Directory -Force | Out-Null
     }
-    
-    # Generate individual reports
-    if ($script:SecureScoreData) {
+
+    # PR 4 — consult the routing helper. Returns the concrete plan
+    # (which deep dives to emit, whether to render cockpit/comprehensive/
+    # unified, plus user-facing warnings).
+    $availableSources = @{
+        SecureScore = ($null -ne $script:SecureScoreData)
+        DefenderCompliance = ($null -ne $script:DefenderComplianceData)
+        AzurePolicy = ($null -ne $script:AzurePolicyData)
+        PurviewCompliance = ($null -ne $script:PurviewComplianceData)
+        Delta = $false  # set later if a delta report is generated
+        PrivilegedIdentity = ($null -ne $script:UnifiedPrivilegedRoster)
+    }
+    $htmlPlan = Get-HtmlReportPlan -HtmlReportSet $HtmlReportSet -HtmlDeepDiveDomains $HtmlDeepDiveDomains -AvailableSources $availableSources
+    foreach ($w in @($htmlPlan.Warnings)) { Write-Warning $w }
+    Write-Host "    HTML report mode: $HtmlReportSet" -ForegroundColor Gray
+    if ($htmlPlan.GenerateDomainReports.Count -gt 0) {
+        Write-Host "    Deep dives: $($htmlPlan.GenerateDomainReports -join ', ')" -ForegroundColor Gray
+    }
+
+    # Deep-dive subdirectory. Plan §6.2: deep dives land under
+    # Reports/<ts>/DeepDives/ so the primary cockpit stays one file at the
+    # top of the report folder. LegacyAll mode falls back to the flat
+    # layout used pre-PR-4.
+    $deepDivesDir = if ($HtmlReportSet -eq 'LegacyAll') { $reportDir } else { Join-Path $reportDir 'DeepDives' }
+    $generatedDeepDives = @{}
+    if ($htmlPlan.GenerateDomainReports.Count -gt 0 -and -not (Test-Path $deepDivesDir)) {
+        New-Item -Path $deepDivesDir -ItemType Directory -Force | Out-Null
+    }
+
+    # Generate the requested per-domain deep dives. The domain set is the
+    # intersection of (requested or LegacyAll-inferred) and (available data).
+    if ('SecureScore' -in $htmlPlan.GenerateDomainReports) {
         $ssModule = Join-Path $script:ModulesPath "EntraChecks-SecureScore.psm1"
         Import-Module $ssModule -Force
-        Export-SecureScoreReport -OutputDirectory $reportDir -TenantName $TenantName
+        $beforeFiles = @(Get-ChildItem -Path $deepDivesDir -Filter 'SecureScore-Report-*.html' -ErrorAction SilentlyContinue)
+        Export-SecureScoreReport -OutputDirectory $deepDivesDir -TenantName $TenantName
+        $afterFiles = @(Get-ChildItem -Path $deepDivesDir -Filter 'SecureScore-Report-*.html' -ErrorAction SilentlyContinue)
+        $new = ($afterFiles | Where-Object { $_.FullName -notin ($beforeFiles | ForEach-Object FullName) } | Sort-Object LastWriteTime -Descending | Select-Object -First 1)
+        if ($new) { $generatedDeepDives['SecureScore'] = $new.FullName }
     }
-    
-    if ($script:DefenderComplianceData) {
+
+    if ('DefenderCompliance' -in $htmlPlan.GenerateDomainReports) {
         $defModule = Join-Path $script:ModulesPath "EntraChecks-DefenderCompliance.psm1"
         Import-Module $defModule -Force
-        Export-DefenderComplianceReport -OutputDirectory $reportDir -TenantName $TenantName
+        $beforeFiles = @(Get-ChildItem -Path $deepDivesDir -Filter 'DefenderCompliance-Report-*.html' -ErrorAction SilentlyContinue)
+        Export-DefenderComplianceReport -OutputDirectory $deepDivesDir -TenantName $TenantName
+        $afterFiles = @(Get-ChildItem -Path $deepDivesDir -Filter 'DefenderCompliance-Report-*.html' -ErrorAction SilentlyContinue)
+        $new = ($afterFiles | Where-Object { $_.FullName -notin ($beforeFiles | ForEach-Object FullName) } | Sort-Object LastWriteTime -Descending | Select-Object -First 1)
+        if ($new) { $generatedDeepDives['DefenderCompliance'] = $new.FullName }
     }
-    
-    if ($script:AzurePolicyData) {
+
+    if ('AzurePolicy' -in $htmlPlan.GenerateDomainReports) {
         $apModule = Join-Path $script:ModulesPath "EntraChecks-AzurePolicy.psm1"
         Import-Module $apModule -Force
-        Export-AzurePolicyReport -OutputDirectory $reportDir -TenantName $TenantName
+        $beforeFiles = @(Get-ChildItem -Path $deepDivesDir -Filter 'AzurePolicy-Report-*.html' -ErrorAction SilentlyContinue)
+        Export-AzurePolicyReport -OutputDirectory $deepDivesDir -TenantName $TenantName
+        $afterFiles = @(Get-ChildItem -Path $deepDivesDir -Filter 'AzurePolicy-Report-*.html' -ErrorAction SilentlyContinue)
+        $new = ($afterFiles | Where-Object { $_.FullName -notin ($beforeFiles | ForEach-Object FullName) } | Sort-Object LastWriteTime -Descending | Select-Object -First 1)
+        if ($new) { $generatedDeepDives['AzurePolicy'] = $new.FullName }
     }
-    
-    if ($script:PurviewComplianceData) {
+
+    if ('PurviewCompliance' -in $htmlPlan.GenerateDomainReports) {
         $pvModule = Join-Path $script:ModulesPath "EntraChecks-PurviewCompliance.psm1"
         Import-Module $pvModule -Force
-        Export-PurviewComplianceReport -OutputDirectory $reportDir -TenantName $TenantName
+        $beforeFiles = @(Get-ChildItem -Path $deepDivesDir -Filter 'PurviewCompliance-Report-*.html' -ErrorAction SilentlyContinue)
+        Export-PurviewComplianceReport -OutputDirectory $deepDivesDir -TenantName $TenantName
+        $afterFiles = @(Get-ChildItem -Path $deepDivesDir -Filter 'PurviewCompliance-Report-*.html' -ErrorAction SilentlyContinue)
+        $new = ($afterFiles | Where-Object { $_.FullName -notin ($beforeFiles | ForEach-Object FullName) } | Sort-Object LastWriteTime -Descending | Select-Object -First 1)
+        if ($new) { $generatedDeepDives['PurviewCompliance'] = $new.FullName }
     }
     
     # Privileged Identity Roster — runs BEFORE the unified report so the
@@ -1969,9 +2052,10 @@ function Export-AssessmentResult {
         }
     }
 
-    # Generate unified report if requested. Runs AFTER the roster collection
-    # above so the renderer can include the Privileged Identity Roster section.
-    if ($IncludeUnified) {
+    # Generate unified report — gated by the HTML routing plan. PR 4 of
+    # HTML-Reporting-Consolidation: only LegacyAll mode emits this; under
+    # Cockpit modes the cockpit subsumes the unified report's content.
+    if ($IncludeUnified -and $htmlPlan.GenerateUnified) {
         $compModule = Join-Path $script:ModulesPath "EntraChecks-Compliance.psm1"
         if (Test-Path $compModule) {
             Import-Module $compModule -Force
@@ -2012,8 +2096,58 @@ function Export-AssessmentResult {
         }
     }
 
-    # Generate comprehensive assessment report
-    if ($GenerateComprehensiveReport -and $script:Findings -and $script:Findings.Count -gt 0) {
+    # Generate the analyst cockpit when the plan says so (PR 4 of
+    # HTML-Reporting-Consolidation-Plan). The cockpit replaces the legacy
+    # comprehensive + unified reports in default (Cockpit) mode and links
+    # out to any deep dives generated above.
+    if ($htmlPlan.GenerateCockpit -and $script:Findings -and $script:Findings.Count -gt 0) {
+        Write-Host "`n[+] Generating analyst cockpit HTML..." -ForegroundColor Cyan
+        $htmlModule = Join-Path $script:ModulesPath 'EntraChecks-HTMLReporting.psm1'
+        if (Test-Path $htmlModule) {
+            Import-Module $htmlModule -Force
+
+            $tenantInfo = [pscustomobject]@{
+                TenantName = $TenantName
+                TenantId = if ($script:TenantCapabilities) { [string]$script:TenantCapabilities.TenantId } else { '' }
+            }
+
+            # Normalize via Initialize-FindingsForReport so the cockpit sees
+            # v2 findings (FindingId/Disposition/Owner/Exception). Same flow
+            # the unified-report path uses.
+            $normalizedFindings = $script:Findings
+            if (Get-Command Initialize-FindingsForReport -ErrorAction SilentlyContinue) {
+                $tenantIdForSchema = if ($tenantInfo.TenantId) { $tenantInfo.TenantId } else { '' }
+                $grcCfg = $null
+                if ($script:Config -and $script:Config.GRC) { $grcCfg = $script:Config.GRC }
+                $normalizedFindings = Initialize-FindingsForReport `
+                    -Findings @($script:Findings) `
+                    -DefaultTenantId $tenantIdForSchema `
+                    -ConfigGrc $grcCfg
+            }
+
+            $cockpitPath = Join-Path $reportDir "EntraChecks-Analyst-Cockpit-$timestamp.html"
+            $cockpitArgs = @{
+                Findings = $normalizedFindings
+                OutputPath = $cockpitPath
+                TenantInfo = $tenantInfo
+                SecureScore = $script:SecureScoreData
+                DefenderCompliance = $script:DefenderComplianceData
+                AzurePolicy = $script:AzurePolicyData
+                PurviewCompliance = $script:PurviewComplianceData
+                HybridCorrelation = $script:HybridCorrelationData
+                PrivilegedIdentityRoster = $script:UnifiedPrivilegedRoster
+                DeepDives = $generatedDeepDives
+            }
+            New-EntraChecksAnalystHtmlReport @cockpitArgs | Out-Null
+            Write-Host "    [OK] Analyst cockpit: $cockpitPath" -ForegroundColor Green
+        }
+        else {
+            Write-Warning "EntraChecks-HTMLReporting.psm1 not found — skipping cockpit generation."
+        }
+    }
+
+    # Generate comprehensive assessment report (LegacyAll mode only).
+    if ($htmlPlan.GenerateComprehensive -and $GenerateComprehensiveReport -and $script:Findings -and $script:Findings.Count -gt 0) {
         Write-Host "`n[+] Generating comprehensive assessment report..." -ForegroundColor Cyan
 
         $comprehensiveReportScript = Join-Path (Join-Path $PSScriptRoot "Scripts") "New-ComprehensiveAssessmentReport.ps1"
@@ -2146,7 +2280,7 @@ function Start-InteractiveMode {
                 $allModules = @("Core", "IdentityProtection", "Devices", "SecureScore", "Defender", "AzurePolicy", "Purview")
                 $results = Invoke-ModuleAssessment -SelectedModules $allModules -TenantName $tenantName -OutputDir $OutputDirectory
                 
-                $reportDir = Export-AssessmentResult -OutputDir $OutputDirectory -TenantName $tenantName -IncludeUnified -GenerateComprehensiveReport:$GenerateComprehensiveReport -GenerateExecutiveSummary:$GenerateExecutiveSummary -GenerateExcelReport:$GenerateExcelReport -GenerateRemediationScripts:$GenerateRemediationScripts
+                $reportDir = Export-AssessmentResult -OutputDir $OutputDirectory -TenantName $tenantName -IncludeUnified -GenerateComprehensiveReport:$GenerateComprehensiveReport -GenerateExecutiveSummary:$GenerateExecutiveSummary -GenerateExcelReport:$GenerateExcelReport -GenerateRemediationScripts:$GenerateRemediationScripts -HtmlReportSet $HtmlReportSet -HtmlDeepDiveDomains $HtmlDeepDiveDomains
                 
                 if ($SaveSnapshot -or (Read-Host "`n  Save snapshot for future comparison? (Y/N)").ToUpper() -eq "Y") {
                     $deltaModule = Join-Path $script:ModulesPath "EntraChecks-DeltaReporting.psm1"
@@ -2204,7 +2338,7 @@ function Start-InteractiveMode {
                                 }
                                 
                                 $results = Invoke-ModuleAssessment -SelectedModules $selectedModules -TenantName $tenantName -OutputDir $OutputDirectory
-                                $reportDir = Export-AssessmentResult -OutputDir $OutputDirectory -TenantName $tenantName -IncludeUnified -GenerateComprehensiveReport:$GenerateComprehensiveReport -GenerateExecutiveSummary:$GenerateExecutiveSummary -GenerateExcelReport:$GenerateExcelReport -GenerateRemediationScripts:$GenerateRemediationScripts
+                                $reportDir = Export-AssessmentResult -OutputDir $OutputDirectory -TenantName $tenantName -IncludeUnified -GenerateComprehensiveReport:$GenerateComprehensiveReport -GenerateExecutiveSummary:$GenerateExecutiveSummary -GenerateExcelReport:$GenerateExcelReport -GenerateRemediationScripts:$GenerateRemediationScripts -HtmlReportSet $HtmlReportSet -HtmlDeepDiveDomains $HtmlDeepDiveDomains
                                 
                                 Write-Host "`n  Assessment complete!" -ForegroundColor Green
                                 Read-Host "  Press Enter to continue"
@@ -2393,7 +2527,7 @@ function Start-QuickMode {
     }
     
     $results = Invoke-ModuleAssessment -SelectedModules $modulesToRun -TenantName $TenantName -OutputDir $OutputDirectory
-    $reportDir = Export-AssessmentResult -OutputDir $OutputDirectory -TenantName $TenantName -IncludeUnified -GenerateComprehensiveReport:$GenerateComprehensiveReport -GenerateExecutiveSummary:$GenerateExecutiveSummary -GenerateExcelReport:$GenerateExcelReport -GenerateRemediationScripts:$GenerateRemediationScripts
+    $reportDir = Export-AssessmentResult -OutputDir $OutputDirectory -TenantName $TenantName -IncludeUnified -GenerateComprehensiveReport:$GenerateComprehensiveReport -GenerateExecutiveSummary:$GenerateExecutiveSummary -GenerateExcelReport:$GenerateExcelReport -GenerateRemediationScripts:$GenerateRemediationScripts -HtmlReportSet $HtmlReportSet -HtmlDeepDiveDomains $HtmlDeepDiveDomains
 
     if ($SaveSnapshot) {
         $deltaModule = Join-Path $script:ModulesPath "EntraChecks-DeltaReporting.psm1"
@@ -2481,7 +2615,7 @@ function Start-HybridMode {
     # Stash correlation output on a script-scope variable so Export-AssessmentResult can pick it up.
     $script:HybridCorrelationData = $hybridCorrelation
 
-    $reportDir = Export-AssessmentResult -OutputDir $OutputDirectory -TenantName $TenantName -IncludeUnified -GenerateComprehensiveReport:$GenerateComprehensiveReport -GenerateExecutiveSummary:$GenerateExecutiveSummary -GenerateExcelReport:$GenerateExcelReport -GenerateRemediationScripts:$GenerateRemediationScripts
+    $reportDir = Export-AssessmentResult -OutputDir $OutputDirectory -TenantName $TenantName -IncludeUnified -GenerateComprehensiveReport:$GenerateComprehensiveReport -GenerateExecutiveSummary:$GenerateExecutiveSummary -GenerateExcelReport:$GenerateExcelReport -GenerateRemediationScripts:$GenerateRemediationScripts -HtmlReportSet $HtmlReportSet -HtmlDeepDiveDomains $HtmlDeepDiveDomains
 
     if ($SaveSnapshot) {
         $deltaModule = Join-Path $script:ModulesPath "EntraChecks-DeltaReporting.psm1"
@@ -2531,7 +2665,7 @@ function Start-ScheduledMode {
     }
     
     $results = Invoke-ModuleAssessment -SelectedModules $modulesToRun -TenantName $TenantName -OutputDir $OutputDirectory
-    Export-AssessmentResult -OutputDir $OutputDirectory -TenantName $TenantName -IncludeUnified -GenerateComprehensiveReport:$GenerateComprehensiveReport -GenerateExecutiveSummary:$GenerateExecutiveSummary -GenerateExcelReport:$GenerateExcelReport -GenerateRemediationScripts:$GenerateRemediationScripts
+    Export-AssessmentResult -OutputDir $OutputDirectory -TenantName $TenantName -IncludeUnified -GenerateComprehensiveReport:$GenerateComprehensiveReport -GenerateExecutiveSummary:$GenerateExecutiveSummary -GenerateExcelReport:$GenerateExcelReport -GenerateRemediationScripts:$GenerateRemediationScripts -HtmlReportSet $HtmlReportSet -HtmlDeepDiveDomains $HtmlDeepDiveDomains
     
     if ($SaveSnapshot) {
         $deltaModule = Join-Path $script:ModulesPath "EntraChecks-DeltaReporting.psm1"

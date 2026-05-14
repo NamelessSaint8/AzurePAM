@@ -252,29 +252,60 @@ and tells you which ones were skipped.
 
 ## Understanding the Output
 
-After an assessment, look in the `Reports/` folder. You'll find a timestamped
-subfolder containing:
+After an assessment, look in the `Reports/` folder. You'll find a timestamped subfolder. **By default** (since the cockpit consolidation work), you'll get:
 
-- **Comprehensive HTML Report** — Open this in any browser. Includes:
-  - **Executive digest** with a one-line posture verdict (`STRONG` / `MINOR DEFICIENCIES` / `GAPS IDENTIFIED`)
-  - Risk-tiered finding cards with stable per-finding deep-link anchors and a copy-link affordance
-  - Dedicated sections for **Microsoft Secure Score** (top improvement actions ranked by priority), **Azure Policy** compliance, and **Purview Compliance Manager** when those modules ran — each section gracefully degrades to a "Not collected" placeholder when its data wasn't supplied
-  - **Print stylesheet** that hides nav/filters and forces black-on-white for clean printable output
-  - Optional **white-label branding** override (org name, logo, primary color) via `-Branding`
-  - **Integrity badge** (SHA-256 of the canonical findings JSON) in the footer, with a sidecar `*.findings.json` for verification
-- **Executive Summary** — A concise overview for leadership with key metrics and
-  prioritized recommendations.
-- **Unified Compliance Report** — Consolidated view across all compliance frameworks
-  (CIS, NIST, SOC 2, PCI-DSS) when external modules are enabled.
-- **SOC 2 Readiness Report** — Standalone TSC-structured report with evidence bundle
-  (when SOC 2 is enabled). See [docs/SOC2-Guide.md](docs/SOC2-Guide.md).
-- **CSV Exports** — Numbered files (`01-ExecutiveSummary.csv` through `12-Purview.csv`)
-  produced automatically when the optional `ImportExcel` module is **not** installed.
-  Mirror the full Excel sheet structure so you can re-combine via Excel's "Get Data >
-  From Folder".
-- **JSON Export** — Machine-readable output for automation pipelines.
-- **Excel Report** — Multi-sheet workbook (requires `ImportExcel` module). When absent,
-  the renderer falls back to the numbered CSV bundle automatically.
+```
+Reports/<timestamp>/
+  EntraChecks-Analyst-Cockpit-<timestamp>.html        ← primary HTML
+  EntraChecks-Analyst-Cockpit-<timestamp>.html.findings.json   (integrity sidecar)
+  Assessment-Data-<timestamp>.json                    (machine-readable v2 findings)
+  CSV/                                                (when ImportExcel is missing)
+  EntraChecks-Comprehensive-Assessment-<timestamp>.xlsx   (when ImportExcel is present)
+```
+
+### Analyst Cockpit HTML (primary)
+
+The cockpit is a single self-contained HTML file with 8 sections in workflow order:
+
+1. **Executive Digest** — posture verdict (`Strong` / `Minor Deficiencies` / `Gaps Identified` / `High Risk` / `Collection Incomplete`), key counts, since-last-assessment delta.
+2. **Action Queue** — actionable items only. Excludes approved exceptions, OK, INFO. Sorted with expired exceptions first, then by risk → due date → priority. Text search + status / risk / disposition filters + pagination + expandable rows.
+3. **Review Queue** — items needing human judgment (`Status='REVIEW'` or `ReviewStatus.State` in NeedsReview / InReview / ActionRequired).
+4. **Source Posture** — cards summarising what was collected (Secure Score, Defender, Azure Policy, Purview, etc.) with collected vs not-collected state.
+5. **Evidence and Provenance** — flat audit table of every v2 Evidence reference (EvidenceId, Source, Provider, Cmdlet, Scope, Hash, RedactionStatus).
+6. **Full Findings** — every finding regardless of disposition (FAIL/WARNING/REVIEW/OK/INFO/accepted-risks/etc.). 5 filters + pagination.
+7. **Deep Dive Hub** — status cards for each on-demand domain. Generated reports link directly to files under `DeepDives/`; pending reports show the exact command to generate them.
+8. **Integrity Footer** — SHA-256 of canonical findings JSON + verification command.
+
+All values HTML-encoded; static-report Content Security Policy in `<head>`; no external CDNs (works under `file://`). Filter / pagination JS is inlined.
+
+### Switching to multi-report mode
+
+The pre-cockpit multi-report layout is preserved via:
+
+```powershell
+.\Start-EntraChecks.ps1 -HtmlReportSet LegacyAll
+```
+
+That restores the comprehensive + unified + per-domain HTML files at the root of the report folder.
+
+### Generating deep dives selectively
+
+```powershell
+# Cockpit + just the deep dives you want, under DeepDives/
+.\Start-EntraChecks.ps1 -HtmlReportSet CockpitAndDeepDives `
+    -HtmlDeepDiveDomains AzurePolicy,DefenderCompliance,SecureScore
+```
+
+Valid domains: `SecureScore`, `DefenderCompliance`, `AzurePolicy`, `PurviewCompliance`, `Delta`, `PrivilegedIdentity`.
+
+Full reference: [docs/Cockpit-Report-Guide.md](docs/Cockpit-Report-Guide.md).
+
+### Other outputs
+
+- **SOC 2 reports** — Stay separate when `SOC2.Enabled = true`. Different audience, retention, and evidence-period semantics. See [docs/SOC2-Guide.md](docs/SOC2-Guide.md).
+- **Excel report** — Multi-sheet workbook with the v2 schema sheets (Analyst Queue / Review Queue / Control Register / Evidence Register / Exceptions / Remediation Plan). Requires `ImportExcel` module; renderer falls back to numbered CSVs when not installed.
+- **CSV exports** — Flat-row format via `ConvertTo-FindingFlatRow`. Owner / Exception / ReviewStatus flattened to prefixed scalar columns; ControlMappings / Evidence / Tags / Links semicolon-joined.
+- **JSON export** — Full v2 finding objects at `-Depth 15`. `Metadata.SchemaVersion='2.0'`. Round-trips Owner / Exception / ControlMappings / Evidence / RemediationDetail cleanly.
 
 ### Finding Severities
 

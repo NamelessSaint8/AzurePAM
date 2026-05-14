@@ -19,7 +19,14 @@
         "CSV",
         "JSON"
       ],
-      "IncludeTimestamp": true
+      "IncludeTimestamp": true,
+      "Html": {
+        "_comment": "PR 4 of HTML-Reporting-Consolidation. ReportSet selects the HTML output style: 'Cockpit' (default — one analyst HTML), 'CockpitAndDeepDives' (cockpit + listed deep dives), 'DeepDivesOnly' (no cockpit; listed deep dives only), 'LegacyAll' (pre-PR4 multi-report behavior). DeepDiveDomains restricts which on-demand reports are generated; valid values: SecureScore, DefenderCompliance, AzurePolicy, PurviewCompliance, Delta, PrivilegedIdentity. MaxInitialRows controls the cockpit's Action/Review/Full Findings pagination window.",
+        "ReportSet": "Cockpit",
+        "DeepDiveDomains": [],
+        "OpenPrimaryReport": true,
+        "MaxInitialRows": 100
+      }
     },
     "Exclusions": {
       "Users": [],

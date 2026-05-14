@@ -8,6 +8,39 @@ EntraChecks now includes enterprise-ready reporting capabilities designed for IT
 2. ✅ **Hard to prioritize what to fix** → Risk scoring and priority recommendations
 3. ✅ **Difficult to map to compliance frameworks** → Automatic mapping to CIS M365, NIST CSF, SOC2, PCI-DSS
 
+## Analyst Cockpit (default HTML)
+
+A normal assessment produces **one primary HTML file** — the analyst cockpit (`EntraChecks-Analyst-Cockpit-<ts>.html`). It replaces the pre-PR-4 multi-report layout (comprehensive + unified + per-domain HTML).
+
+The cockpit has 8 sections in analyst-workflow order: Executive Digest → Action Queue → Review Queue → Source Posture → Evidence and Provenance → Full Findings → Deep Dive Hub → Integrity Footer. Action Queue / Review Queue / Full Findings are interactive (text search, multi-column filters, pagination, expandable rows showing the full v2 detail).
+
+Switch modes via `-HtmlReportSet`:
+
+| Mode | Output |
+|---|---|
+| `Cockpit` (default) | Cockpit only |
+| `CockpitAndDeepDives` | Cockpit + only the deep dives listed in `-HtmlDeepDiveDomains`, under `DeepDives/` |
+| `DeepDivesOnly` | Only the listed deep dives (no cockpit) |
+| `LegacyAll` | Pre-PR-4 multi-report layout (compatibility mode) |
+
+Examples:
+
+```powershell
+# Default — cockpit only
+.\Start-EntraChecks.ps1
+
+# Cockpit + Azure Policy + Defender deep dives
+.\Start-EntraChecks.ps1 -HtmlReportSet CockpitAndDeepDives `
+    -HtmlDeepDiveDomains AzurePolicy,DefenderCompliance
+
+# Old multi-report behavior
+.\Start-EntraChecks.ps1 -HtmlReportSet LegacyAll
+```
+
+Full reference: [Cockpit-Report-Guide.md](Cockpit-Report-Guide.md).
+
+---
+
 ## v2 Finding Schema — what's new in the reports
 
 Every report consumes the central v2 finding schema (`SchemaVersion='2.0'`). Each finding now carries a stable `FindingId`, derived `Disposition`, analyst-overlaid `Owner` / `Exception` / `ReviewStatus`, framework-flattened `ControlMappings`, and an `Evidence` chain of references. Legacy code paths still work; v2 fields are additive.

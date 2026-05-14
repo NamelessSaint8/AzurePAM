@@ -35,6 +35,215 @@ Import-Module (Join-Path $modulePath "EntraChecks-PrivilegedIdentityRender.psm1"
 # environment via $module:LowConfidenceCheckNames or by editing this file.
 $script:LowConfidenceCheckNames = @()
 
+#region HTML Safety Helpers (PR 1 of HTML-Reporting-Consolidation-Plan)
+
+# Centralized encoders + safe-link/safe-id builders. Every dynamic value
+# rendered into the cockpit HTML should pass through one of these so the
+# encoding decisions are auditable in one place rather than scattered across
+# 2,500 lines of string interpolation.
+#
+# These helpers do NOT alter the output of the existing legacy report
+# functions in this module — they're foundation pieces for the cockpit
+# renderer that PR 2 introduces. Call sites in existing functions can migrate
+# opportunistically; this PR is additive.
+
+function ConvertTo-SafeHtml {
+    <#
+    .SYNOPSIS
+        Encodes arbitrary text for use as HTML element content.
+    .DESCRIPTION
+        Wraps `[System.Net.WebUtility]::HtmlEncode` with two guarantees the
+        raw call doesn't give us:
+          1. $null input returns '' (not the literal string "null", not an error).
+          2. The implementation is in one place, so a future move to a stricter
+             encoder is a one-line change for the whole report path.
+
+        Use this for any value going INTO HTML element content
+        (e.g. `<td>$x</td>`). For attribute values use
+        `ConvertTo-SafeHtmlAttribute`. For embedding into `<script>` blocks
+        use `ConvertTo-SafeHtmlJson`.
+    .OUTPUTS
+        Encoded string. Empty string for $null / empty input.
+    #>
+    [OutputType([string])]
+    [CmdletBinding()]
+    param([AllowNull()][AllowEmptyString()][string]$Text)
+    if ([string]::IsNullOrEmpty($Text)) { return '' }
+    return [System.Net.WebUtility]::HtmlEncode($Text)
+}
+
+function ConvertTo-SafeHtmlAttribute {
+    <#
+    .SYNOPSIS
+        Encodes arbitrary text for use INSIDE an HTML attribute.
+    .DESCRIPTION
+        `WebUtility.HtmlEncode` already escapes `<`, `>`, `&`, `"`, `'` — which
+        covers double-quoted attribute contexts. This wrapper exists so
+        call-site intent is explicit ("this is being used in an attribute")
+        and so a stricter encoder (e.g. AntiXSS) can be swapped in later
+        without grep-and-replace across the whole module.
+
+        ALWAYS double-quote the attribute when interpolating the result:
+
+            <input type="text" value="$(ConvertTo-SafeHtmlAttribute -Text $x)" />
+
+        Single-quoted attributes are also safe because HtmlEncode escapes
+        `'` to `&#39;`. Avoid unquoted attributes — they're vulnerable to
+        whitespace and `>` even with encoding.
+    .OUTPUTS
+        Encoded string. Empty string for $null / empty input.
+    #>
+    [OutputType([string])]
+    [CmdletBinding()]
+    param([AllowNull()][AllowEmptyString()][string]$Text)
+    if ([string]::IsNullOrEmpty($Text)) { return '' }
+    return [System.Net.WebUtility]::HtmlEncode($Text)
+}
+
+function ConvertTo-SafeHtmlJson {
+    <#
+    .SYNOPSIS
+        Encodes an object as JSON that's safe to embed in a `<script>` block.
+    .DESCRIPTION
+        Plain `ConvertTo-Json` output is JSON-safe but NOT HTML-safe. A
+        finding description containing `</script>` would break out of the
+        script block. JavaScript also treats U+2028 (line separator) and
+        U+2029 (paragraph separator) as line terminators inside string
+        literals — those need escaping even though JSON doesn't require it.
+
+        This function:
+          - calls ConvertTo-Json with the requested depth
+          - replaces `<`, `>`, `&` with their `\uXXXX` JSON escapes so the
+            embedded string can never close the surrounding `<script>` tag
+            or be misinterpreted by HTML-aware parsers
+          - escapes U+2028 and U+2029 explicitly
+
+        The result is valid JSON AND safe to drop inside `<script>...</script>`.
+    .EXAMPLE
+        $payload | ConvertTo-SafeHtmlJson -Depth 10
+        # then embed inside <script>const data = $result;</script>
+    .OUTPUTS
+        Single string of safe JSON.
+    #>
+    [OutputType([string])]
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, ValueFromPipeline)][AllowNull()] $InputObject,
+        [int]$Depth = 10
+    )
+    process {
+        if ($null -eq $InputObject) { return 'null' }
+        $json = $InputObject | ConvertTo-Json -Depth $Depth -Compress:$false
+        # The four escapes that matter for HTML embedding + JS parsing.
+        # Order is irrelevant — replacements don't overlap.
+        
+        $json = $json `
+            -replace '<', '\u003c' `
+            -replace '>', '\u003e' `
+            -replace '&', '\u0026' `
+            -replace "`u{2028}", '\u2028' `
+            -replace "`u{2029}", '\u2029'
+
+        return $json
+    }
+}
+
+function New-SafeExternalLink {
+    <#
+    .SYNOPSIS
+        Builds an `<a>` tag for an external URL with safe scheme validation
+        and noopener/noreferrer attributes.
+    .DESCRIPTION
+        Use this for ANY URL that came from a finding, evidence reference,
+        owner block, or any other dynamic source — including URLs that look
+        trustworthy (e.g. portal.azure.com). A malicious `javascript:` URL
+        smuggled into a Defender finding's `ActionUrl` would otherwise run
+        when the user clicks the link.
+
+        Behavior:
+          - Only `http://` and `https://` schemes pass; anything else
+            (`javascript:`, `data:`, `vbscript:`, `file:`, `chrome:`, etc.)
+            is rejected and the function returns the encoded LinkText only,
+            wrapped in `<span>` so the user sees the text but can't click it.
+          - `rel="noopener noreferrer"` on every external link (prevents
+            window.opener access + Referer leakage to third parties).
+          - `target="_blank"` so the cockpit isn't navigated away from.
+          - URL and link text are HTML-encoded for attribute and content
+            contexts respectively.
+
+        $null/empty URL returns the encoded LinkText only.
+    .OUTPUTS
+        HTML string: either an `<a>` or a `<span>` depending on URL safety.
+    #>
+    [OutputType([string])]
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][AllowNull()][string]$Url,
+        [Parameter(Mandatory)][AllowEmptyString()][AllowNull()][string]$LinkText
+    )
+    $safeText = ConvertTo-SafeHtml -Text $LinkText
+    if (-not $Url) { return "<span>$safeText</span>" }
+
+    # Scheme check. We deliberately compare against an allowlist rather than
+    # blocking known-bad schemes — new dangerous schemes appear over time
+    # (e.g. `intent:` on Android, `ms-cxh:` on Windows).
+    $allowedSchemes = @('http', 'https')
+    $parsedScheme = $null
+    if ($Url -match '^([a-zA-Z][a-zA-Z0-9+.\-]*):') {
+        $parsedScheme = $matches[1].ToLowerInvariant()
+    }
+    if (-not $parsedScheme -or $parsedScheme -notin $allowedSchemes) {
+        # Reject — render text only, no clickable element.
+        return "<span title=`"Link rejected: unsafe scheme`">$safeText</span>"
+    }
+
+    $safeUrl = ConvertTo-SafeHtmlAttribute -Text $Url
+    return "<a href=`"$safeUrl`" target=`"_blank`" rel=`"noopener noreferrer`">$safeText</a>"
+}
+
+function New-SafeElementId {
+    <#
+    .SYNOPSIS
+        Generates a stable, ASCII-safe HTML id from arbitrary input.
+    .DESCRIPTION
+        HTML id values are author-controlled but in this codebase the inputs
+        are dynamic — FindingIds, object names, UPNs, framework labels. Raw
+        substitution would produce ids like `id="<img src=x>"` or
+        `id="user@contoso.com #1"` which break selectors, break querySelector
+        escaping, and open XSS surfaces in JavaScript that later reads them.
+
+        This function:
+          - hashes the input with SHA1 (id stability only, not security)
+          - returns `<Prefix><first 16 hex chars>` — always ASCII, always
+            valid as both an HTML id and a CSS selector.
+
+        SHA1 is fine here: this is for collision-resistant readable ids, not
+        cryptography. Two different inputs will not collide in practice; an
+        attacker forcing a collision gains nothing.
+    .OUTPUTS
+        Safe id string, e.g. `ecf-anchor-d8bbd4ad379dae12`.
+    #>
+    [OutputType([string])]
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][AllowNull()][string]$InputText,
+        [string]$Prefix = 'ecf-anchor-'
+    )
+    if ([string]::IsNullOrEmpty($InputText)) { $InputText = 'empty' }
+    $sha1 = [System.Security.Cryptography.SHA1]::Create()
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($InputText)
+        $hash = $sha1.ComputeHash($bytes)
+        $hex = -join ($hash | ForEach-Object { $_.ToString('x2') })
+        return $Prefix + $hex.Substring(0, 16)
+    }
+    finally {
+        $sha1.Dispose()
+    }
+}
+
+#endregion
+
 #region HTML Generation Functions
 
 function New-EnhancedHTMLReport {
@@ -298,6 +507,1234 @@ function New-EnhancedHTMLReport {
 
     return $OutputPath
 }
+
+#region Cockpit Renderer (PR 2 of HTML-Reporting-Consolidation-Plan)
+# The cockpit is the single primary analyst HTML report that will become the
+# default in PR 4. It composes existing section builders (executive digest,
+# compliance, full findings, integrity footer) plus three new sections
+# (Source Posture, Evidence/Provenance, Deep Dive Hub) and basic non-
+# interactive Action Queue + Review Queue tables. PR 3 upgrades the queues
+# to interactive (filters, pagination, expandable rows). PR 4 flips the
+# orchestrator default.
+
+function Get-CockpitSourcePostureSection {
+    <#
+    .SYNOPSIS
+        Renders the Source Posture cards summarising what was collected.
+    .DESCRIPTION
+        One card per data source. Each card shows collection status
+        (collected / not collected / failed), provider name, and a brief
+        metric where available. Sources for which we have no data render
+        a "Not collected" placeholder so the analyst knows the section
+        exists but the data wasn't gathered.
+    #>
+    [OutputType([string])]
+    param(
+        [object]$SecureScore,
+        [object]$DefenderCompliance,
+        [object]$AzurePolicy,
+        [object]$PurviewCompliance,
+        [object]$HybridCorrelation,
+        [object]$PrivilegedIdentityRoster
+    )
+
+    function _Card {
+        param([string]$Name, [bool]$Collected, [string]$Metric, [string]$Anchor)
+        $statusClass = if ($Collected) { 'good' } else { 'muted' }
+        $statusLabel = if ($Collected) { 'Collected' } else { 'Not collected' }
+        $safeName = ConvertTo-SafeHtml -Text $Name
+        $safeMetric = ConvertTo-SafeHtml -Text $Metric
+        $safeAnchor = ConvertTo-SafeHtmlAttribute -Text $Anchor
+        $linkAttr = if ($Anchor) { " data-anchor=`"$safeAnchor`"" } else { '' }
+        return @"
+            <div class="source-card $statusClass"$linkAttr>
+                <h4>$safeName</h4>
+                <p class="source-status">$statusLabel</p>
+                <p class="source-metric">$safeMetric</p>
+            </div>
+"@
+    }
+
+    # Pre-compute metrics so the array-of-Card-calls is parser-friendly.
+    # Inline multi-line `if (...) { ... } else { '' }` expressions inside
+    # `_Card -Metric (...)` get parsed as separate commands across lines
+    # in PowerShell's array literal context.
+    $secureScoreMetric = ''
+    if ($SecureScore -and $SecureScore.PSObject.Properties['CurrentScore']) {
+        $secureScoreMetric = "Score: $($SecureScore.CurrentScore)"
+    }
+    $defenderMetric = ''
+    if ($DefenderCompliance -and $DefenderCompliance.PSObject.Properties['Standards']) {
+        $defenderMetric = "$(@($DefenderCompliance.Standards).Count) standards"
+    }
+    $policyMetric = ''
+    if ($AzurePolicy -and $AzurePolicy.PSObject.Properties['Initiatives']) {
+        $policyMetric = "$(@($AzurePolicy.Initiatives).Count) initiatives"
+    }
+    $purviewMetric = ''
+    if ($PurviewCompliance -and $PurviewCompliance.PSObject.Properties['Assessments']) {
+        $purviewMetric = "$(@($PurviewCompliance.Assessments).Count) assessments"
+    }
+    $hybridMetric = ''
+    if ($HybridCorrelation -and $HybridCorrelation.PSObject.Properties['Correlations']) {
+        $hybridMetric = "$(@($HybridCorrelation.Correlations).Count) correlations"
+    }
+    $rosterMetric = ''
+    if ($PrivilegedIdentityRoster -and $PrivilegedIdentityRoster.PSObject.Properties['Statistics']) {
+        $rosterMetric = "$($PrivilegedIdentityRoster.Statistics.TotalIdentities) identities"
+    }
+
+    $cards = @(
+        _Card -Name 'EntraChecks (Internal)' -Collected $true -Metric 'Always present'
+        _Card -Name 'Microsoft Secure Score' -Collected ([bool]$SecureScore) -Metric $secureScoreMetric
+        _Card -Name 'Defender for Cloud' -Collected ([bool]$DefenderCompliance) -Metric $defenderMetric
+        _Card -Name 'Azure Policy' -Collected ([bool]$AzurePolicy) -Metric $policyMetric
+        _Card -Name 'Purview Compliance Manager' -Collected ([bool]$PurviewCompliance) -Metric $purviewMetric
+        _Card -Name 'Hybrid Correlation' -Collected ([bool]$HybridCorrelation) -Metric $hybridMetric
+        _Card -Name 'Privileged Identity Roster' -Collected ([bool]$PrivilegedIdentityRoster) -Metric $rosterMetric
+    )
+    $cardHtml = $cards -join "`n"
+    return @"
+<section class="cockpit-section" id="source-posture">
+    <h2 class="cockpit-section-title">Source Posture</h2>
+    <p class="cockpit-section-lede">What was collected, and from where. Sources marked "Not collected" can be enabled with the matching <code>-Include&lt;Source&gt;</code> switch.</p>
+    <div class="source-card-grid">
+$cardHtml
+    </div>
+</section>
+"@
+}
+
+function Get-CockpitEvidenceProvenanceSection {
+    <#
+    .SYNOPSIS
+        Renders the Evidence / Provenance flat table.
+    .DESCRIPTION
+        One row per Evidence reference flattened across all findings. Carries
+        EvidenceId, Source, Provider, Cmdlet, Scope, ResourceId, Hash, and
+        RedactionStatus so an auditor can trace any finding back to the API
+        call that produced it. Section is suppressed when no v2 Evidence
+        data exists (legacy findings).
+    #>
+    [OutputType([string])]
+    param([Parameter(Mandatory)][array]$Findings)
+
+    $rows = New-Object System.Collections.Generic.List[object]
+    foreach ($f in $Findings) {
+        if (-not $f.PSObject.Properties['Evidence']) { continue }
+        $ev = $f.Evidence
+        if (-not $ev) { continue }
+        foreach ($e in @($ev)) {
+            if ($null -eq $e) { continue }
+            $row = [pscustomobject]@{
+                EvidenceId = [string]$e.EvidenceId
+                FindingId = [string]$f.FindingId
+                Source = [string]$e.Source
+                Provider = [string]$e.Provider
+                Cmdlet = [string]$e.Cmdlet
+                QueryScope = [string]$e.QueryScope
+                ResourceId = [string]$e.ResourceId
+                Hash = [string]$e.Hash
+                RedactionStatus = [string]$e.RedactionStatus
+            }
+            $rows.Add($row)
+        }
+    }
+    if ($rows.Count -eq 0) { return '' }
+
+    $rowsHtml = ($rows | ForEach-Object {
+            $eid = ConvertTo-SafeHtml -Text $_.EvidenceId
+            $fid = ConvertTo-SafeHtml -Text $_.FindingId
+            $src = ConvertTo-SafeHtml -Text $_.Source
+            $prov = ConvertTo-SafeHtml -Text $_.Provider
+            $cmd = ConvertTo-SafeHtml -Text $_.Cmdlet
+            $scope = ConvertTo-SafeHtml -Text $_.QueryScope
+            $resId = ConvertTo-SafeHtml -Text $_.ResourceId
+            $hash = ConvertTo-SafeHtml -Text $_.Hash
+            $redact = ConvertTo-SafeHtml -Text $_.RedactionStatus
+            "<tr><td><code>$eid</code></td><td><code>$fid</code></td><td>$src</td><td>$prov</td><td>$cmd</td><td>$scope</td><td><code>$resId</code></td><td class=`"hash-cell`">$hash</td><td>$redact</td></tr>"
+        }) -join "`n"
+
+    return @"
+<section class="cockpit-section" id="evidence-provenance">
+    <h2 class="cockpit-section-title">Evidence and Provenance</h2>
+    <p class="cockpit-section-lede">Provenance audit trail. Every evidence reference includes the source, cmdlet, scope, hash, and redaction status so any finding can be traced back to the API call that produced it.</p>
+    <table class="provenance-table">
+        <thead>
+            <tr>
+                <th>Evidence ID</th><th>Finding ID</th><th>Source</th><th>Provider</th><th>Cmdlet</th><th>Scope</th><th>Resource</th><th>Hash</th><th>Redaction</th>
+            </tr>
+        </thead>
+        <tbody>
+$rowsHtml
+        </tbody>
+    </table>
+</section>
+"@
+}
+
+function Get-CockpitDeepDiveHubSection {
+    <#
+    .SYNOPSIS
+        Renders the Deep Dive Hub — status cards for each on-demand report.
+    .DESCRIPTION
+        Each domain (Secure Score, Defender, Azure Policy, Purview, Delta,
+        Privileged Identity) gets a card showing whether the corresponding
+        deep-dive HTML has been generated, and a hint command for generating
+        it when not. The DeepDives hashtable maps domain name -> file path
+        for generated reports.
+    #>
+    [OutputType([string])]
+    param([hashtable]$DeepDives = @{})
+
+    $domains = @(
+        @{ Key = 'SecureScore'; Name = 'Microsoft Secure Score'; Hint = '-HtmlReportSet CockpitAndDeepDives -HtmlDeepDiveDomains SecureScore' }
+        @{ Key = 'DefenderCompliance'; Name = 'Defender for Cloud Compliance'; Hint = '-HtmlReportSet CockpitAndDeepDives -HtmlDeepDiveDomains DefenderCompliance' }
+        @{ Key = 'AzurePolicy'; Name = 'Azure Policy Initiatives'; Hint = '-HtmlReportSet CockpitAndDeepDives -HtmlDeepDiveDomains AzurePolicy' }
+        @{ Key = 'PurviewCompliance'; Name = 'Purview Compliance Manager'; Hint = '-HtmlReportSet CockpitAndDeepDives -HtmlDeepDiveDomains PurviewCompliance' }
+        @{ Key = 'Delta'; Name = 'Delta vs Previous Assessment'; Hint = '-HtmlReportSet CockpitAndDeepDives -HtmlDeepDiveDomains Delta' }
+        @{ Key = 'PrivilegedIdentity'; Name = 'Privileged Identity Roster'; Hint = '-HtmlReportSet CockpitAndDeepDives -HtmlDeepDiveDomains PrivilegedIdentity' }
+    )
+
+    $cardsHtml = ($domains | ForEach-Object {
+            $name = ConvertTo-SafeHtml -Text $_.Name
+            $hint = ConvertTo-SafeHtml -Text $_.Hint
+            if ($DeepDives.ContainsKey($_.Key) -and $DeepDives[$_.Key]) {
+                # Generated — link to the file. Relative path so the cockpit
+                # works under file:// when opened from the report folder.
+                $rel = Split-Path -Leaf $DeepDives[$_.Key]
+                $linkHtml = New-SafeExternalLink -Url $rel -LinkText 'Open deep dive'
+                "<div class=`"deep-dive-card generated`"><h4>$name</h4><p class=`"status`">Generated</p><p>$linkHtml</p></div>"
+            }
+            else {
+                "<div class=`"deep-dive-card pending`"><h4>$name</h4><p class=`"status`">Not generated this run</p><p class=`"hint`">Run with: <code>$hint</code></p></div>"
+            }
+        }) -join "`n"
+
+    return @"
+<section class="cockpit-section" id="deep-dive-hub">
+    <h2 class="cockpit-section-title">Deep Dive Hub</h2>
+    <p class="cockpit-section-lede">Detailed per-domain reports. Generated on demand; not part of the default run to keep the report set focused.</p>
+    <div class="deep-dive-grid">
+$cardsHtml
+    </div>
+</section>
+"@
+}
+
+function Get-CockpitFindingRowSearchHay {
+    <#
+    Build the lowercase "search haystack" string for a finding's data-search
+    attribute. Concatenates the fields users are likely to grep against,
+    HTML-attribute-encoded once. The inline JS does a case-insensitive
+    substring match.
+    #>
+    param([Parameter(Mandatory)] $Finding)
+    $findingIdStr = ''
+    if ($Finding.PSObject.Properties['FindingId']) { $findingIdStr = [string]$Finding.FindingId }
+    $parts = @(
+        [string]$Finding.Object
+        [string]$Finding.Description
+        [string]$Finding.Remediation
+        [string]$Finding.CheckName
+        [string]$Finding.Type
+        [string]$Finding.Source
+        $findingIdStr
+    )
+    if ($Finding.PSObject.Properties['Owner'] -and $Finding.Owner) {
+        $parts += [string]$Finding.Owner.DisplayName
+        $parts += [string]$Finding.Owner.Email
+    }
+    return (($parts | Where-Object { $_ }) -join ' ').ToLowerInvariant()
+}
+
+function Get-CockpitFindingRowBody {
+    <#
+    Renders the expandable row body shared by all 3 queue sections — surfaces
+    v2 metadata that's too verbose for the always-visible summary row.
+    Every dynamic value goes through ConvertTo-SafeHtml so XSS attempts
+    via Description/Owner/etc. are neutralised.
+    #>
+    param([Parameter(Mandatory)] $Finding)
+    $obj = ConvertTo-SafeHtml -Text ([string]$Finding.Object)
+    $desc = ConvertTo-SafeHtml -Text ([string]$Finding.Description)
+    $rem = ConvertTo-SafeHtml -Text ([string]$Finding.Remediation)
+    $src = ConvertTo-SafeHtml -Text ([string]$Finding.Source)
+    $checkName = ConvertTo-SafeHtml -Text ([string]$Finding.CheckName)
+
+    $ownerLine = ''
+    if ($Finding.PSObject.Properties['Owner'] -and $Finding.Owner -and [string]$Finding.Owner.OwnerType -and $Finding.Owner.OwnerType -ne 'Unknown') {
+        $name = ConvertTo-SafeHtml -Text ([string]$Finding.Owner.DisplayName)
+        $email = ConvertTo-SafeHtml -Text ([string]$Finding.Owner.Email)
+        $due = ConvertTo-SafeHtml -Text ([string]$Finding.Owner.DueDate)
+        $ownerLine = "<p><strong>Owner:</strong> $name"
+        if ($email) { $ownerLine += " ($email)" }
+        if ($due) { $ownerLine += " &middot; <strong>Due:</strong> $due" }
+        $ownerLine += '</p>'
+    }
+
+    $exceptionLine = ''
+    if ($Finding.PSObject.Properties['Exception'] -and $Finding.Exception -and [string]$Finding.Exception.Status -and $Finding.Exception.Status -ne 'None') {
+        $st = ConvertTo-SafeHtml -Text ([string]$Finding.Exception.Status)
+        $type = ConvertTo-SafeHtml -Text ([string]$Finding.Exception.Type)
+        $expires = ConvertTo-SafeHtml -Text ([string]$Finding.Exception.ExpiresAt)
+        $just = ConvertTo-SafeHtml -Text ([string]$Finding.Exception.Justification)
+        $parts = @("<strong>Exception:</strong> $st")
+        if ($type) { $parts += $type }
+        if ($expires) { $parts += "expires $expires" }
+        $exceptionLine = '<p>' + ($parts -join ' &middot; ') + '</p>'
+        if ($just) {
+            $exceptionLine += "<p class=`"cockpit-justification`">$just</p>"
+        }
+    }
+
+    $evidenceLine = ''
+    if ($Finding.PSObject.Properties['Evidence'] -and $Finding.Evidence) {
+        $count = @($Finding.Evidence).Count
+        if ($count -gt 0) {
+            $evidenceLine = "<p class=`"cockpit-meta-line`"><strong>Evidence:</strong> $count reference$(if ($count -ne 1) {'s'}) &mdash; see Evidence and Provenance section below.</p>"
+        }
+    }
+
+    $findingIdLine = ''
+    if ($Finding.PSObject.Properties['FindingId'] -and $Finding.FindingId) {
+        $idSafe = ConvertTo-SafeHtml -Text ([string]$Finding.FindingId)
+        $findingIdLine = "<p class=`"cockpit-finding-id`"><code>$idSafe</code></p>"
+    }
+
+    return @"
+<div class="cockpit-row-body">
+    <div class="cockpit-row-body-grid">
+        <div><strong>Object:</strong> $obj</div>
+        <div><strong>Source:</strong> $src</div>
+        <div><strong>Check:</strong> $checkName</div>
+    </div>
+    <p><strong>Description:</strong> $desc</p>
+    $ownerLine
+    $exceptionLine
+    <p><strong>Remediation:</strong> $rem</p>
+    $evidenceLine
+    $findingIdLine
+</div>
+"@
+}
+
+function Get-CockpitActionQueueSection {
+    <#
+    .SYNOPSIS
+        Interactive Action Queue with filters, expandable rows, and pagination.
+    .DESCRIPTION
+        Filter rule:
+          Include: Disposition in {Open, ActionRequired, Review, ExpiredException}.
+          Exclude: Passing, Informational, AcceptedRisk, CompensatingControl,
+                   FalsePositive, OutOfScope, Resolved, Suppressed.
+        Legacy fallback: Status in {FAIL, WARNING, REVIEW}.
+        Sort order (plan §10.2):
+          1. ExpiredException dispositions first (don't let lapsed waivers hide)
+          2. Critical / High risk
+          3. Earliest Owner.DueDate
+          4. Priority score (descending)
+          5. Owner DisplayName
+        Inline JS (Get-CockpitJavaScript) wires the filter inputs to data-*
+        attributes on each row.
+    #>
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)][array]$EnhancedFindings,
+        [int]$MaxInitialRows = 100
+    )
+
+    $actionable = @('Open', 'ActionRequired', 'Review', 'ExpiredException')
+    $queue = @($EnhancedFindings | Where-Object {
+            $disp = if ($_.PSObject.Properties['Disposition']) { [string]$_.Disposition } else { '' }
+            if ($disp) { return ($disp -in $actionable) }
+            return ($_.Status -in @('FAIL', 'WARNING', 'REVIEW'))
+        })
+
+    # Documented sort order. Sort keys built as an array so the multi-line
+    # form doesn't fight with PSScriptAnalyzer's indentation rule for
+    # backtick-continued pipelines.
+    $sortKeys = @(
+        @{ Expression = { if ([string]$_.Disposition -eq 'ExpiredException') { 0 } else { 1 } } }
+        @{ Expression = { switch ([string]$_.RiskLevel) { 'Critical' { 0 } 'High' { 1 } 'Medium' { 2 } 'Low' { 3 } default { 4 } } } }
+        @{ Expression = { if ($_.PSObject.Properties['Owner'] -and $_.Owner -and $_.Owner.DueDate) { [string]$_.Owner.DueDate } else { 'zzz' } } }
+        @{ Expression = { if ($_.PSObject.Properties['PriorityScore'] -and $null -ne $_.PriorityScore) { -1 * [double]$_.PriorityScore } else { 0 } } }
+        @{ Expression = { if ($_.PSObject.Properties['Owner'] -and $_.Owner) { [string]$_.Owner.DisplayName } else { 'zzz' } } }
+    )
+    $queue = $queue | Sort-Object -Property $sortKeys
+
+    if ($queue.Count -eq 0) {
+        return @"
+<section class="cockpit-section cockpit-interactive" id="action-queue" data-max-initial-rows="$MaxInitialRows">
+    <h2 class="cockpit-section-title">Action Queue (0)</h2>
+    <p class="cockpit-section-lede empty">No findings need immediate action. Approved exceptions and passing checks are still listed under Full Findings.</p>
+</section>
+"@
+    }
+
+    # Build filter option sets from the live data so dropdowns only offer
+    # values that exist in the current run.
+    $statusOpts = ($queue | ForEach-Object { [string]$_.Status } | Where-Object { $_ } | Sort-Object -Unique)
+    $riskOpts = ($queue | ForEach-Object { [string]$_.RiskLevel } | Where-Object { $_ } | Sort-Object -Unique)
+    $dispOpts = ($queue | ForEach-Object { [string]$_.Disposition } | Where-Object { $_ } | Sort-Object -Unique)
+
+    $statusOptionsHtml = ($statusOpts | ForEach-Object {
+            $v = ConvertTo-SafeHtmlAttribute -Text $_
+            "<option value=`"$($v.ToLowerInvariant())`">$v</option>"
+        }) -join ''
+    $riskOptionsHtml = ($riskOpts | ForEach-Object {
+            $v = ConvertTo-SafeHtmlAttribute -Text $_
+            "<option value=`"$($v.ToLowerInvariant())`">$v</option>"
+        }) -join ''
+    $dispOptionsHtml = ($dispOpts | ForEach-Object {
+            $v = ConvertTo-SafeHtmlAttribute -Text $_
+            "<option value=`"$($v.ToLowerInvariant())`">$v</option>"
+        }) -join ''
+
+    $rowsHtml = ($queue | ForEach-Object {
+            $status = [string]$_.Status
+            $statusSafe = ConvertTo-SafeHtml -Text $status
+            $statusAttr = ConvertTo-SafeHtmlAttribute -Text $status.ToLowerInvariant()
+            $disp = [string]$_.Disposition
+            $dispSafe = ConvertTo-SafeHtml -Text $disp
+            $dispAttr = ConvertTo-SafeHtmlAttribute -Text $disp.ToLowerInvariant()
+            $risk = [string]$_.RiskLevel
+            $riskSafe = ConvertTo-SafeHtml -Text $risk
+            $riskAttr = ConvertTo-SafeHtmlAttribute -Text $risk.ToLowerInvariant()
+            $obj = ConvertTo-SafeHtml -Text ([string]$_.Object)
+            $desc = ConvertTo-SafeHtml -Text ([string]$_.Description)
+            $owner = ''
+            if ($_.PSObject.Properties['Owner'] -and $_.Owner -and $_.Owner.OwnerType -and $_.Owner.OwnerType -ne 'Unknown') {
+                $owner = ConvertTo-SafeHtml -Text ([string]$_.Owner.DisplayName)
+            }
+            $searchHay = ConvertTo-SafeHtmlAttribute -Text (Get-CockpitFindingRowSearchHay -Finding $_)
+            $bodyHtml = Get-CockpitFindingRowBody -Finding $_
+            @"
+<div class="cockpit-row" data-status="$statusAttr" data-disposition="$dispAttr" data-risk="$riskAttr" data-search="$searchHay">
+    <div class="cockpit-row-header">
+        <span class="cockpit-badge status-$statusAttr">$statusSafe</span>
+        <span class="cockpit-badge risk-$riskAttr">$riskSafe</span>
+        <span class="cockpit-cell-object">$obj</span>
+        <span class="cockpit-cell-desc">$desc</span>
+        <span class="cockpit-cell-owner">$owner</span>
+        <span class="cockpit-cell-disposition">$dispSafe</span>
+        <span class="cockpit-caret">&#9660;</span>
+    </div>
+    $bodyHtml
+</div>
+"@
+        }) -join "`n"
+
+    return @"
+<section class="cockpit-section cockpit-interactive" id="action-queue" data-max-initial-rows="$MaxInitialRows">
+    <h2 class="cockpit-section-title">Action Queue (<span class="cockpit-total-count">$($queue.Count)</span>)</h2>
+    <p class="cockpit-section-lede">Findings that need attention right now. Approved non-expired exceptions are excluded; expired exceptions surface here so they don't slip through. Click any row to expand for the full v2 detail (Owner, Exception, Evidence, FindingId).</p>
+    <div class="cockpit-filters">
+        <input type="search" placeholder="Search description, object, owner..." data-filter-key="_search" aria-label="Search Action Queue" />
+        <select data-filter-key="status" aria-label="Filter by status">
+            <option value="">All statuses</option>
+            $statusOptionsHtml
+        </select>
+        <select data-filter-key="risk" aria-label="Filter by risk level">
+            <option value="">All risk levels</option>
+            $riskOptionsHtml
+        </select>
+        <select data-filter-key="disposition" aria-label="Filter by disposition">
+            <option value="">All dispositions</option>
+            $dispOptionsHtml
+        </select>
+        <span class="cockpit-counter" aria-live="polite"></span>
+    </div>
+    <div class="cockpit-row-list">
+$rowsHtml
+    </div>
+    <button type="button" class="cockpit-show-more" data-section-id="action-queue">Show more (100 at a time)</button>
+</section>
+"@
+}
+
+function Get-CockpitReviewQueueSection {
+    <#
+    .SYNOPSIS
+        Interactive Review Queue with filters and expandable rows.
+    .DESCRIPTION
+        Includes findings with Status='REVIEW' OR ReviewStatus.State in
+        {NeedsReview, InReview, ActionRequired}. Sorted by RiskScore desc.
+    #>
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)][array]$EnhancedFindings,
+        [int]$MaxInitialRows = 100
+    )
+
+    $queue = @($EnhancedFindings | Where-Object {
+            if ($_.Status -eq 'REVIEW') { return $true }
+            if (-not $_.PSObject.Properties['ReviewStatus']) { return $false }
+            $rs = $_.ReviewStatus
+            if (-not $rs) { return $false }
+            return ([string]$rs.State -in @('NeedsReview', 'InReview', 'ActionRequired'))
+        }) | Sort-Object @{Expression = { if ($_.PSObject.Properties['RiskScore'] -and $null -ne $_.RiskScore) { -1 * [double]$_.RiskScore } else { 0 } } }
+
+    if ($queue.Count -eq 0) { return '' }
+
+    $riskOpts = ($queue | ForEach-Object { [string]$_.RiskLevel } | Where-Object { $_ } | Sort-Object -Unique)
+    $stateOpts = ($queue | ForEach-Object {
+            if ($_.PSObject.Properties['ReviewStatus'] -and $_.ReviewStatus) { [string]$_.ReviewStatus.State } else { '' }
+        } | Where-Object { $_ } | Sort-Object -Unique)
+
+    $riskOptionsHtml = ($riskOpts | ForEach-Object {
+            $v = ConvertTo-SafeHtmlAttribute -Text $_
+            "<option value=`"$($v.ToLowerInvariant())`">$v</option>"
+        }) -join ''
+    $stateOptionsHtml = ($stateOpts | ForEach-Object {
+            $v = ConvertTo-SafeHtmlAttribute -Text $_
+            "<option value=`"$($v.ToLowerInvariant())`">$v</option>"
+        }) -join ''
+
+    $rowsHtml = ($queue | ForEach-Object {
+            $risk = [string]$_.RiskLevel
+            $riskSafe = ConvertTo-SafeHtml -Text $risk
+            $riskAttr = ConvertTo-SafeHtmlAttribute -Text $risk.ToLowerInvariant()
+            $rs = if ($_.PSObject.Properties['ReviewStatus']) { $_.ReviewStatus } else { $null }
+            $state = if ($rs) { [string]$rs.State } else { '' }
+            $stateSafe = ConvertTo-SafeHtml -Text $state
+            $stateAttr = ConvertTo-SafeHtmlAttribute -Text $state.ToLowerInvariant()
+            $riskScoreSafe = ConvertTo-SafeHtml -Text ([string]$_.RiskScore)
+            $obj = ConvertTo-SafeHtml -Text ([string]$_.Object)
+            $desc = ConvertTo-SafeHtml -Text ([string]$_.Description)
+            $searchHay = ConvertTo-SafeHtmlAttribute -Text (Get-CockpitFindingRowSearchHay -Finding $_)
+            $bodyHtml = Get-CockpitFindingRowBody -Finding $_
+            @"
+<div class="cockpit-row" data-risk="$riskAttr" data-reviewstate="$stateAttr" data-search="$searchHay">
+    <div class="cockpit-row-header">
+        <span class="cockpit-badge risk-$riskAttr">$riskSafe</span>
+        <span class="cockpit-cell-score">$riskScoreSafe</span>
+        <span class="cockpit-cell-state">$stateSafe</span>
+        <span class="cockpit-cell-object">$obj</span>
+        <span class="cockpit-cell-desc">$desc</span>
+        <span class="cockpit-caret">&#9660;</span>
+    </div>
+    $bodyHtml
+</div>
+"@
+        }) -join "`n"
+
+    return @"
+<section class="cockpit-section cockpit-interactive" id="review-queue" data-max-initial-rows="$MaxInitialRows">
+    <h2 class="cockpit-section-title">Review Queue (<span class="cockpit-total-count">$($queue.Count)</span>)</h2>
+    <p class="cockpit-section-lede">Human-judgment items &mdash; sorted by risk score. Click any row to expand for the full v2 detail.</p>
+    <div class="cockpit-filters">
+        <input type="search" placeholder="Search description, object, owner..." data-filter-key="_search" aria-label="Search Review Queue" />
+        <select data-filter-key="risk" aria-label="Filter by risk level">
+            <option value="">All risk levels</option>
+            $riskOptionsHtml
+        </select>
+        <select data-filter-key="reviewstate" aria-label="Filter by review state">
+            <option value="">All review states</option>
+            $stateOptionsHtml
+        </select>
+        <span class="cockpit-counter" aria-live="polite"></span>
+    </div>
+    <div class="cockpit-row-list">
+$rowsHtml
+    </div>
+    <button type="button" class="cockpit-show-more" data-section-id="review-queue">Show more (100 at a time)</button>
+</section>
+"@
+}
+
+function Get-CockpitFullFindingsSection {
+    <#
+    .SYNOPSIS
+        Renders the Full Findings section with text search, multi-column
+        filters, and client-side pagination.
+    .DESCRIPTION
+        Unlike the Action / Review queues, this section includes EVERY
+        finding regardless of disposition — OK, INFO, accepted risks, false
+        positives, out-of-scope, resolved items, the lot. The plan §10.7
+        rule: "Avoid hidden findings."
+
+        Filters offered: text search, status, risk level, disposition, source.
+        Pagination: shows first `-MaxInitialRows` (default 100); "Show more"
+        button bumps the visible window by 100 each click.
+
+        Performance: rows are rendered statically with `data-*` attributes;
+        the JS in Get-CockpitJavaScript filters by toggling a `filtered-out`
+        class. This keeps 1,200-finding reports responsive under
+        `file://` without external JS.
+    #>
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)][array]$EnhancedFindings,
+        [int]$MaxInitialRows = 100
+    )
+
+    if ($EnhancedFindings.Count -eq 0) { return '' }
+
+    # No filter on inclusion — include everything. Sort by Status priority
+    # then PriorityScore so failures float to the top.
+    $sortKeys = @(
+        @{ Expression = { switch ([string]$_.Status) { 'FAIL' { 0 } 'WARNING' { 1 } 'REVIEW' { 2 } 'INFO' { 3 } 'OK' { 4 } default { 5 } } } }
+        @{ Expression = { if ($_.PSObject.Properties['PriorityScore'] -and $null -ne $_.PriorityScore) { -1 * [double]$_.PriorityScore } else { 0 } } }
+    )
+    $sorted = $EnhancedFindings | Sort-Object -Property $sortKeys
+
+    $statusOpts = ($sorted | ForEach-Object { [string]$_.Status } | Where-Object { $_ } | Sort-Object -Unique)
+    $riskOpts = ($sorted | ForEach-Object { [string]$_.RiskLevel } | Where-Object { $_ } | Sort-Object -Unique)
+    $dispOpts = ($sorted | ForEach-Object { [string]$_.Disposition } | Where-Object { $_ } | Sort-Object -Unique)
+    $sourceOpts = ($sorted | ForEach-Object { [string]$_.Source } | Where-Object { $_ } | Sort-Object -Unique)
+
+    $mkOpts = {
+        param($opts)
+        ($opts | ForEach-Object {
+            $v = ConvertTo-SafeHtmlAttribute -Text $_
+            "<option value=`"$($v.ToLowerInvariant())`">$v</option>"
+        }) -join ''
+    }
+
+    $rowsHtml = ($sorted | ForEach-Object {
+            $status = [string]$_.Status
+            $statusSafe = ConvertTo-SafeHtml -Text $status
+            $statusAttr = ConvertTo-SafeHtmlAttribute -Text $status.ToLowerInvariant()
+            $disp = [string]$_.Disposition
+            $dispSafe = ConvertTo-SafeHtml -Text $disp
+            $dispAttr = ConvertTo-SafeHtmlAttribute -Text $disp.ToLowerInvariant()
+            $risk = [string]$_.RiskLevel
+            $riskSafe = ConvertTo-SafeHtml -Text $risk
+            $riskAttr = ConvertTo-SafeHtmlAttribute -Text $risk.ToLowerInvariant()
+            $source = [string]$_.Source
+            $sourceSafe = ConvertTo-SafeHtml -Text $source
+            $sourceAttr = ConvertTo-SafeHtmlAttribute -Text $source.ToLowerInvariant()
+            $obj = ConvertTo-SafeHtml -Text ([string]$_.Object)
+            $desc = ConvertTo-SafeHtml -Text ([string]$_.Description)
+            $searchHay = ConvertTo-SafeHtmlAttribute -Text (Get-CockpitFindingRowSearchHay -Finding $_)
+            $bodyHtml = Get-CockpitFindingRowBody -Finding $_
+            @"
+<div class="cockpit-row" data-status="$statusAttr" data-disposition="$dispAttr" data-risk="$riskAttr" data-source="$sourceAttr" data-search="$searchHay">
+    <div class="cockpit-row-header">
+        <span class="cockpit-badge status-$statusAttr">$statusSafe</span>
+        <span class="cockpit-badge risk-$riskAttr">$riskSafe</span>
+        <span class="cockpit-cell-object">$obj</span>
+        <span class="cockpit-cell-desc">$desc</span>
+        <span class="cockpit-cell-disposition">$dispSafe</span>
+        <span class="cockpit-cell-source">$sourceSafe</span>
+        <span class="cockpit-caret">&#9660;</span>
+    </div>
+    $bodyHtml
+</div>
+"@
+        }) -join "`n"
+
+    return @"
+<section class="cockpit-section cockpit-interactive" id="full-findings" data-max-initial-rows="$MaxInitialRows">
+    <h2 class="cockpit-section-title">Full Findings (<span class="cockpit-total-count">$($sorted.Count)</span>)</h2>
+    <p class="cockpit-section-lede">Every finding from this run &mdash; including accepted risks, false positives, out-of-scope, OK, and INFO. Use the filters to narrow down; click any row to expand.</p>
+    <div class="cockpit-filters">
+        <input type="search" placeholder="Search description, object, owner..." data-filter-key="_search" aria-label="Search Full Findings" />
+        <select data-filter-key="status" aria-label="Filter by status">
+            <option value="">All statuses</option>
+            $(& $mkOpts $statusOpts)
+        </select>
+        <select data-filter-key="risk" aria-label="Filter by risk level">
+            <option value="">All risk levels</option>
+            $(& $mkOpts $riskOpts)
+        </select>
+        <select data-filter-key="disposition" aria-label="Filter by disposition">
+            <option value="">All dispositions</option>
+            $(& $mkOpts $dispOpts)
+        </select>
+        <select data-filter-key="source" aria-label="Filter by source">
+            <option value="">All sources</option>
+            $(& $mkOpts $sourceOpts)
+        </select>
+        <span class="cockpit-counter" aria-live="polite"></span>
+    </div>
+    <div class="cockpit-row-list">
+$rowsHtml
+    </div>
+    <button type="button" class="cockpit-show-more" data-section-id="full-findings">Show more (100 at a time)</button>
+</section>
+"@
+}
+
+function Get-CockpitJavaScript {
+    <#
+    .SYNOPSIS
+        Emits the inline <script> block that powers cockpit interactivity.
+    .DESCRIPTION
+        Wires data-filter-key inputs/selects to data-* attributes on the
+        rows. Toggles a `filtered-out` class for non-matching rows and a
+        `paginated-out` class for rows past the current page window.
+        Updates the "Showing X of Y" counter and the "Show more" button
+        visibility.
+
+        IMPORTANT: this script must remain self-contained — no external
+        CDNs, no third-party libraries — so the cockpit works under
+        file:// and survives the static-report CSP policy.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param()
+    return @'
+<script>
+(function () {
+  "use strict";
+
+  // Per-section pagination cursor. Initialized lazily from
+  // data-max-initial-rows on the section element.
+  var paginationState = {};
+
+  function getMaxRows(sectionId) {
+    if (paginationState[sectionId]) return paginationState[sectionId];
+    var section = document.getElementById(sectionId);
+    var initial = 100;
+    if (section) {
+      var attr = section.getAttribute('data-max-initial-rows');
+      if (attr) {
+        var parsed = parseInt(attr, 10);
+        if (!isNaN(parsed) && parsed > 0) initial = parsed;
+      }
+    }
+    paginationState[sectionId] = initial;
+    return initial;
+  }
+
+  function applyFilters(sectionId) {
+    var section = document.getElementById(sectionId);
+    if (!section) return;
+    var filterEls = section.querySelectorAll('[data-filter-key]');
+    var filters = {};
+    for (var i = 0; i < filterEls.length; i++) {
+      var key = filterEls[i].getAttribute('data-filter-key');
+      var raw = (filterEls[i].value || '').toLowerCase().trim();
+      if (raw) filters[key] = raw;
+    }
+    var rows = section.querySelectorAll('.cockpit-row');
+    var matchedCount = 0;
+    for (var r = 0; r < rows.length; r++) {
+      var row = rows[r];
+      var matches = true;
+      for (var key in filters) {
+        if (!Object.prototype.hasOwnProperty.call(filters, key)) continue;
+        var needle = filters[key];
+        if (key === '_search') {
+          var hay = (row.getAttribute('data-search') || '').toLowerCase();
+          if (hay.indexOf(needle) === -1) { matches = false; break; }
+        } else {
+          var rowVal = (row.getAttribute('data-' + key) || '').toLowerCase();
+          if (rowVal !== needle) { matches = false; break; }
+        }
+      }
+      if (matches) {
+        row.classList.remove('filtered-out');
+        matchedCount++;
+      } else {
+        row.classList.add('filtered-out');
+      }
+    }
+    applyPagination(sectionId, matchedCount);
+    updateCounter(section, matchedCount);
+  }
+
+  function applyPagination(sectionId, matchedCount) {
+    var section = document.getElementById(sectionId);
+    if (!section) return;
+    var maxRows = getMaxRows(sectionId);
+    var visible = section.querySelectorAll('.cockpit-row:not(.filtered-out)');
+    for (var i = 0; i < visible.length; i++) {
+      if (i >= maxRows) {
+        visible[i].classList.add('paginated-out');
+      } else {
+        visible[i].classList.remove('paginated-out');
+      }
+    }
+    var btn = section.querySelector('.cockpit-show-more');
+    if (btn) {
+      btn.style.display = (matchedCount > maxRows) ? 'inline-block' : 'none';
+    }
+  }
+
+  function updateCounter(section, matchedCount) {
+    var counterEl = section.querySelector('.cockpit-counter');
+    if (!counterEl) return;
+    var sectionId = section.id;
+    var maxRows = getMaxRows(sectionId);
+    var visibleNow = Math.min(matchedCount, maxRows);
+    counterEl.textContent = 'Showing ' + visibleNow + ' of ' + matchedCount;
+  }
+
+  function showMore(sectionId) {
+    var cur = getMaxRows(sectionId);
+    paginationState[sectionId] = cur + 100;
+    applyFilters(sectionId);
+  }
+
+  function toggleRow(headerEl) {
+    var row = headerEl.parentElement;
+    if (!row) return;
+    row.classList.toggle('expanded');
+    var caret = headerEl.querySelector('.cockpit-caret');
+    if (caret) {
+      caret.innerHTML = row.classList.contains('expanded') ? '&#9650;' : '&#9660;';
+    }
+  }
+
+  document.addEventListener('DOMContentLoaded', function () {
+    // Click handler for every row header (expand/collapse).
+    var headers = document.querySelectorAll('.cockpit-row-header');
+    for (var i = 0; i < headers.length; i++) {
+      (function (h) {
+        h.addEventListener('click', function () { toggleRow(h); });
+      })(headers[i]);
+    }
+
+    // Filter input handlers — input fires on every keystroke, change for
+    // the select dropdowns.
+    var filterEls = document.querySelectorAll('[data-filter-key]');
+    for (var j = 0; j < filterEls.length; j++) {
+      (function (el) {
+        var section = el.closest('.cockpit-section');
+        if (!section) return;
+        var sectionId = section.id;
+        el.addEventListener('input', function () { applyFilters(sectionId); });
+        el.addEventListener('change', function () { applyFilters(sectionId); });
+      })(filterEls[j]);
+    }
+
+    // "Show more" pagination buttons.
+    var btns = document.querySelectorAll('.cockpit-show-more');
+    for (var k = 0; k < btns.length; k++) {
+      (function (b) {
+        b.addEventListener('click', function () {
+          showMore(b.getAttribute('data-section-id'));
+        });
+      })(btns[k]);
+    }
+
+    // Initial pass so counters and pagination are correct on first paint.
+    var interactiveSections = document.querySelectorAll('.cockpit-interactive');
+    for (var m = 0; m < interactiveSections.length; m++) {
+      applyFilters(interactiveSections[m].id);
+    }
+  });
+})();
+</script>
+'@
+}
+
+function Get-HtmlReportPlan {
+    <#
+    .SYNOPSIS
+        Decides which HTML reports to generate for the current run.
+    .DESCRIPTION
+        The orchestrator's HTML routing decision (PR 4 of
+        HTML-Reporting-Consolidation-Plan). Inputs: the report-set mode
+        (`Cockpit` | `CockpitAndDeepDives` | `DeepDivesOnly` | `LegacyAll`),
+        the requested deep-dive domains, and flags for which auxiliary data
+        was collected (Secure Score / Defender / etc.).
+
+        Output: a plan hashtable the orchestrator can act on without
+        re-implementing the decision tree at every call site. Same plan
+        shape is testable in isolation — see Tests/HtmlReportPlan.Tests.ps1.
+
+        Decision rules (plan §12):
+
+        - Cockpit               → cockpit only. No legacy multi-reports.
+                                  No domain deep dives.
+        - CockpitAndDeepDives   → cockpit + only the explicitly listed
+                                  deep-dive domains. Empty list = cockpit
+                                  alone (no inference).
+        - DeepDivesOnly         → no cockpit; only the listed deep dives.
+                                  Empty list = warning + no HTML.
+        - LegacyAll             → preserves pre-PR-4 behavior: every
+                                  available source emits a deep-dive
+                                  report, plus the legacy comprehensive
+                                  report and unified report. No cockpit
+                                  (those reports cover the same ground).
+
+        A deep-dive domain is "available" when the matching `$AvailableSources`
+        flag is true AND the domain is listed in `-HtmlDeepDiveDomains` (or
+        we're in LegacyAll mode, which infers all available domains).
+
+    .PARAMETER HtmlReportSet
+        One of `Cockpit`, `CockpitAndDeepDives`, `DeepDivesOnly`, `LegacyAll`.
+        Default: `Cockpit`.
+
+    .PARAMETER HtmlDeepDiveDomains
+        Subset of `SecureScore`, `DefenderCompliance`, `AzurePolicy`,
+        `PurviewCompliance`, `Delta`, `PrivilegedIdentity`.
+
+    .PARAMETER AvailableSources
+        Hashtable from domain name to `[bool]`. Set values to `$true` for
+        sources the run actually collected. Missing keys default to `$false`.
+
+    .OUTPUTS
+        Hashtable with:
+          - GenerateCockpit         : bool
+          - GenerateComprehensive   : bool
+          - GenerateUnified         : bool
+          - GenerateDomainReports   : string[] (concrete list to emit)
+          - Warnings                : string[]
+    #>
+    [OutputType([hashtable])]
+    [CmdletBinding()]
+    param(
+        [ValidateSet('Cockpit', 'CockpitAndDeepDives', 'DeepDivesOnly', 'LegacyAll')]
+        [string]$HtmlReportSet = 'Cockpit',
+        [string[]]$HtmlDeepDiveDomains = @(),
+        [hashtable]$AvailableSources = @{}
+    )
+
+    $allDomains = @('SecureScore', 'DefenderCompliance', 'AzurePolicy', 'PurviewCompliance', 'Delta', 'PrivilegedIdentity')
+    $warnings = New-Object System.Collections.Generic.List[string]
+
+    # Validate requested domains. Anything not in the canonical set becomes a
+    # warning rather than a hard error — orchestrator continues.
+    $requested = @($HtmlDeepDiveDomains | Where-Object { $_ })
+    $invalidDomains = @($requested | Where-Object { $_ -notin $allDomains })
+    foreach ($bad in $invalidDomains) {
+        $warnings.Add("HtmlDeepDiveDomains: '$bad' is not a recognised domain. Allowed: $($allDomains -join ', ').")
+    }
+    $valid = @($requested | Where-Object { $_ -in $allDomains })
+
+    switch ($HtmlReportSet) {
+        'Cockpit' {
+            if ($valid.Count -gt 0) {
+                $warnings.Add("HtmlDeepDiveDomains was supplied but HtmlReportSet is 'Cockpit' — deep dives ignored. Use 'CockpitAndDeepDives' to include them.")
+            }
+            return @{
+                GenerateCockpit = $true
+                GenerateComprehensive = $false
+                GenerateUnified = $false
+                GenerateDomainReports = @()
+                Warnings = $warnings.ToArray()
+            }
+        }
+        'CockpitAndDeepDives' {
+            # Only emit deep dives for domains that BOTH were requested AND
+            # have data. Requesting a domain whose data wasn't collected is a
+            # warning, not silent skip.
+            $emitted = New-Object System.Collections.Generic.List[string]
+            foreach ($d in $valid) {
+                if ($AvailableSources[$d]) {
+                    $emitted.Add($d)
+                }
+                else {
+                    $warnings.Add("Deep dive '$d' requested but no data was collected for it this run — skipping.")
+                }
+            }
+            return @{
+                GenerateCockpit = $true
+                GenerateComprehensive = $false
+                GenerateUnified = $false
+                GenerateDomainReports = $emitted.ToArray()
+                Warnings = $warnings.ToArray()
+            }
+        }
+        'DeepDivesOnly' {
+            if ($valid.Count -eq 0) {
+                $warnings.Add("HtmlReportSet='DeepDivesOnly' but HtmlDeepDiveDomains is empty — no HTML will be generated. Pass at least one domain (e.g. -HtmlDeepDiveDomains AzurePolicy).")
+                return @{
+                    GenerateCockpit = $false
+                    GenerateComprehensive = $false
+                    GenerateUnified = $false
+                    GenerateDomainReports = @()
+                    Warnings = $warnings.ToArray()
+                }
+            }
+            $emitted = New-Object System.Collections.Generic.List[string]
+            foreach ($d in $valid) {
+                if ($AvailableSources[$d]) {
+                    $emitted.Add($d)
+                }
+                else {
+                    $warnings.Add("Deep dive '$d' requested but no data was collected for it this run — skipping.")
+                }
+            }
+            return @{
+                GenerateCockpit = $false
+                GenerateComprehensive = $false
+                GenerateUnified = $false
+                GenerateDomainReports = $emitted.ToArray()
+                Warnings = $warnings.ToArray()
+            }
+        }
+        'LegacyAll' {
+            # Old behavior: comprehensive + unified + every available domain.
+            # No cockpit (those reports cover the same ground). No warning for
+            # extra HtmlDeepDiveDomains — we already emit every available one.
+            $emitted = New-Object System.Collections.Generic.List[string]
+            foreach ($d in $allDomains) {
+                if ($AvailableSources[$d]) { $emitted.Add($d) }
+            }
+            return @{
+                GenerateCockpit = $false
+                GenerateComprehensive = $true
+                GenerateUnified = $true
+                GenerateDomainReports = $emitted.ToArray()
+                Warnings = $warnings.ToArray()
+            }
+        }
+    }
+}
+
+function New-EntraChecksAnalystHtmlReport {
+    <#
+    .SYNOPSIS
+        Generates the single primary analyst cockpit HTML report.
+    .DESCRIPTION
+        Composes the executive digest, action queue, review queue, control
+        impact, source posture, evidence/provenance, full findings, deep
+        dive hub, and integrity footer into one HTML document. Every dynamic
+        value passes through the safe-encoding helpers from PR 1.
+
+        The cockpit is opt-in in PR 2 — the orchestrator default remains the
+        existing multi-report behavior. PR 4 of HTML-Reporting-Consolidation
+        flips the default after PR 3 adds interactive filtering.
+    .PARAMETER DeepDives
+        Optional hashtable mapping deep-dive domain name (e.g. 'SecureScore',
+        'AzurePolicy', 'Delta', etc.) to the path of the generated deep-dive
+        HTML file. The Deep Dive Hub renders linkified cards for present
+        entries and "not generated this run" cards for missing ones.
+    .OUTPUTS
+        String — the OutputPath of the written HTML file.
+    #>
+    [OutputType([string])]
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][array]$Findings,
+        [Parameter(Mandatory)][string]$OutputPath,
+        [Parameter(Mandatory)][object]$TenantInfo,
+        [object]$PreviousAssessment,
+        [object]$SecureScore,
+        [object]$DefenderCompliance,
+        [object]$AzurePolicy,
+        [object]$PurviewCompliance,
+        [object]$HybridCorrelation,
+        [object]$PrivilegedIdentityRoster,
+        [object]$Branding,
+        [hashtable]$DeepDives = @{},
+        [int]$MaxInitialRows = 100,
+        [bool]$IncludeIntegrityBadge = $true
+    )
+
+    # Enrich findings — same pipeline as New-EnhancedHTMLReport so the cockpit
+    # consumes identical data shapes.
+    $enhancedFindings = @()
+    foreach ($finding in $Findings) {
+        $enhanced = $finding | Add-RiskScoring | Add-ComplianceMapping | Add-RemediationGuidance
+        $enhancedFindings += $enhanced
+    }
+
+    # Dedupe (Description + Object) — identical heuristic to the existing report.
+    $seen = @{}
+    $deduped = @()
+    foreach ($f in $enhancedFindings) {
+        $key = "$($f.Description)|$($f.Object)"
+        if (-not $seen.ContainsKey($key)) { $seen[$key] = $true; $deduped += $f }
+    }
+    $enhancedFindings = $deduped
+
+    # Summaries
+    $riskSummary = Get-RiskSummary -Findings $enhancedFindings
+    $complianceGap = Get-ComplianceGapReport -Findings $enhancedFindings -Framework 'All'
+
+    $findingsDelta = $null
+    if ($PreviousAssessment) {
+        $previousFindings = if ($PreviousAssessment.PSObject.Properties['Findings']) {
+            $PreviousAssessment.Findings
+        } else { @($PreviousAssessment) }
+        $findingsDelta = Get-FindingsDelta -Current $enhancedFindings -Previous $previousFindings
+    }
+
+    $execDigest = Get-EntraChecksExecutiveDigest -Findings $enhancedFindings -RiskSummary $riskSummary -ComplianceGap $complianceGap -FindingsDelta $findingsDelta
+    $execDigestHtml = Format-ExecutiveDigest -Digest $execDigest -TenantInfo $TenantInfo
+
+    # Section composition (plan §9 ordering). PR 3: Action Queue, Review
+    # Queue, and Full Findings are now interactive (filters + pagination +
+    # expandable rows). Wired by the cockpit JS emitted near </body>.
+    $actionQueueHtml = Get-CockpitActionQueueSection -EnhancedFindings $enhancedFindings -MaxInitialRows $MaxInitialRows
+    $reviewQueueHtml = Get-CockpitReviewQueueSection -EnhancedFindings $enhancedFindings -MaxInitialRows $MaxInitialRows
+    $sourcePostureHtml = Get-CockpitSourcePostureSection `
+        -SecureScore $SecureScore -DefenderCompliance $DefenderCompliance `
+        -AzurePolicy $AzurePolicy -PurviewCompliance $PurviewCompliance `
+        -HybridCorrelation $HybridCorrelation -PrivilegedIdentityRoster $PrivilegedIdentityRoster
+    $evidenceHtml = Get-CockpitEvidenceProvenanceSection -Findings $enhancedFindings
+    $deepDiveHtml = Get-CockpitDeepDiveHubSection -DeepDives $DeepDives
+    $fullFindingsHtml = Get-CockpitFullFindingsSection -EnhancedFindings $enhancedFindings -MaxInitialRows $MaxInitialRows
+    $cockpitJs = Get-CockpitJavaScript
+
+    $integrityHtml = if ($IncludeIntegrityBadge) {
+        New-IntegrityBlock -EnhancedFindings $enhancedFindings -OutputPath $OutputPath
+    } else { '' }
+
+    $htmlHead = Get-HTMLHead
+    $cockpitCss = Get-CockpitCss
+
+    # Header — branding overrides if supplied.
+    $tenantName = ConvertTo-SafeHtml -Text ([string]$TenantInfo.TenantName)
+    $tenantId = ConvertTo-SafeHtml -Text ([string]$TenantInfo.TenantId)
+    $reportTitle = if ($Branding -and $Branding.ReportTitle) {
+        ConvertTo-SafeHtml -Text ([string]$Branding.ReportTitle)
+    } else { 'EntraChecks Analyst Cockpit' }
+
+    # Static-report Content Security Policy. This is a local file: inline
+    # script and inline style are required (no external CDNs). Block
+    # everything else so a malicious finding value can't trigger a network
+    # request (img-src 'self' data: lets data-URL icons render).
+    $cspMeta = "<meta http-equiv=`"Content-Security-Policy`" content=`"default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'; form-action 'none';`">"
+
+    $html = @"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    $cspMeta
+    <title>$reportTitle - $tenantName</title>
+    $htmlHead
+    $cockpitCss
+</head>
+<body>
+    <div class="container">
+        <header class="report-header">
+            <h1>$reportTitle</h1>
+            <div class="tenant-info">
+                <p><strong>Tenant:</strong> $tenantName</p>
+                <p><strong>Tenant ID:</strong> $tenantId</p>
+                <p><strong>Report Generated:</strong> $(Get-Date -Format "MMMM dd, yyyy 'at' HH:mm:ss")</p>
+                <p><strong>Total Findings:</strong> $($enhancedFindings.Count)</p>
+                <p><strong>Report Mode:</strong> Cockpit</p>
+            </div>
+        </header>
+
+        <!-- Section 1: Executive Digest -->
+        $execDigestHtml
+
+        <!-- Section 2: Action Queue (PR 3 makes this interactive) -->
+        $actionQueueHtml
+
+        <!-- Section 3: Review Queue (PR 3 makes this interactive) -->
+        $reviewQueueHtml
+
+        <!-- Section 5: Source Posture -->
+        $sourcePostureHtml
+
+        <!-- Section 6: Evidence and Provenance -->
+        $evidenceHtml
+
+        <!-- Section 7: Full Findings -->
+        $fullFindingsHtml
+
+        <!-- Section 8: Deep Dive Hub -->
+        $deepDiveHtml
+
+        $integrityHtml
+    </div>
+    $cockpitJs
+</body>
+</html>
+"@
+
+    $html | Set-Content -Path $OutputPath -Encoding UTF8
+    Write-Verbose "Analyst cockpit HTML generated: $OutputPath"
+    return $OutputPath
+}
+
+function Get-CockpitCss {
+    <#
+    .SYNOPSIS
+        Cockpit-specific CSS (cards, queue tables, provenance table).
+    .DESCRIPTION
+        Returned as a single <style> block. Loaded ADDITIONALLY to the
+        existing Get-HTMLHead so the cockpit inherits the base look-and-feel
+        and only adds the new sections' styles.
+    #>
+    return @'
+<style>
+.cockpit-section { margin: 30px 0; padding: 20px; background: #fff; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.04); }
+.cockpit-section-title { font-size: 1.5em; color: #0078d4; border-bottom: 2px solid #0078d4; padding-bottom: 8px; margin-bottom: 12px; }
+.cockpit-section-lede { color: #555; font-size: 0.95em; margin-bottom: 16px; }
+.cockpit-section-lede.empty { font-style: italic; }
+.cockpit-section-note { color: #888; font-size: 0.85em; margin-top: 10px; font-style: italic; }
+.source-card-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+.source-card { padding: 12px; border-radius: 6px; border-left: 4px solid #ccc; background: #f8f9fb; }
+.source-card.good { border-left-color: #107c10; }
+.source-card.muted { border-left-color: #999; opacity: 0.85; }
+.source-card h4 { margin: 0 0 6px 0; font-size: 1em; }
+.source-status { font-weight: 600; font-size: 0.9em; }
+.source-card.good .source-status { color: #107c10; }
+.source-card.muted .source-status { color: #888; }
+.source-metric { color: #555; font-size: 0.85em; margin-top: 4px; }
+.deep-dive-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; }
+.deep-dive-card { padding: 12px; border-radius: 6px; border-left: 4px solid #ccc; background: #f8f9fb; }
+.deep-dive-card.generated { border-left-color: #0078d4; }
+.deep-dive-card.pending { border-left-color: #ffaa44; opacity: 0.95; }
+.deep-dive-card h4 { margin: 0 0 6px 0; font-size: 1em; }
+.deep-dive-card .status { font-weight: 600; font-size: 0.9em; }
+.deep-dive-card.generated .status { color: #0078d4; }
+.deep-dive-card.pending .status { color: #b87100; }
+.deep-dive-card .hint { color: #555; font-size: 0.82em; margin-top: 6px; }
+.deep-dive-card .hint code { background: #eef; padding: 2px 5px; border-radius: 3px; font-size: 0.92em; }
+.provenance-table { width: 100%; border-collapse: collapse; font-size: 0.85em; }
+.provenance-table th, .provenance-table td { padding: 6px 8px; text-align: left; border-bottom: 1px solid #e5e7eb; }
+.provenance-table th { background: #f0f3f7; font-weight: 600; }
+.provenance-table .hash-cell { font-family: monospace; word-break: break-all; max-width: 200px; }
+.provenance-table code { font-size: 0.9em; background: #f4f5f7; padding: 1px 4px; border-radius: 3px; }
+.cockpit-queue-table { width: 100%; border-collapse: collapse; font-size: 0.9em; }
+.cockpit-queue-table th, .cockpit-queue-table td { padding: 8px 10px; text-align: left; border-bottom: 1px solid #e5e7eb; }
+.cockpit-queue-table th { background: #f0f3f7; font-weight: 600; }
+.cockpit-queue-table tr:hover { background: #fafbfc; }
+/* PR 3: interactive queue styles */
+.cockpit-filters { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; align-items: center; }
+.cockpit-filters input[type="search"], .cockpit-filters select { padding: 6px 10px; border: 1px solid #d0d5dc; border-radius: 4px; font-size: 0.9em; background: #fff; }
+.cockpit-filters input[type="search"] { flex: 1 1 240px; min-width: 200px; }
+.cockpit-filters select { min-width: 130px; }
+.cockpit-filters input:focus, .cockpit-filters select:focus { outline: 2px solid #0078d4; outline-offset: 1px; }
+.cockpit-counter { margin-left: auto; color: #555; font-size: 0.85em; }
+.cockpit-row-list { display: flex; flex-direction: column; gap: 4px; }
+.cockpit-row { background: #fff; border: 1px solid #e5e7eb; border-radius: 4px; transition: box-shadow 0.15s; }
+.cockpit-row.filtered-out, .cockpit-row.paginated-out { display: none; }
+.cockpit-row:hover { box-shadow: 0 2px 4px rgba(0,0,0,0.06); }
+.cockpit-row-header { display: grid; grid-template-columns: auto auto 1fr 2fr auto auto auto; gap: 10px; align-items: center; padding: 8px 12px; cursor: pointer; user-select: none; font-size: 0.9em; }
+.cockpit-row-header:hover { background: #f7f9fb; }
+.cockpit-row-header:focus { outline: 2px solid #0078d4; outline-offset: -2px; }
+.cockpit-badge { display: inline-block; padding: 2px 8px; border-radius: 3px; font-size: 0.78em; font-weight: 600; }
+.cockpit-badge.status-fail { background: #fde7e9; color: #a4373a; }
+.cockpit-badge.status-warning { background: #fff4ce; color: #8a5a00; }
+.cockpit-badge.status-review { background: #ede4f5; color: #5c2d91; }
+.cockpit-badge.status-ok { background: #dff6dd; color: #107c10; }
+.cockpit-badge.status-info { background: #deecf9; color: #004578; }
+.cockpit-badge.risk-critical { background: #c52733; color: #fff; }
+.cockpit-badge.risk-high { background: #e8893a; color: #fff; }
+.cockpit-badge.risk-medium { background: #ffd166; color: #7b5e00; }
+.cockpit-badge.risk-low { background: #95c19e; color: #1f3d22; }
+.cockpit-badge.risk-info { background: #d6deea; color: #283b50; }
+.cockpit-badge.risk-review { background: #5c2d91; color: #fff; }
+.cockpit-cell-object { font-family: monospace; font-size: 0.88em; color: #333; word-break: break-all; }
+.cockpit-cell-desc { color: #444; }
+.cockpit-cell-owner, .cockpit-cell-disposition, .cockpit-cell-source, .cockpit-cell-state, .cockpit-cell-score { color: #555; font-size: 0.85em; }
+.cockpit-caret { color: #888; font-size: 0.85em; transition: transform 0.15s; }
+.cockpit-row-body { display: none; padding: 14px 18px; background: #fafbfc; border-top: 1px solid #e5e7eb; }
+.cockpit-row.expanded .cockpit-row-body { display: block; }
+.cockpit-row-body-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px; margin-bottom: 10px; font-size: 0.88em; }
+.cockpit-row-body p { margin: 6px 0; font-size: 0.9em; }
+.cockpit-justification { color: #555; font-size: 0.85em; font-style: italic; margin-left: 12px; }
+.cockpit-meta-line, .cockpit-finding-id { font-size: 0.82em; color: #666; }
+.cockpit-finding-id code { font-family: monospace; }
+.cockpit-show-more { margin-top: 12px; padding: 8px 16px; border: 1px solid #0078d4; background: #fff; color: #0078d4; border-radius: 4px; cursor: pointer; font-size: 0.9em; display: none; }
+.cockpit-show-more:hover { background: #0078d4; color: #fff; }
+.cockpit-show-more:focus { outline: 2px solid #0078d4; outline-offset: 2px; }
+@media print {
+    .cockpit-filters, .cockpit-show-more, .cockpit-caret { display: none !important; }
+    .cockpit-row { page-break-inside: avoid; }
+    .cockpit-row-body { display: block !important; }
+}
+</style>
+'@
+}
+
+#endregion
 
 function Get-HTMLHead {
     return @'
@@ -2652,7 +4089,22 @@ function Get-HTMLJavaScript {
 
 Export-ModuleMember -Function @(
     'New-EnhancedHTMLReport',
-    'Test-EntraChecksReportIntegrity'
+    'Test-EntraChecksReportIntegrity',
+    # PR 1 of HTML-Reporting-Consolidation-Plan — safety helpers consumed by
+    # the cockpit renderer that PR 2 introduces. Exported so cross-module
+    # callers (Compliance.psm1, ExcelReporting.psm1 link rendering, etc.)
+    # can use the same encoders.
+    'ConvertTo-SafeHtml',
+    'ConvertTo-SafeHtmlAttribute',
+    'ConvertTo-SafeHtmlJson',
+    'New-SafeExternalLink',
+    'New-SafeElementId',
+    # PR 2 of HTML-Reporting-Consolidation-Plan — single analyst cockpit
+    # renderer. Opt-in in PR 2; PR 4 flips the orchestrator default.
+    'New-EntraChecksAnalystHtmlReport',
+    # PR 4 of HTML-Reporting-Consolidation-Plan — orchestrator-facing routing
+    # decision. Returns a plan hashtable the orchestrator acts on.
+    'Get-HtmlReportPlan'
 )
 
 #endregion

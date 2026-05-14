@@ -19,6 +19,7 @@ We've created **6 comprehensive guides** totaling over **1,000 pages** of docume
 | **[API-REFERENCE.md](API-REFERENCE.md)** | Developers | 45-60 min | Function reference |
 | **[Finding-Schema-Guide.md](Finding-Schema-Guide.md)** | Analysts / Auditors / Developers | 30-45 min | Central v2 finding schema, FindingId, analyst state file, disposition, security defaults |
 | **[Reporting-Guide.md](Reporting-Guide.md)** | All users | 20-40 min | Excel / HTML / CSV / JSON report formats, v2 schema surfacing |
+| **[Cockpit-Report-Guide.md](Cockpit-Report-Guide.md)** | Analysts / Auditors | 15-25 min | Analyst Cockpit HTML (the default since PR 4) — modes, sections, deep-dive routing, migration from pre-PR-4 layout |
 | **[REPORTING-STATUS.md](REPORTING-STATUS.md)** | All users | 5-10 min | Current status |
 
 ---
