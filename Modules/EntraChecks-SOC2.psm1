@@ -2687,6 +2687,22 @@ function Invoke-SOC2Assessment {
     $allFindings += $syntheticFindings.ToArray()
     $allFindings += $manualStubs
 
+    # Step 5b: Normalize to schema v2 BEFORE redaction so every downstream
+    # consumer (redaction → bundle → summary → digest → renderers) sees the
+    # same shape. ConvertTo-EntraFindingV2 is idempotent; existing v2 fields
+    # are preserved, missing ones added (FindingId, Disposition, Owner,
+    # Exception, ReviewStatus, ControlMappings, Evidence, SchemaVersion).
+    # Source defaults to 'SOC2' so the deterministic FindingId is stable
+    # across runs of the SOC 2 pipeline.
+    # See: plans/SOC2-Audit-Readiness-Plan.md §8.1 (PR 1 sub-step 1).
+    if (Get-Command ConvertTo-EntraFindingV2 -ErrorAction SilentlyContinue) {
+        $normalized = @()
+        foreach ($f in $allFindings) {
+            $normalized += (ConvertTo-EntraFindingV2 -Finding $f -DefaultTenantId $TenantId -DefaultSource 'SOC2')
+        }
+        $allFindings = $normalized
+    }
+
     # Step 6: Redact if requested
     $identityMap = @{}
     $redactionResult = $null

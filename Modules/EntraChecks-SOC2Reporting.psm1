@@ -33,6 +33,340 @@ $script:LowConfidenceCheckNames = @(
     'Test-SOC2BreakGlassAccountsConfigured'
 )
 
+#region ==================== CONTROL CONCLUSION (audit-readiness register) ====================
+
+<#
+.SYNOPSIS
+    Returns the SOC 2 audit conclusion for a single control given its mapped
+    findings and evidence count. Pure function — no I/O.
+
+.DESCRIPTION
+    Implements the precedence table from plans/SOC2-Audit-Readiness-Plan.md §7.
+    Order of evaluation (first match wins):
+
+        FAIL (active)        -> Deficiency           (severity from highest FAIL)
+        WARNING (active)     -> Deficiency - Minor
+        REVIEW / MANUAL      -> Manual Pending       (skipped if ReviewStatus.State is Accepted/Reviewed)
+        Licensing Gap        -> Not Assessed - Licensing
+        Accepted Risk only   -> Accepted Risk        (no other unaccepted blockers present)
+        INFO                 -> Informational
+        OK with evidence     -> Effective
+        OK without evidence  -> Effective            (still effective; missing evidence is a separate audit-trail concern)
+        Nothing              -> Not Assessed - No Evidence
+
+    A finding with `Disposition` in {AcceptedRisk, CompensatingControl,
+    FalsePositive, OutOfScope, Resolved, Suppressed} does not drive
+    Deficiency. AcceptedRisk / CompensatingControl additionally surface as
+    the Accepted Risk conclusion when they are the only blockers.
+
+.PARAMETER ControlId
+    The TSC control id (e.g. 'CC6.1') the conclusion is being computed for.
+    Echoed back on the output object for caller convenience.
+
+.PARAMETER Findings
+    v2-shaped findings mapped to this control. Empty array is legal.
+
+.PARAMETER EvidenceCount
+    Number of evidence-bundle records that reference this control. 0 is
+    legal; affects only the OK -> Effective vs No-Evidence boundary.
+
+.OUTPUTS
+    PSCustomObject with: ControlId, Conclusion, DeficiencySeverity,
+    BlockingFinding (or $null), Reason, FindingCount, EvidenceCount.
+#>
+function Get-SOC2ControlConclusion {
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)][string]$ControlId,
+        [object[]]$Findings = @(),
+        [int]$EvidenceCount = 0
+    )
+
+    # Dispositions that exclude a finding from driving a Deficiency.
+    # AcceptedRisk and CompensatingControl additionally trigger the Accepted Risk
+    # conclusion when no unaccepted blockers exist.
+    $acceptedDispositions = @('AcceptedRisk', 'CompensatingControl')
+    $excludedDispositions = @('FalsePositive', 'OutOfScope', 'Resolved', 'Suppressed')
+
+    function script:Test-IsLicensingGapFinding {
+        param($Finding)
+        $t = if ($Finding.PSObject.Properties['Type']) { [string]$Finding.Type } else { '' }
+        if ($t -match '^SOC2_LicensingGap') { return $true }
+        if ($Finding.PSObject.Properties['Tags']) {
+            foreach ($tag in @($Finding.Tags)) {
+                if ([string]$tag -eq 'LicensingGap') { return $true }
+            }
+        }
+        return $false
+    }
+
+    function script:Test-IsAttestedManual {
+        param($Finding)
+        if (-not $Finding.PSObject.Properties['ReviewStatus']) { return $false }
+        $rs = $Finding.ReviewStatus
+        if (-not $rs) { return $false }
+        if (-not $rs.PSObject.Properties['State']) { return $false }
+        return ([string]$rs.State -in @('Accepted', 'Reviewed'))
+    }
+
+    # Severity rank used to pick the worst FAIL as the "blocking" finding.
+    $sevRank = @{ Critical = 4; High = 3; Medium = 2; Low = 1; Info = 0 }
+
+    $activeFails = New-Object System.Collections.Generic.List[object]
+    $activeWarnings = New-Object System.Collections.Generic.List[object]
+    $acceptedBlockers = New-Object System.Collections.Generic.List[object]
+    $manualPending = New-Object System.Collections.Generic.List[object]
+    $licensingGaps = New-Object System.Collections.Generic.List[object]
+    $infoFindings = New-Object System.Collections.Generic.List[object]
+    $okFindings = New-Object System.Collections.Generic.List[object]
+
+    foreach ($f in @($Findings)) {
+        if ($null -eq $f) { continue }
+        $status = if ($f.PSObject.Properties['Status']) { [string]$f.Status } else { '' }
+        $disposition = if ($f.PSObject.Properties['Disposition']) { [string]$f.Disposition } else { '' }
+
+        # Licensing gaps short-circuit by Type/Tag regardless of Status, because
+        # the production code emits them as INFO today. Plan §7 row 4 ranks
+        # them above INFO so they have to win that race.
+        if (Test-IsLicensingGapFinding $f) {
+            $licensingGaps.Add($f) | Out-Null
+            continue
+        }
+
+        switch ($status) {
+            'FAIL' {
+                if ($disposition -in $acceptedDispositions) {
+                    $acceptedBlockers.Add($f) | Out-Null
+                } elseif ($disposition -in $excludedDispositions) {
+                    # Resolved / FalsePositive / OutOfScope / Suppressed don't block.
+                } else {
+                    $activeFails.Add($f) | Out-Null
+                }
+            }
+            'WARNING' {
+                if ($disposition -in $acceptedDispositions) {
+                    $acceptedBlockers.Add($f) | Out-Null
+                } elseif ($disposition -in $excludedDispositions) {
+                    # ignore
+                } else {
+                    $activeWarnings.Add($f) | Out-Null
+                }
+            }
+            'REVIEW' {
+                if (Test-IsAttestedManual $f) { $okFindings.Add($f) | Out-Null }
+                else { $manualPending.Add($f) | Out-Null }
+            }
+            'MANUAL' {
+                if (Test-IsAttestedManual $f) { $okFindings.Add($f) | Out-Null }
+                else { $manualPending.Add($f) | Out-Null }
+            }
+            'OK' { $okFindings.Add($f) | Out-Null }
+            default { $infoFindings.Add($f) | Out-Null }
+        }
+    }
+
+    $conclusion = ''
+    $deficiencySeverity = ''
+    $reason = ''
+    $blockingFinding = $null
+
+    if ($activeFails.Count -gt 0) {
+        # Pick the worst FAIL by severity rank, stable on first-seen for ties.
+        $worst = $null
+        $worstRank = -1
+        foreach ($f in $activeFails) {
+            $sev = if ($f.PSObject.Properties['Severity']) { [string]$f.Severity } else { 'Info' }
+            $rank = if ($sevRank.ContainsKey($sev)) { $sevRank[$sev] } else { 0 }
+            if ($rank -gt $worstRank) { $worst = $f; $worstRank = $rank }
+        }
+        $blockingFinding = $worst
+        $conclusion = 'Deficiency'
+        $deficiencySeverity = if ($worst.PSObject.Properties['Severity']) { [string]$worst.Severity } else { 'High' }
+        $reason = "FAIL ($deficiencySeverity): $([string]$worst.Description)"
+    }
+    elseif ($activeWarnings.Count -gt 0) {
+        $blockingFinding = $activeWarnings[0]
+        $conclusion = 'Deficiency - Minor'
+        $deficiencySeverity = 'Medium'
+        $reason = "WARNING: $([string]$blockingFinding.Description)"
+    }
+    elseif ($manualPending.Count -gt 0) {
+        $blockingFinding = $manualPending[0]
+        $conclusion = 'Manual Pending'
+        $reason = "Manual attestation pending: $([string]$blockingFinding.Description)"
+    }
+    elseif ($licensingGaps.Count -gt 0) {
+        $blockingFinding = $licensingGaps[0]
+        $conclusion = 'Not Assessed - Licensing'
+        $reason = "Licensing gap: $([string]$blockingFinding.Description)"
+    }
+    elseif ($acceptedBlockers.Count -gt 0) {
+        $blockingFinding = $acceptedBlockers[0]
+        $conclusion = 'Accepted Risk'
+        $reason = "Risk accepted: $([string]$blockingFinding.Description)"
+    }
+    elseif ($infoFindings.Count -gt 0) {
+        $blockingFinding = $infoFindings[0]
+        $conclusion = 'Informational'
+        $reason = 'Informational findings only'
+    }
+    elseif ($okFindings.Count -gt 0) {
+        $blockingFinding = $okFindings[0]
+        $conclusion = 'Effective'
+        $reason = if ($EvidenceCount -gt 0) { 'All findings OK, evidence collected' } else { 'All findings OK (no evidence record present)' }
+    }
+    else {
+        $conclusion = 'Not Assessed - No Evidence'
+        $reason = 'No findings and no evidence for this control'
+    }
+
+    return [pscustomobject]@{
+        ControlId = $ControlId
+        Conclusion = $conclusion
+        DeficiencySeverity = $deficiencySeverity
+        BlockingFinding = $blockingFinding
+        Reason = $reason
+        FindingCount = @($Findings).Count
+        EvidenceCount = $EvidenceCount
+    }
+}
+
+<#
+.SYNOPSIS
+    Builds the Control Conclusion Register: one row per SOC 2 control, with
+    conclusion, owner, due date, exception status, evidence count, and
+    management response.
+
+.DESCRIPTION
+    Walks the TSC catalog. For each control:
+      1. Pulls mapped findings from $Summary.ControlFindings[control.Id].
+      2. Counts evidence records that reference this control (best-effort —
+         falls back to bundle-wide count when per-control mapping is absent).
+      3. Calls Get-SOC2ControlConclusion to compute the conclusion.
+      4. Reads Owner / Exception / ManagementResponse from the v2 fields on
+         the blocking finding (or the highest-severity finding for the
+         control if no blocker was identified).
+
+    Sort order: families in canonical order (CC, A, C, PI, P) and then by
+    control id within family.
+
+.PARAMETER Catalog
+    Output of Get-SOC2TSCCatalog.
+
+.PARAMETER Summary
+    Output of Get-SOC2Summary (the .Summary property of the
+    Invoke-SOC2Assessment result).
+
+.PARAMETER EvidenceBundle
+    Optional output of New-SOC2EvidenceBundle. When present, per-control
+    evidence counts are derived from EvidenceBundle.Findings; otherwise
+    every control row reports EvidenceCount=0.
+
+.OUTPUTS
+    Array of PSCustomObject rows with:
+      ControlId, TscFamily, FamilyName, Automation, ControlDescription,
+      Conclusion, DeficiencySeverity, FindingCount, EvidenceCount, Owner,
+      DueDate, ExceptionStatus, ManagementResponse, ControlOwnerHint.
+#>
+function Get-SOC2ControlConclusionRegister {
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [Parameter(Mandatory)][object[]]$Catalog,
+        [Parameter(Mandatory)][pscustomobject]$Summary,
+        [pscustomobject]$EvidenceBundle
+    )
+
+    # Per-control evidence counts. EvidenceBundle.Findings is keyed by
+    # finding (each entry carries .TSCReferences and a hash), so we tally
+    # references rather than findings — closer to "how many distinct pieces
+    # of evidence underpin this control".
+    $evidenceByControl = @{}
+    if ($EvidenceBundle -and $EvidenceBundle.PSObject.Properties['Findings'] -and $EvidenceBundle.Findings) {
+        foreach ($e in @($EvidenceBundle.Findings)) {
+            $refs = if ($e.PSObject.Properties['TSCReferences']) { @($e.TSCReferences) } else { @() }
+            foreach ($r in $refs) {
+                $key = [string]$r
+                if (-not $evidenceByControl.ContainsKey($key)) { $evidenceByControl[$key] = 0 }
+                $evidenceByControl[$key]++
+            }
+        }
+    }
+
+    $familyOrder = @{ CC = 0; A = 1; C = 2; PI = 3; P = 4 }
+    $ordered = @($Catalog | Sort-Object @{
+            Expression = { if ($familyOrder.ContainsKey([string]$_.Family)) { $familyOrder[[string]$_.Family] } else { 99 } }
+        }, 'Id')
+
+    $rows = New-Object System.Collections.Generic.List[object]
+    foreach ($control in $ordered) {
+        $controlId = [string]$control.Id
+        $controlFindings = if ($Summary.ControlFindings.ContainsKey($controlId)) {
+            @($Summary.ControlFindings[$controlId])
+        } else { @() }
+        $evidenceCount = if ($evidenceByControl.ContainsKey($controlId)) { $evidenceByControl[$controlId] } else { 0 }
+
+        $conclusion = Get-SOC2ControlConclusion `
+            -ControlId $controlId `
+            -Findings $controlFindings `
+            -EvidenceCount $evidenceCount
+
+        # Pull owner/exception/management response off the blocking finding when
+        # we have one. v2 normalization always populates the fields (with empty
+        # objects when no real state exists), so the property checks below are
+        # belt-and-braces against legacy or partial findings.
+        $owner = ''
+        $dueDate = ''
+        $exceptionStatus = 'None'
+        $managementResponse = ''
+
+        $bf = $conclusion.BlockingFinding
+        if ($bf) {
+            if ($bf.PSObject.Properties['Owner'] -and $bf.Owner) {
+                if ($bf.Owner.PSObject.Properties['DisplayName']) { $owner = [string]$bf.Owner.DisplayName }
+                if ($bf.Owner.PSObject.Properties['DueDate']) { $dueDate = [string]$bf.Owner.DueDate }
+            }
+            if ($bf.PSObject.Properties['Exception'] -and $bf.Exception) {
+                if ($bf.Exception.PSObject.Properties['Status']) {
+                    $st = [string]$bf.Exception.Status
+                    if ($st) { $exceptionStatus = $st }
+                }
+            }
+            if ($bf.PSObject.Properties['ManagementResponse'] -and $bf.ManagementResponse) {
+                $managementResponse = [string]$bf.ManagementResponse
+            }
+        }
+        if (-not $owner -and $control.PSObject.Properties['ControlOwnerHint']) {
+            # Fall back to the catalog's owner hint so the column is never empty.
+            $owner = [string]$control.ControlOwnerHint
+        }
+
+        $row = [pscustomobject]@{
+            ControlId = $controlId
+            TscFamily = [string]$control.Family
+            FamilyName = if ($control.PSObject.Properties['FamilyName']) { [string]$control.FamilyName } else { '' }
+            Automation = if ($control.PSObject.Properties['Automation']) { [string]$control.Automation } else { '' }
+            ControlDescription = if ($control.PSObject.Properties['Description']) { [string]$control.Description } else { '' }
+            Conclusion = $conclusion.Conclusion
+            DeficiencySeverity = $conclusion.DeficiencySeverity
+            FindingCount = $conclusion.FindingCount
+            EvidenceCount = $conclusion.EvidenceCount
+            Owner = $owner
+            DueDate = $dueDate
+            ExceptionStatus = $exceptionStatus
+            ManagementResponse = $managementResponse
+            ControlOwnerHint = if ($control.PSObject.Properties['ControlOwnerHint']) { [string]$control.ControlOwnerHint } else { '' }
+            Reason = $conclusion.Reason
+        }
+        $rows.Add($row) | Out-Null
+    }
+
+    return , $rows.ToArray()
+}
+
+#endregion
+
 #region ==================== INTERNAL HELPERS (row builders + digest) ====================
 
 <#
@@ -266,10 +600,15 @@ function Get-SOC2ExecutiveDigest {
     [OutputType([pscustomobject])]
     param(
         [Parameter(Mandatory)][object[]]$Catalog,
-        [Parameter(Mandatory)][pscustomobject]$Summary
+        [Parameter(Mandatory)][pscustomobject]$Summary,
+        # Optional — if provided, the verdict is derived from control-level
+        # conclusions rather than aggregate finding counts. See
+        # plans/SOC2-Audit-Readiness-Plan.md §8.5.
+        [pscustomobject]$EvidenceBundle
     )
 
-    # Readiness verdict (simple heuristic — no magic tuning; documented thresholds)
+    # Legacy finding-count rollup. Kept for backwards compat — external
+    # consumers (CI badges, dashboards) read TotalPass / Fail / Warning.
     $totalFail = 0
     $totalWarn = 0
     $totalPass = 0
@@ -283,17 +622,64 @@ function Get-SOC2ExecutiveDigest {
         $totalControls += ($f.Automated + $f.Manual)
     }
 
+    # PR 1: verdict from control conclusions. The plan's rationale is that
+    # a single high-severity FAIL on one control should drive the verdict,
+    # not get diluted by 50 OK findings on the same control. Build the
+    # register once and tally.
+    $register = Get-SOC2ControlConclusionRegister `
+        -Catalog $Catalog `
+        -Summary $Summary `
+        -EvidenceBundle $EvidenceBundle
+
+    $conclusionCounts = @{
+        'Deficiency' = 0
+        'Deficiency - Minor' = 0
+        'Manual Pending' = 0
+        'Not Assessed - Licensing' = 0
+        'Accepted Risk' = 0
+        'Informational' = 0
+        'Effective' = 0
+        'Not Assessed - No Evidence' = 0
+    }
+    $criticalDeficiencyCount = 0
+    foreach ($row in $register) {
+        if ($conclusionCounts.ContainsKey($row.Conclusion)) {
+            $conclusionCounts[$row.Conclusion]++
+        }
+        if ($row.Conclusion -eq 'Deficiency' -and [string]$row.DeficiencySeverity -in @('Critical', 'High')) {
+            $criticalDeficiencyCount++
+        }
+    }
+
     $verdict = 'INSUFFICIENT DATA'
     $verdictClass = 'state-Unobserved'
-    if ($totalControls -gt 0) {
-        if ($totalFail -eq 0 -and $totalWarn -eq 0) {
-            $verdict = 'STRONG'
+    if ($register.Count -gt 0) {
+        # Plan §8.5 verdict rules:
+        # - Audit-Ready: every control Effective or Accepted Risk.
+        # - Potential Material Deficiency: any Critical/High Deficiency.
+        #   Phrased as "potential" deliberately — this tool flags for
+        #   analyst attention, it does not render the formal audit
+        #   determination of a material deficiency.
+        # - Gaps Identified: any Deficiency or Deficiency - Minor remaining.
+        # - In Progress: any Manual Pending or Not Assessed.
+        $auditReady = (
+            $conclusionCounts['Deficiency'] -eq 0 -and
+            $conclusionCounts['Deficiency - Minor'] -eq 0 -and
+            $conclusionCounts['Manual Pending'] -eq 0 -and
+            $conclusionCounts['Not Assessed - Licensing'] -eq 0 -and
+            $conclusionCounts['Not Assessed - No Evidence'] -eq 0
+        )
+        if ($auditReady) {
+            $verdict = 'AUDIT-READY'
             $verdictClass = 'state-ConsistentlyPassing'
-        } elseif ($totalFail -gt 0) {
+        } elseif ($criticalDeficiencyCount -gt 0) {
+            $verdict = 'POTENTIAL MATERIAL DEFICIENCY'
+            $verdictClass = 'state-Inconsistent'
+        } elseif ($conclusionCounts['Deficiency'] -gt 0 -or $conclusionCounts['Deficiency - Minor'] -gt 0) {
             $verdict = 'GAPS IDENTIFIED'
             $verdictClass = 'state-Inconsistent'
         } else {
-            $verdict = 'MINOR DEFICIENCIES'
+            $verdict = 'IN PROGRESS'
             $verdictClass = 'state-DegradedButOperating'
         }
     }
@@ -339,6 +725,11 @@ function Get-SOC2ExecutiveDigest {
         TopFailingTscs = $topFailingTscs
         TopLicensingGaps = $topLicensingGaps
         LicensingGapsTotal = if ($Summary.PSObject.Properties['LicensingGaps'] -and $Summary.LicensingGaps) { $Summary.LicensingGaps.Total } else { 0 }
+        # PR 1: control-level conclusion rollup. Callers can render the
+        # register without re-walking the catalog.
+        ControlConclusions = $conclusionCounts
+        CriticalDeficiencyCount = $criticalDeficiencyCount
+        ConclusionRegister = $register
     }
 }
 
@@ -516,6 +907,31 @@ footer { background: #2a3441; color: #d0d5dc; text-align: center; padding: 16px;
 .summary-card a.family-link { color: inherit; text-decoration: none; }
 .summary-card a.family-link:hover .family { text-decoration: underline; }
 .integrity-icon { display: inline-block; vertical-align: middle; margin-right: 4px; }
+/* SOC 2 Audit-Readiness Plan PR 1 — Control Conclusion Register */
+.conclusion-counts { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0 18px; }
+.conclusion-chip { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 12px; font-size: 0.82em; background: #eef1f5; color: #1a1a1a; border: 1px solid #d6dce5; }
+.conclusion-chip .count { font-weight: 700; }
+.conclusion-chip.state-ConsistentlyPassing { background: #e6f4ea; color: #1f6f3a; border-color: #b9dec5; }
+.conclusion-chip.state-Inconsistent { background: #fde7e9; color: #8b1a23; border-color: #f3b7bd; }
+.conclusion-chip.state-DegradedButOperating { background: #fff4ce; color: #7b5e00; border-color: #e8d791; }
+.conclusion-chip.state-Manual { background: #ede4f5; color: #5c2d91; border-color: #c8b3e0; }
+.conclusion-chip.state-Licensing { background: #f3f0fb; color: #6a5fb3; border-color: #cfc6ec; }
+.conclusion-chip.state-AcceptedRisk { background: #fcefe1; color: #8a4b00; border-color: #e9cba2; }
+.conclusion-chip.state-Info { background: #deecf9; color: #1d4d7f; border-color: #b8d3eb; }
+.conclusion-chip.state-Unobserved { background: #e8eaee; color: #555; border-color: #c9ced4; }
+table.conclusion-register { width: 100%; border-collapse: collapse; font-size: 0.9em; }
+table.conclusion-register th { background: #f0f3f6; text-align: left; padding: 8px 10px; border-bottom: 2px solid #d0d5dc; }
+table.conclusion-register td { padding: 8px 10px; border-bottom: 1px solid #e5e8ec; vertical-align: top; }
+table.conclusion-register tr.row-deficiency td { background: #fdf2f3; }
+table.conclusion-register tr.row-deficiency-minor td { background: #fffaf0; }
+table.conclusion-register tr.row-manual td { background: #f6f1fb; }
+table.conclusion-register tr.row-licensing td { background: #f5f2fa; }
+table.conclusion-register tr.row-accepted-risk td { background: #fff5e8; }
+table.conclusion-register tr.row-effective td { background: #f1f9f3; }
+table.conclusion-register tr.row-no-evidence td { background: #f4f5f7; color: #555; }
+table.conclusion-register tr.row-info td { color: #1a1a1a; }
+table.conclusion-register tr:hover td { filter: brightness(0.97); }
+table.conclusion-register a { color: inherit; }
 /* Print stylesheet */
 @media print {
     body { background: white; }
@@ -549,7 +965,7 @@ footer { background: #2a3441; color: #d0d5dc; text-align: center; padding: 16px;
 
     # Executive summary (reporting-enhancements PR) — pinned at the top for
     # a one-page readiness view before the reader scrolls into detail.
-    $digest = Get-SOC2ExecutiveDigest -Catalog $catalog -Summary $summary
+    $digest = Get-SOC2ExecutiveDigest -Catalog $catalog -Summary $summary -EvidenceBundle $evidence
     [void]$sb.AppendLine('<section class="exec-summary">')
     [void]$sb.AppendLine('<h2>Executive Summary</h2>')
     [void]$sb.AppendLine("<div class='verdict'><span class='$($digest.VerdictClass)'>Internal readiness: $($digest.Verdict)</span></div>")
@@ -671,6 +1087,74 @@ footer { background: #2a3441; color: #d0d5dc; text-align: center; padding: 16px;
     }
 
     [void]$sb.AppendLine('</section>')
+
+    # SOC 2 Audit-Readiness Plan PR 1 §8.3 — Control Conclusion Register.
+    # The auditor-facing headline view: one row per control, with the
+    # precedence-derived Conclusion, Owner, Due Date, and Exception Status.
+    # The per-family TSC sections below are the legacy detail view; they
+    # stay for one release behind data-soc2-legacy-findings="true" so
+    # consumers can transition. Plan §14 rollout step 1.
+    # Direct assignment (not @(...) around the call): the helper returns a
+    # comma-wrapped array (file convention, see Get-SOC2SummaryByCategoryRows).
+    # @() applied straight to that pipeline output double-wraps it; an
+    # intermediate assignment unwraps cleanly first.
+    if ($digest.PSObject.Properties['ConclusionRegister'] -and $digest.ConclusionRegister) {
+        $registerRows = $digest.ConclusionRegister
+    } else {
+        $registerRows = Get-SOC2ControlConclusionRegister -Catalog $catalog -Summary $summary -EvidenceBundle $evidence
+    }
+    $registerRows = @($registerRows)
+    if ($registerRows.Count -gt 0) {
+        [void]$sb.AppendLine('<section class="report" id="control-conclusion-register">')
+        [void]$sb.AppendLine('<h2>Control Conclusion Register</h2>')
+        [void]$sb.AppendLine('<p style="color:#555;font-size:0.9em;margin:8px 0 16px;">One row per SOC 2 control. The <em>Conclusion</em> column is derived from the precedence rules in <code>plans/SOC2-Audit-Readiness-Plan.md</code> &sect;7: a single high-severity FAIL drives a Deficiency; warnings drive Deficiency&nbsp;-&nbsp;Minor; accepted-risk findings override deficiency conclusions; manual controls remain Pending until attested.</p>')
+        # Conclusion counts strip — quick visual triage for leadership.
+        $counts = $digest.ControlConclusions
+        if ($counts) {
+            [void]$sb.AppendLine('<div class="conclusion-counts">')
+            foreach ($pair in @(
+                    @{ Label = 'Deficiency'; Key = 'Deficiency'; Class = 'state-Inconsistent' }
+                    @{ Label = 'Deficiency - Minor'; Key = 'Deficiency - Minor'; Class = 'state-DegradedButOperating' }
+                    @{ Label = 'Manual Pending'; Key = 'Manual Pending'; Class = 'state-Manual' }
+                    @{ Label = 'Not Assessed - Licensing'; Key = 'Not Assessed - Licensing'; Class = 'state-Licensing' }
+                    @{ Label = 'Accepted Risk'; Key = 'Accepted Risk'; Class = 'state-AcceptedRisk' }
+                    @{ Label = 'Informational'; Key = 'Informational'; Class = 'state-Info' }
+                    @{ Label = 'Effective'; Key = 'Effective'; Class = 'state-ConsistentlyPassing' }
+                    @{ Label = 'No Evidence'; Key = 'Not Assessed - No Evidence'; Class = 'state-Unobserved' }
+                )) {
+                $n = if ($counts.ContainsKey($pair.Key)) { [int]$counts[$pair.Key] } else { 0 }
+                [void]$sb.AppendLine("<span class='conclusion-chip $($pair.Class)'><span class='count'>$n</span> $($pair.Label)</span>")
+            }
+            [void]$sb.AppendLine('</div>')
+        }
+        [void]$sb.AppendLine('<table class="conclusion-register">')
+        [void]$sb.AppendLine('<thead><tr><th>Control</th><th>Family</th><th>Conclusion</th><th>Severity</th><th>Findings</th><th>Evidence</th><th>Owner</th><th>Due</th><th>Exception</th><th>Description</th></tr></thead>')
+        [void]$sb.AppendLine('<tbody>')
+        foreach ($r in $registerRows) {
+            $cssClass = switch ($r.Conclusion) {
+                'Deficiency' { 'row-deficiency' }
+                'Deficiency - Minor' { 'row-deficiency-minor' }
+                'Manual Pending' { 'row-manual' }
+                'Not Assessed - Licensing' { 'row-licensing' }
+                'Accepted Risk' { 'row-accepted-risk' }
+                'Informational' { 'row-info' }
+                'Effective' { 'row-effective' }
+                'Not Assessed - No Evidence' { 'row-no-evidence' }
+                default { '' }
+            }
+            $controlId = [System.Web.HttpUtility]::HtmlEncode([string]$r.ControlId)
+            $family = [System.Web.HttpUtility]::HtmlEncode([string]$r.TscFamily)
+            $conclusion = [System.Web.HttpUtility]::HtmlEncode([string]$r.Conclusion)
+            $severity = [System.Web.HttpUtility]::HtmlEncode([string]$r.DeficiencySeverity)
+            $owner = [System.Web.HttpUtility]::HtmlEncode([string]$r.Owner)
+            $due = [System.Web.HttpUtility]::HtmlEncode([string]$r.DueDate)
+            $exceptionStatus = [System.Web.HttpUtility]::HtmlEncode([string]$r.ExceptionStatus)
+            $desc = [System.Web.HttpUtility]::HtmlEncode([string]$r.ControlDescription)
+            [void]$sb.AppendLine("<tr class='$cssClass'><td><a href='#family-$family'>$controlId</a></td><td>$family</td><td>$conclusion</td><td>$severity</td><td>$($r.FindingCount)</td><td>$($r.EvidenceCount)</td><td>$owner</td><td>$due</td><td>$exceptionStatus</td><td>$desc</td></tr>")
+        }
+        [void]$sb.AppendLine('</tbody></table>')
+        [void]$sb.AppendLine('</section>')
+    }
 
     # Control register grouped by family (anchor IDs wired for quick-nav links)
     foreach ($family in @('CC', 'A', 'C', 'PI', 'P')) {
@@ -921,6 +1405,12 @@ function New-SOC2AuditWorkbook {
     )
     $summaryRows = Get-SOC2SummaryByCategoryRows -Summary $summary
     $registerRows = Get-SOC2ControlRegisterRows -Catalog $catalog -Summary $summary
+    # SOC 2 Audit-Readiness Plan PR 1 §8.4 — first content sheet after Cover.
+    # The Control Conclusion Register is the auditor's primary view; ship it
+    # before the legacy per-family Findings sheets. Direct assignment then
+    # @() — see the HTML render path for why @() around the call double-wraps.
+    $conclusionRows = Get-SOC2ControlConclusionRegister -Catalog $catalog -Summary $summary -EvidenceBundle $evidence
+    $conclusionRows = @($conclusionRows)
     $familyPreds = Get-SOC2FamilyPredicates
     $licensingRows = Get-SOC2LicensingGapRows -Summary $summary
     $manualRows = Get-SOC2ManualAttestationRows -Catalog $catalog
@@ -932,6 +1422,22 @@ function New-SOC2AuditWorkbook {
         Import-Module ImportExcel -ErrorAction Stop
 
         $coverRows | Export-Excel -Path $OutputPath -WorksheetName 'Cover' -AutoSize -ClearSheet
+        if ($conclusionRows -and $conclusionRows.Count -gt 0) {
+            # Conditional formatting on the Conclusion column. Column letter
+            # picked by ImportExcel's auto-ordering; the column is the 6th
+            # field (ControlId, TscFamily, FamilyName, Automation,
+            # ControlDescription, Conclusion, ...) so 'F' is the address.
+            $conditional = @(
+                New-ConditionalText -Text 'Deficiency' -ConditionalTextColor White -BackgroundColor '#c8102e'
+                New-ConditionalText -Text 'Deficiency - Minor' -ConditionalTextColor Black -BackgroundColor '#ffd166'
+                New-ConditionalText -Text 'Manual Pending' -ConditionalTextColor White -BackgroundColor '#5c2d91'
+                New-ConditionalText -Text 'Not Assessed - Licensing' -ConditionalTextColor White -BackgroundColor '#6a5fb3'
+                New-ConditionalText -Text 'Effective' -ConditionalTextColor Black -BackgroundColor '#dff6dd'
+                New-ConditionalText -Text 'Accepted Risk' -ConditionalTextColor Black -BackgroundColor '#fcefe1'
+                New-ConditionalText -Text 'Not Assessed - No Evidence' -ConditionalTextColor Black -BackgroundColor '#e8eaee'
+            )
+            $conclusionRows | Export-Excel -Path $OutputPath -WorksheetName 'Control Conclusions' -AutoSize -TableName 'tblConclusions' -FreezeTopRow -ConditionalText $conditional
+        }
         if ($summaryRows) { $summaryRows | Export-Excel -Path $OutputPath -WorksheetName 'Summary by Category' -AutoSize -TableName 'tblSummary' }
         if ($registerRows) { $registerRows | Export-Excel -Path $OutputPath -WorksheetName 'Control Register' -AutoSize -TableName 'tblRegister' }
 
@@ -965,6 +1471,13 @@ function New-SOC2AuditWorkbook {
 
     $coverRows | Export-Csv -Path (Join-Path $csvDir '01-Cover.csv') -NoTypeInformation -Encoding UTF8
 
+    # PR 1 §8.4 — Control Conclusion Register. Existing numbers (02/03/04...)
+    # are kept stable so downstream consumers and the
+    # SOC2-Reporting-Enhancements tests don't break; we slot the new file at
+    # 01a so it sorts right after the Cover but before the legacy Summary.
+    if ($conclusionRows -and $conclusionRows.Count -gt 0) {
+        $conclusionRows | Export-Csv -Path (Join-Path $csvDir '01a-Control-Conclusions.csv') -NoTypeInformation -Encoding UTF8
+    }
     if ($summaryRows) {
         $summaryRows | Export-Csv -Path (Join-Path $csvDir '02-Summary-by-Category.csv') -NoTypeInformation -Encoding UTF8
     }
@@ -1000,5 +1513,13 @@ function New-SOC2AuditWorkbook {
 
 Export-ModuleMember -Function @(
     'New-SOC2AuditReport',
-    'New-SOC2AuditWorkbook'
+    'New-SOC2AuditWorkbook',
+    # SOC 2 Audit-Readiness Plan PR 1 — control-level conclusion engine.
+    # Exported so consumers (Type 2 report, future remediation/evidence
+    # PRs, and Pester tests) can call them directly.
+    'Get-SOC2ControlConclusion',
+    'Get-SOC2ControlConclusionRegister',
+    # Was previously consumed only inside this module via New-SOC2AuditReport;
+    # PR 1 needs to test it directly to lock the verdict logic.
+    'Get-SOC2ExecutiveDigest'
 )

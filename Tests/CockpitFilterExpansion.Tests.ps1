@@ -225,11 +225,19 @@ Describe 'Full Findings filter expansion — controls and row attributes' {
         # MFA_AdminDisabled maps to CIS_M365 controls (among other
         # frameworks). The attribute must (a) start with a space, (b) end
         # with a space, (c) contain " cis_m365 " as a whole-word token.
-        # Iteration order across frameworks isn't guaranteed.
+        # Framework iteration order is hashtable-key order — NOT guaranteed
+        # (ConvertTo-ControlMappings enumerates $ComplianceMappings.Keys).
+        # The assertion must therefore be position-independent: a padded
+        # attribute always wraps every token in spaces, so " cis_m365 "
+        # appears as a whole-token substring regardless of where the
+        # framework lands in the enumeration. (A previous regex required a
+        # token *before* cis_m365 and went flaky whenever it enumerated
+        # first — see SOC2 Audit-Readiness PR 1.)
         $row = ($script:Ff -split 'admin-1', 2)[0]
         $rowStart = $row.LastIndexOf('<div class="cockpit-row"')
         $row = $row.Substring($rowStart)
-        $row | Should -Match 'data-frameworks=" [^"]* cis_m365 [^"]*"'
+        $row | Should -Match 'data-frameworks=" [^"]*"'
+        $row | Should -Match 'data-frameworks="[^"]* cis_m365 [^"]*"'
     }
 
     It 'controls attribute is space-padded and contains Framework:ControlId tokens' {

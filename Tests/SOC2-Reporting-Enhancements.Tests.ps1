@@ -208,6 +208,12 @@ Describe 'Item 2: HTML executive summary + anchor links + print stylesheet' {
     }
 
     It 'renders the Executive Summary section with verdict + headline stats + jump-to nav' {
+        # SOC2 Audit-Readiness PR 1 (plan §8.5): the verdict is now derived
+        # from control-level conclusions, not raw finding counts. A
+        # High-severity FAIL produces a Critical/High Deficiency, so the
+        # verdict is POTENTIAL MATERIAL DEFICIENCY (was 'GAPS IDENTIFIED'
+        # under the old finding-count heuristic). "Potential" because the
+        # tool flags for analyst attention, not a formal audit ruling.
         $findings = @(
             New-TestFinding -Status 'FAIL' -TSCRefs @('CC6.1')
             New-TestFinding -Type 'Other' -Status 'WARNING' -TSCRefs @('CC6.3')
@@ -218,17 +224,36 @@ Describe 'Item 2: HTML executive summary + anchor links + print stylesheet' {
         $body = Get-Content -LiteralPath $script:HtmlPath -Raw
 
         $body | Should -BeLike '*Executive Summary*'
-        $body | Should -BeLike '*Internal readiness: GAPS IDENTIFIED*'
+        $body | Should -BeLike '*Internal readiness: POTENTIAL MATERIAL DEFICIENCY*'
         $body | Should -BeLike '*class=*headline-row*'
         $body | Should -BeLike '*Jump to*'
     }
 
-    It 'verdict is STRONG when only PASS findings exist' {
+    It 'verdict is AUDIT-READY when every control is Effective' {
+        # PR 1 §8.5: AUDIT-READY requires every control in scope to land on
+        # Effective or Accepted Risk — a single OK finding leaves the rest
+        # of the catalog "Not Assessed - No Evidence" (verdict IN PROGRESS).
+        # Give every CC control an OK finding so the whole register is
+        # Effective.
+        $catalog = Get-SOC2TSCCatalog -Categories @('CC')
+        $findings = foreach ($c in $catalog) {
+            New-TestFinding -Status 'OK' -TSCRefs @($c.Id) -Object $c.Id
+        }
+        $result = New-TestAssessmentResult -Findings @($findings)
+        $branding = Get-ReportBrandingContext -Config $null -ReportTitle 'Enhancements Test'
+        $null = New-SOC2AuditReport -AssessmentResult $result -OutputPath $script:HtmlPath -Branding $branding
+        (Get-Content $script:HtmlPath -Raw) | Should -BeLike '*Internal readiness: AUDIT-READY*'
+    }
+
+    It 'verdict is IN PROGRESS when only some controls are assessed' {
+        # The sparse case the old 'STRONG when only PASS findings exist'
+        # test used to assert — under PR 1 semantics an all-pass-but-sparse
+        # run is honestly IN PROGRESS, not audit-ready.
         $findings = @(New-TestFinding -Status 'OK' -TSCRefs @('CC6.1'))
         $result = New-TestAssessmentResult -Findings $findings
         $branding = Get-ReportBrandingContext -Config $null -ReportTitle 'Enhancements Test'
         $null = New-SOC2AuditReport -AssessmentResult $result -OutputPath $script:HtmlPath -Branding $branding
-        (Get-Content $script:HtmlPath -Raw) | Should -BeLike '*Internal readiness: STRONG*'
+        (Get-Content $script:HtmlPath -Raw) | Should -BeLike '*Internal readiness: IN PROGRESS*'
     }
 
     It 'per-family sections have anchor IDs wired for quick-nav' {
