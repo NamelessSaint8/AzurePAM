@@ -9,8 +9,8 @@
     1. Get-SOC2ControlConclusionRegister — walks the catalog and produces
        one row per control with the right column shape. Tests cover
        column completeness, family/control-id sort order, owner pulled
-       from the v2 Owner field, and the evidence count derived from
-       EvidenceBundle.Findings[].TSCReferences.
+       from the v2 Owner field, and the evidence count derived from the
+       bundle manifest via Get-SOC2EvidenceMatrix (PR 3 follow-up).
 
     2. Get-SOC2ExecutiveDigest verdict rolls up from control conclusions
        (not raw finding counts). Tests pin the four verdict states:
@@ -153,29 +153,65 @@ Describe 'Get-SOC2ControlConclusionRegister — column shape and ordering' {
 }
 
 Describe 'Get-SOC2ControlConclusionRegister — evidence count derivation' {
+    # PR 3 follow-up: EvidenceCount is now derived from the bundle
+    # manifest via Get-SOC2EvidenceMatrix (the production path), not the
+    # never-populated $EvidenceBundle.Findings property. These tests build
+    # a real on-disk bundle so they exercise the manifest reader.
 
-    It 'counts evidence records by TSCReferences from EvidenceBundle' {
-        $findings = @(
-            New-SyntheticFinding -Status 'OK' -TSCReferences @('CC6.1')
-        )
-        $result = Build-Result -Findings $findings -Categories @('CC')
-        $bundle = [pscustomobject]@{
-            Findings = @(
-                [pscustomobject]@{ Hash = 'aaa'; TSCReferences = @('CC6.1') }
-                [pscustomobject]@{ Hash = 'bbb'; TSCReferences = @('CC6.1', 'CC6.3') }
-                [pscustomobject]@{ Hash = 'ccc'; TSCReferences = @('CC8.1') }
-            )
+    BeforeEach {
+        $script:Tmp = Join-Path $env:TEMP "ccr-ev-$((Get-Random))"
+        $null = New-Item -Path $script:Tmp -ItemType Directory -Force
+    }
+    AfterEach {
+        if (Test-Path $script:Tmp) { Remove-Item -LiteralPath $script:Tmp -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'derives EvidenceCount from the manifest and agrees with the Evidence Matrix' {
+        $findings = @(New-SyntheticFinding -Status 'OK' -TSCReferences @('CC6.1'))
+        $catalog = Get-SOC2TSCCatalog -Categories @('CC')
+        $summary = Get-SOC2Summary -Findings $findings -Catalog $catalog
+        $bundle = New-SOC2EvidenceBundle -Findings $findings -Catalog $catalog `
+            -TenantId 't-ccr-ev' -Categories @('CC') -Summary $summary -OutputDirectory $script:Tmp
+
+        $register = Get-SOC2ControlConclusionRegister -Catalog $catalog -Summary $summary -EvidenceBundle $bundle
+        $matrix = Get-SOC2EvidenceMatrix -EvidenceBundle $bundle -ControlCatalog $catalog
+
+        # Every catalog control gets a controls/<Id>.json artifact, so the
+        # count is >= 1 everywhere; Manual controls also get a
+        # manual-attestation/.md artifact (count 2). The register must
+        # match the matrix row count per control exactly.
+        foreach ($id in @('CC6.1', 'CC6.3', 'CC1.1')) {
+            $regRow = $register | Where-Object ControlId -eq $id | Select-Object -First 1
+            $matrixCount = @($matrix | Where-Object { $_.ControlId -eq $id }).Count
+            $regRow.EvidenceCount | Should -Be $matrixCount -Because "register and matrix must agree on $id"
+            $regRow.EvidenceCount | Should -BeGreaterThan 0
         }
-        $register = Get-SOC2ControlConclusionRegister -Catalog $result.Catalog -Summary $result.Summary -EvidenceBundle $bundle
-        ($register | Where-Object ControlId -eq 'CC6.1').EvidenceCount | Should -Be 2
-        ($register | Where-Object ControlId -eq 'CC6.3').EvidenceCount | Should -Be 1
-        ($register | Where-Object ControlId -eq 'CC8.1').EvidenceCount | Should -Be 1
+    }
+
+    It 'gives Manual controls a higher count than automated (controls JSON + attestation template)' {
+        $findings = @(New-SyntheticFinding -Status 'OK' -TSCReferences @('CC6.1'))
+        $catalog = Get-SOC2TSCCatalog -Categories @('CC')
+        $summary = Get-SOC2Summary -Findings $findings -Catalog $catalog
+        $bundle = New-SOC2EvidenceBundle -Findings $findings -Catalog $catalog `
+            -TenantId 't-ccr-ev2' -Categories @('CC') -Summary $summary -OutputDirectory $script:Tmp
+        $register = Get-SOC2ControlConclusionRegister -Catalog $catalog -Summary $summary -EvidenceBundle $bundle
+
+        # CC1.1 is a Manual control (controls JSON + manual-attestation MD).
+        ($register | Where-Object ControlId -eq 'CC1.1').EvidenceCount | Should -Be 2
     }
 
     It 'reports EvidenceCount=0 when no bundle is provided' {
         $findings = @(New-SyntheticFinding -Status 'OK')
         $result = Build-Result -Findings $findings -Categories @('CC')
         $register = Get-SOC2ControlConclusionRegister -Catalog $result.Catalog -Summary $result.Summary
+        @($register | Where-Object { $_.EvidenceCount -ne 0 }).Count | Should -Be 0
+    }
+
+    It 'reports EvidenceCount=0 when the bundle manifest is unreadable' {
+        $findings = @(New-SyntheticFinding -Status 'OK')
+        $result = Build-Result -Findings $findings -Categories @('CC')
+        $fakeBundle = [pscustomobject]@{ ManifestPath = (Join-Path $script:Tmp 'does-not-exist/manifest.json') }
+        $register = Get-SOC2ControlConclusionRegister -Catalog $result.Catalog -Summary $result.Summary -EvidenceBundle $fakeBundle
         @($register | Where-Object { $_.EvidenceCount -ne 0 }).Count | Should -Be 0
     }
 }

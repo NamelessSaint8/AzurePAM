@@ -259,9 +259,10 @@ function Get-SOC2ControlConclusion {
     Invoke-SOC2Assessment result).
 
 .PARAMETER EvidenceBundle
-    Optional output of New-SOC2EvidenceBundle. When present, per-control
-    evidence counts are derived from EvidenceBundle.Findings; otherwise
-    every control row reports EvidenceCount=0.
+    Optional output of New-SOC2EvidenceBundle. When present (and its
+    manifest is readable), per-control evidence counts are derived from
+    the bundle manifest via Get-SOC2EvidenceMatrix; otherwise every
+    control row reports EvidenceCount=0.
 
 .OUTPUTS
     Array of PSCustomObject rows with:
@@ -281,20 +282,25 @@ function Get-SOC2ControlConclusionRegister {
         [pscustomobject]$EvidenceBundle
     )
 
-    # Per-control evidence counts. EvidenceBundle.Findings is keyed by
-    # finding (each entry carries .TSCReferences and a hash), so we tally
-    # references rather than findings — closer to "how many distinct pieces
-    # of evidence underpin this control".
+    # Per-control evidence counts. Derived from the bundle manifest via
+    # Get-SOC2EvidenceMatrix (the canonical reader added in PR 3) so the
+    # register's EvidenceCount and the Evidence Matrix never disagree on
+    # what an "evidence artifact" is. One matrix row == one hashed
+    # artifact in the manifest (a control's automated-capture JSON, plus
+    # the manual-attestation template for Manual controls).
+    #
+    # The original PR 1 implementation read $EvidenceBundle.Findings,
+    # which the production New-SOC2EvidenceBundle return object never
+    # carries (it only exposes ManifestPath) — so this count was silently
+    # 0 on every real run. Reading the manifest fixes that.
     $evidenceByControl = @{}
-    if ($EvidenceBundle -and $EvidenceBundle.PSObject.Properties['Findings'] -and $EvidenceBundle.Findings) {
-        foreach ($e in @($EvidenceBundle.Findings)) {
-            $refs = if ($e.PSObject.Properties['TSCReferences']) { @($e.TSCReferences) } else { @() }
-            foreach ($r in $refs) {
-                $key = [string]$r
-                if (-not $evidenceByControl.ContainsKey($key)) { $evidenceByControl[$key] = 0 }
-                $evidenceByControl[$key]++
-            }
-        }
+    $matrixRows = Get-SOC2EvidenceMatrix -EvidenceBundle $EvidenceBundle -ControlCatalog $Catalog
+    foreach ($mr in @($matrixRows)) {
+        if (-not $mr) { continue }
+        $key = [string]$mr.ControlId
+        if (-not $key) { continue }
+        if (-not $evidenceByControl.ContainsKey($key)) { $evidenceByControl[$key] = 0 }
+        $evidenceByControl[$key]++
     }
 
     $familyOrder = @{ CC = 0; A = 1; C = 2; PI = 3; P = 4 }
