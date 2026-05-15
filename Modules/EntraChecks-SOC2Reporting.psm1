@@ -500,6 +500,204 @@ function Get-SOC2RemediationPlan {
     return , @($sorted)
 }
 
+<#
+.SYNOPSIS
+    Buckets an evidence artifact's age into Fresh / Aging / Stale.
+    Pure boundary math — SOC 2 Audit-Readiness Plan PR 3 §10.1.
+
+.DESCRIPTION
+    Fresh  : age < 30 days
+    Aging  : 30 <= age < 90 days
+    Stale  : age >= 90 days
+    Unknown: CollectionTime missing or unparseable.
+
+    Boundaries are half-open so the day-30 and day-90 marks are
+    deterministic (29d -> Fresh, 30d -> Aging, 89d -> Aging,
+    90d -> Stale).
+
+.PARAMETER CollectionTime
+    ISO-8601 timestamp string (e.g. the manifest GeneratedAt).
+
+.PARAMETER AsOf
+    Reference "now" for the age calculation. Defaults to current UTC.
+    Injectable so tests can pin the boundary math.
+
+.OUTPUTS
+    String: Fresh | Aging | Stale | Unknown.
+#>
+function Get-SOC2EvidenceFreshness {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowNull()][AllowEmptyString()][string]$CollectionTime,
+        [datetime]$AsOf = ([datetime]::UtcNow)
+    )
+
+    if ([string]::IsNullOrWhiteSpace($CollectionTime)) { return 'Unknown' }
+
+    # DateTimeOffset carries the zone, so the age math is tz-kind safe even
+    # when -AsOf is a Local/Unspecified [datetime] (e.g. a string literal)
+    # and the timestamp is UTC. Mixing those as plain [datetime] would skew
+    # the result by the local UTC offset.
+    $parsed = [System.DateTimeOffset]::MinValue
+    $ok = [System.DateTimeOffset]::TryParse(
+        $CollectionTime,
+        [System.Globalization.CultureInfo]::InvariantCulture,
+        [System.Globalization.DateTimeStyles]::AssumeUniversal,
+        [ref]$parsed)
+    if (-not $ok) { return 'Unknown' }
+
+    # Interpret AsOf's wall clock as UTC (matches AssumeUniversal above) so a
+    # pinned [datetime] literal in tests and the UtcNow default behave the same.
+    $asOfUtc = [datetime]::SpecifyKind($AsOf, [System.DateTimeKind]::Utc)
+    $asOfOffset = [System.DateTimeOffset]::new($asOfUtc)
+    $ageDays = ($asOfOffset - $parsed).TotalDays
+    if ($ageDays -lt 0) { $ageDays = 0 }   # clock skew → treat as fresh
+    if ($ageDays -lt 30) { return 'Fresh' }
+    if ($ageDays -lt 90) { return 'Aging' }
+    return 'Stale'
+}
+
+<#
+.SYNOPSIS
+    Pivots the evidence bundle manifest into one row per evidence
+    artifact, keyed to its TSC control. SOC 2 Audit-Readiness Plan
+    PR 3 §10.
+
+.DESCRIPTION
+    A pure view — reads the manifest JSON written by
+    New-SOC2EvidenceBundle (the canonical record), maps each hashed
+    file back to a control, and joins the catalog for TscFamily.
+
+    Per-file ControlId is parsed from the manifest relative path
+    (controls/<Id>.json or manual-attestation/<Id>.md). The bundle
+    return object only carries ManifestPath, so this is the only
+    reliable per-control evidence source.
+
+    RedactionStatus is bundle-wide: redaction (Invoke-SOC2Redaction)
+    runs over every finding before the bundle is written, so either
+    all artifacts derive from redacted findings or none do. The signal
+    is taken from -IdentityMapPath (set on the assessment result when
+    redaction ran) and its salt-fingerprint metadata.
+
+.PARAMETER EvidenceBundle
+    The PSCustomObject returned by New-SOC2EvidenceBundle (needs
+    .ManifestPath). $null → empty matrix.
+
+.PARAMETER ControlCatalog
+    Output of Get-SOC2TSCCatalog (for TscFamily lookup).
+
+.PARAMETER IdentityMapPath
+    Optional path to the identity-resolution map. When present, every
+    row's RedactionStatus reflects the recorded hash algorithm;
+    otherwise rows report "Not redacted".
+
+.PARAMETER AsOf
+    Reference time for Freshness. Defaults to current UTC.
+
+.OUTPUTS
+    Array of PSCustomObject rows:
+      ControlId, TscFamily, EvidenceArtifact, Source, CollectionTime,
+      Hash, RedactionStatus, Freshness, AnchorId.
+#>
+function Get-SOC2EvidenceMatrix {
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [AllowNull()][pscustomobject]$EvidenceBundle,
+        [Parameter(Mandatory)][object[]]$ControlCatalog,
+        [AllowNull()][AllowEmptyString()][string]$IdentityMapPath,
+        [datetime]$AsOf = ([datetime]::UtcNow)
+    )
+
+    $rows = New-Object System.Collections.Generic.List[object]
+
+    if (-not $EvidenceBundle -or
+        -not $EvidenceBundle.PSObject.Properties['ManifestPath'] -or
+        -not $EvidenceBundle.ManifestPath -or
+        -not (Test-Path -LiteralPath $EvidenceBundle.ManifestPath)) {
+        return , $rows.ToArray()
+    }
+
+    try {
+        $manifest = Get-Content -LiteralPath $EvidenceBundle.ManifestPath -Raw | ConvertFrom-Json
+    } catch {
+        return , $rows.ToArray()
+    }
+
+    $collectionTime = if ($manifest.PSObject.Properties['GeneratedAt']) { [string]$manifest.GeneratedAt } else { '' }
+    $freshness = Get-SOC2EvidenceFreshness -CollectionTime $collectionTime -AsOf $AsOf
+
+    # Bundle-wide redaction status from the identity-resolution map.
+    $redactionStatus = 'Not redacted'
+    if ($IdentityMapPath -and (Test-Path -LiteralPath $IdentityMapPath)) {
+        try {
+            $idMap = Get-Content -LiteralPath $IdentityMapPath -Raw | ConvertFrom-Json
+            $algo = if ($idMap.PSObject.Properties['HashAlgorithm'] -and $idMap.HashAlgorithm) { [string]$idMap.HashAlgorithm } else { 'SHA256' }
+            $redactionStatus = "Redacted ($algo, salted)"
+        } catch {
+            $redactionStatus = 'Redacted'
+        }
+    }
+
+    # Family lookup from the catalog.
+    $familyById = @{}
+    foreach ($c in $ControlCatalog) {
+        if ($c -and $c.PSObject.Properties['Id']) {
+            $familyById[[string]$c.Id] = if ($c.PSObject.Properties['Family']) { [string]$c.Family } else { '' }
+        }
+    }
+
+    $files = if ($manifest.PSObject.Properties['Files']) { @($manifest.Files) } else { @() }
+    foreach ($entry in $files) {
+        if (-not $entry) { continue }
+        $rel = if ($entry.PSObject.Properties['RelativePath']) { [string]$entry.RelativePath } else { '' }
+        if (-not $rel) { continue }
+        # Skip the manifest itself if it ever appears in its own Files list.
+        if ($rel -match '(^|[\\/])manifest\.json$') { continue }
+
+        # ControlId is the file stem under controls/ or manual-attestation/.
+        $leaf = [System.IO.Path]::GetFileNameWithoutExtension($rel)
+        $controlId = $leaf
+        $source = if ($rel -match '(^|[\\/])controls[\\/]') {
+            'Automated control capture'
+        } elseif ($rel -match '(^|[\\/])manual-attestation[\\/]') {
+            'Manual attestation template'
+        } else {
+            'Bundle artifact'
+        }
+
+        $hash = if ($entry.PSObject.Properties['SHA256']) { [string]$entry.SHA256 } else { '' }
+        # The SHA-256 is already ASCII hex, so a stable per-row anchor is
+        # just the prefix + first 16 chars — no cross-module dependency on
+        # New-SafeElementId (HTMLReporting) needed.
+        $anchorId = if ($hash) { 'soc2-evidence-' + $hash.Substring(0, [Math]::Min(16, $hash.Length)) } else { 'soc2-evidence-empty' }
+
+        $tscFamily = if ($familyById.ContainsKey($controlId)) { $familyById[$controlId] } else { '' }
+
+        $row = [pscustomobject]@{
+            ControlId = $controlId
+            TscFamily = $tscFamily
+            EvidenceArtifact = $rel
+            Source = $source
+            CollectionTime = $collectionTime
+            Hash = $hash
+            RedactionStatus = $redactionStatus
+            Freshness = $freshness
+            AnchorId = $anchorId
+        }
+        $rows.Add($row) | Out-Null
+    }
+
+    # Stable order: TscFamily, then ControlId, then artifact path.
+    $byFamily = @{ Expression = { [string]$_.TscFamily } }
+    $byControl = @{ Expression = { [string]$_.ControlId } }
+    $byArtifact = @{ Expression = { [string]$_.EvidenceArtifact } }
+    $sorted = $rows.ToArray() | Sort-Object -Property $byFamily, $byControl, $byArtifact
+
+    return , @($sorted)
+}
+
 #endregion
 
 #region ==================== INTERNAL HELPERS (row builders + digest) ====================
@@ -1084,6 +1282,21 @@ table.remediation-plan a { color: inherit; }
 .prio-badge.prio-3 { background: #5c2d91; }
 .prio-badge.prio-4 { background: #6a5fb3; }
 .prio-badge.prio-5 { background: #6c757d; }
+/* PR 3 — Evidence Matrix */
+.em-filters { display: flex; flex-wrap: wrap; gap: 14px; margin: 12px 0 16px; font-size: 0.85em; }
+.em-filters label { display: flex; align-items: center; gap: 6px; color: #555; }
+.em-filters select { padding: 4px 8px; border: 1px solid #d0d5dc; border-radius: 4px; font-size: 0.95em; }
+table.evidence-matrix { width: 100%; border-collapse: collapse; font-size: 0.85em; }
+table.evidence-matrix th { background: #f0f3f6; text-align: left; padding: 8px 10px; border-bottom: 2px solid #d0d5dc; }
+table.evidence-matrix td { padding: 7px 10px; border-bottom: 1px solid #e5e8ec; vertical-align: top; }
+table.evidence-matrix td.evidence-hash { font-family: monospace; font-size: 0.78em; word-break: break-all; color: #555; }
+table.evidence-matrix tr:hover td { background: #fafbfc; }
+table.evidence-matrix a { color: inherit; }
+.fresh-badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 0.8em; font-weight: 600; }
+.fresh-badge.fresh-fresh { background: #dff6dd; color: #1f6f3a; }
+.fresh-badge.fresh-aging { background: #fff4ce; color: #7b5e00; }
+.fresh-badge.fresh-stale { background: #fde7e9; color: #8b1a23; }
+.fresh-badge.fresh-unknown { background: #e8eaee; color: #555; }
 /* Print stylesheet */
 @media print {
     body { background: white; }
@@ -1095,6 +1308,7 @@ table.remediation-plan a { color: inherit; }
     .low-confidence-banner { break-inside: avoid; }
     * { -webkit-print-color-adjust: exact !important; color-adjust: exact !important; print-color-adjust: exact !important; }
     .exec-summary .nav-links { display: none; }
+    .em-filters { display: none; }
     a[href^="#"] { text-decoration: none; color: inherit; }
 }
 </style>
@@ -1337,6 +1551,82 @@ table.remediation-plan a { color: inherit; }
         [void]$sb.AppendLine('</section>')
     }
 
+    # SOC 2 Audit-Readiness Plan PR 3 §10.2 — Evidence Matrix. Per-artifact
+    # rows pivoted from the bundle manifest, after the Remediation Plan and
+    # before the legacy per-family TSC sections. Filters (TscFamily /
+    # Freshness / RedactionStatus) use a small self-contained inline script
+    # scoped to this section — the SOC 2 report is otherwise static and
+    # importing the whole cockpit JS module would couple the two reports.
+    $evidenceMatrixRows = Get-SOC2EvidenceMatrix -EvidenceBundle $evidence -ControlCatalog $catalog -IdentityMapPath $IdentityResolutionMapPath
+    $evidenceMatrixRows = @($evidenceMatrixRows)
+    if ($evidenceMatrixRows.Count -gt 0) {
+        $emFamilies = @($evidenceMatrixRows | ForEach-Object { $_.TscFamily } | Where-Object { $_ } | Sort-Object -Unique)
+        $emFresh = @($evidenceMatrixRows | ForEach-Object { $_.Freshness } | Sort-Object -Unique)
+        $emRedaction = @($evidenceMatrixRows | ForEach-Object { $_.RedactionStatus } | Sort-Object -Unique)
+
+        [void]$sb.AppendLine('<section class="report" id="evidence-matrix">')
+        [void]$sb.AppendLine('<h2>Evidence Matrix</h2>')
+        [void]$sb.AppendLine('<p style="color:#555;font-size:0.9em;margin:8px 0 16px;">Every evidence artifact in the bundle, pivoted to its control. <strong>Freshness</strong> is artifact age at render time: Fresh&nbsp;&lt;&nbsp;30d, Aging&nbsp;30&ndash;90d, Stale&nbsp;&ge;&nbsp;90d. Each artifact is hash-verifiable via the manifest.</p>')
+
+        # Filter controls (plain selects + tiny scoped JS).
+        [void]$sb.AppendLine('<div class="em-filters">')
+        $famOpts = ($emFamilies | ForEach-Object { "<option value='$([System.Web.HttpUtility]::HtmlEncode($_))'>$([System.Web.HttpUtility]::HtmlEncode($_))</option>" }) -join ''
+        $freshOpts = ($emFresh | ForEach-Object { "<option value='$([System.Web.HttpUtility]::HtmlEncode($_))'>$([System.Web.HttpUtility]::HtmlEncode($_))</option>" }) -join ''
+        $redOpts = ($emRedaction | ForEach-Object { "<option value='$([System.Web.HttpUtility]::HtmlEncode($_))'>$([System.Web.HttpUtility]::HtmlEncode($_))</option>" }) -join ''
+        [void]$sb.AppendLine("<label>Family <select data-em-filter='fam'><option value=''>All</option>$famOpts</select></label>")
+        [void]$sb.AppendLine("<label>Freshness <select data-em-filter='fresh'><option value=''>All</option>$freshOpts</select></label>")
+        [void]$sb.AppendLine("<label>Redaction <select data-em-filter='red'><option value=''>All</option>$redOpts</select></label>")
+        [void]$sb.AppendLine('</div>')
+
+        [void]$sb.AppendLine('<table class="evidence-matrix" id="evidence-matrix-table">')
+        [void]$sb.AppendLine('<thead><tr><th>Control</th><th>Family</th><th>Evidence Artifact</th><th>Source</th><th>Collected</th><th>Freshness</th><th>Redaction</th><th>SHA-256</th></tr></thead>')
+        [void]$sb.AppendLine('<tbody>')
+        foreach ($em in $evidenceMatrixRows) {
+            $fresh = [string]$em.Freshness
+            $freshCss = "fresh-$($fresh.ToLowerInvariant())"
+            $cId = [System.Web.HttpUtility]::HtmlEncode([string]$em.ControlId)
+            $fam = [System.Web.HttpUtility]::HtmlEncode([string]$em.TscFamily)
+            $art = [System.Web.HttpUtility]::HtmlEncode([string]$em.EvidenceArtifact)
+            $src = [System.Web.HttpUtility]::HtmlEncode([string]$em.Source)
+            $col = [System.Web.HttpUtility]::HtmlEncode([string]$em.CollectionTime)
+            $red = [System.Web.HttpUtility]::HtmlEncode([string]$em.RedactionStatus)
+            $hsh = [System.Web.HttpUtility]::HtmlEncode([string]$em.Hash)
+            $anchor = [System.Web.HttpUtility]::HtmlEncode([string]$em.AnchorId)
+            $famAttr = [System.Web.HttpUtility]::HtmlEncode([string]$em.TscFamily)
+            $freshAttr = [System.Web.HttpUtility]::HtmlEncode($fresh)
+            $redAttr = [System.Web.HttpUtility]::HtmlEncode([string]$em.RedactionStatus)
+            [void]$sb.AppendLine("<tr id='$anchor' class='$freshCss' data-em-fam='$famAttr' data-em-fresh='$freshAttr' data-em-red='$redAttr'><td><a href='#family-$fam'>$cId</a></td><td>$fam</td><td>$art</td><td>$src</td><td>$col</td><td><span class='fresh-badge $freshCss'>$([System.Web.HttpUtility]::HtmlEncode($fresh))</span></td><td>$red</td><td class='evidence-hash'>$hsh</td></tr>")
+        }
+        [void]$sb.AppendLine('</tbody></table>')
+        [void]$sb.AppendLine(@'
+<script>
+(function () {
+  var sect = document.getElementById('evidence-matrix');
+  if (!sect) { return; }
+  var selects = sect.querySelectorAll('select[data-em-filter]');
+  var rows = sect.querySelectorAll('#evidence-matrix-table tbody tr');
+  function apply() {
+    var fam = '', fresh = '', red = '';
+    selects.forEach(function (s) {
+      var k = s.getAttribute('data-em-filter');
+      if (k === 'fam') { fam = s.value; }
+      else if (k === 'fresh') { fresh = s.value; }
+      else if (k === 'red') { red = s.value; }
+    });
+    rows.forEach(function (r) {
+      var ok = (!fam || r.getAttribute('data-em-fam') === fam) &&
+               (!fresh || r.getAttribute('data-em-fresh') === fresh) &&
+               (!red || r.getAttribute('data-em-red') === red);
+      r.style.display = ok ? '' : 'none';
+    });
+  }
+  selects.forEach(function (s) { s.addEventListener('change', apply); });
+})();
+</script>
+'@)
+        [void]$sb.AppendLine('</section>')
+    }
+
     # Control register grouped by family (anchor IDs wired for quick-nav links)
     foreach ($family in @('CC', 'A', 'C', 'PI', 'P')) {
         $controlsInFamily = @($catalog | Where-Object { $_.Family -eq $family })
@@ -1572,6 +1862,7 @@ function New-SOC2AuditWorkbook {
     $catalog = $AssessmentResult.Catalog
     $summary = $AssessmentResult.Summary
     $evidence = $AssessmentResult.Evidence
+    $identityMapPath = if ($AssessmentResult.PSObject.Properties['IdentityMapPath']) { [string]$AssessmentResult.IdentityMapPath } else { '' }
 
     # Row sets built once via private helpers; consumed by both Excel and CSV branches.
     $coverRows = @(
@@ -1595,6 +1886,9 @@ function New-SOC2AuditWorkbook {
     # PR 2 §9.2 — prioritised remediation view over the register.
     $remediationRows = Get-SOC2RemediationPlan -Register $conclusionRows
     $remediationRows = @($remediationRows)
+    # PR 3 §10.2 — per-control evidence pivot from the bundle manifest.
+    $evidenceMatrixRows = Get-SOC2EvidenceMatrix -EvidenceBundle $evidence -ControlCatalog $catalog -IdentityMapPath $identityMapPath
+    $evidenceMatrixRows = @($evidenceMatrixRows)
     $familyPreds = Get-SOC2FamilyPredicates
     $licensingRows = Get-SOC2LicensingGapRows -Summary $summary
     $manualRows = Get-SOC2ManualAttestationRows -Catalog $catalog
@@ -1634,6 +1928,18 @@ function New-SOC2AuditWorkbook {
                 New-ConditionalText -Text '5' -ConditionalTextColor Black -BackgroundColor '#e8eaee'
             )
             $remediationRows | Export-Excel -Path $OutputPath -WorksheetName 'Remediation Plan' -AutoSize -TableName 'tblRemediation' -FreezeTopRow -ConditionalText $prioConditional
+        }
+        if ($evidenceMatrixRows -and $evidenceMatrixRows.Count -gt 0) {
+            # Freshness is field 8 (ControlId, TscFamily, EvidenceArtifact,
+            # Source, CollectionTime, Hash, RedactionStatus, Freshness,
+            # AnchorId). Colour it Fresh→Stale to mirror the HTML badges.
+            $freshConditional = @(
+                New-ConditionalText -Text 'Fresh' -ConditionalTextColor Black -BackgroundColor '#dff6dd'
+                New-ConditionalText -Text 'Aging' -ConditionalTextColor Black -BackgroundColor '#fff4ce'
+                New-ConditionalText -Text 'Stale' -ConditionalTextColor White -BackgroundColor '#c8102e'
+                New-ConditionalText -Text 'Unknown' -ConditionalTextColor Black -BackgroundColor '#e8eaee'
+            )
+            $evidenceMatrixRows | Export-Excel -Path $OutputPath -WorksheetName 'Evidence Matrix' -AutoSize -TableName 'tblEvidenceMatrix' -FreezeTopRow -ConditionalText $freshConditional
         }
         if ($summaryRows) { $summaryRows | Export-Excel -Path $OutputPath -WorksheetName 'Summary by Category' -AutoSize -TableName 'tblSummary' }
         if ($registerRows) { $registerRows | Export-Excel -Path $OutputPath -WorksheetName 'Control Register' -AutoSize -TableName 'tblRegister' }
@@ -1679,6 +1985,10 @@ function New-SOC2AuditWorkbook {
     # still ahead of the legacy 02/03 files which keep their numbers.
     if ($remediationRows -and $remediationRows.Count -gt 0) {
         $remediationRows | Export-Csv -Path (Join-Path $csvDir '01b-Remediation-Plan.csv') -NoTypeInformation -Encoding UTF8
+    }
+    # PR 3 — Evidence Matrix at 01c; legacy 02/03 numbers stay stable.
+    if ($evidenceMatrixRows -and $evidenceMatrixRows.Count -gt 0) {
+        $evidenceMatrixRows | Export-Csv -Path (Join-Path $csvDir '01c-Evidence-Matrix.csv') -NoTypeInformation -Encoding UTF8
     }
     if ($summaryRows) {
         $summaryRows | Export-Csv -Path (Join-Path $csvDir '02-Summary-by-Category.csv') -NoTypeInformation -Encoding UTF8
@@ -1726,5 +2036,9 @@ Export-ModuleMember -Function @(
     'Get-SOC2ExecutiveDigest',
     # SOC 2 Audit-Readiness Plan PR 2 — prioritised remediation view over
     # the register. Exported for the report renderers and Pester tests.
-    'Get-SOC2RemediationPlan'
+    'Get-SOC2RemediationPlan',
+    # SOC 2 Audit-Readiness Plan PR 3 — per-control evidence pivot +
+    # freshness bucketing. Exported for renderers and Pester tests.
+    'Get-SOC2EvidenceMatrix',
+    'Get-SOC2EvidenceFreshness'
 )
