@@ -54,3 +54,7 @@ Comprehensive-Assessment-*.html
 # Local analyst state for the v2 finding schema (per-tenant business
 # context, exceptions, owner assignments). The example is tracked.
 config/finding-state.local.json
+
+# Local SOC 2 manual-attestation state (per-control lifecycle, owners,
+# reviewer notes). Audit-Readiness Plan 11.1. Gitignored like the above.
+config/soc2-attestation-state.local.json

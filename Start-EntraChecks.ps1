@@ -1412,9 +1412,10 @@ function Invoke-SOC2ReadinessFromMenu {
     # Load SOC 2 modules (catalog, reporting, branding)
     $soc2Module = Join-Path $script:ModulesPath "EntraChecks-SOC2.psm1"
     $soc2ReportModule = Join-Path $script:ModulesPath "EntraChecks-SOC2Reporting.psm1"
+    $soc2AttestModule = Join-Path $script:ModulesPath "EntraChecks-SOC2Attestation.psm1"
     $brandingModule = Join-Path $script:ModulesPath "EntraChecks-Branding.psm1"
     $mappingModule = Join-Path $script:ModulesPath "EntraChecks-ComplianceMapping.psm1"
-    foreach ($m in @($brandingModule, $mappingModule, $soc2Module, $soc2ReportModule)) {
+    foreach ($m in @($brandingModule, $mappingModule, $soc2Module, $soc2AttestModule, $soc2ReportModule)) {
         if (Test-Path $m) {
             Import-Module $m -Force -ErrorAction Stop
         } else {
@@ -1474,9 +1475,11 @@ function Invoke-SOC2ReadinessFromMenu {
     $svcHealthThreshold = 98
     $diagCategories = @('AuditLogs', 'SignInLogs')
     $diagWorkspaceId = ''
+    $attestationStatePath = ''
 
     if ($soc2Cfg) {
         if ($soc2Cfg.Categories) { $categories = @($soc2Cfg.Categories) }
+        if ($null -ne $soc2Cfg.AttestationStatePath) { $attestationStatePath = [string]$soc2Cfg.AttestationStatePath }
         if ($null -ne $soc2Cfg.Redaction) {
             if ($null -ne $soc2Cfg.Redaction.RedactUserPII) { $redactUsers = [bool]$soc2Cfg.Redaction.RedactUserPII }
             if ($null -ne $soc2Cfg.Redaction.RedactDeviceNames) { $redactDevices = [bool]$soc2Cfg.Redaction.RedactDeviceNames }
@@ -1558,6 +1561,14 @@ function Invoke-SOC2ReadinessFromMenu {
     $assessmentParams['ServiceHealthThreshold'] = $svcHealthThreshold
     $assessmentParams['DiagnosticSettingsRequiredCategories'] = $diagCategories
     $assessmentParams['DiagnosticSettingsRequiredWorkspaceId'] = $diagWorkspaceId
+    # §11.1 Manual Attestation Workflow — resolve the local state path
+    # relative to the script root when it's a relative config value.
+    if ($attestationStatePath) {
+        if (-not [System.IO.Path]::IsPathRooted($attestationStatePath)) {
+            $attestationStatePath = Join-Path $PSScriptRoot $attestationStatePath
+        }
+        $assessmentParams['AttestationStatePath'] = $attestationStatePath
+    }
 
     $result = Invoke-SOC2Assessment @assessmentParams
 

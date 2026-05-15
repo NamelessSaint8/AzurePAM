@@ -846,26 +846,79 @@ function Get-SOC2LicensingGapRows {
 
 <#
 .SYNOPSIS
-    Builds manual-attestation register rows.
+    Builds manual-attestation register rows, populated from the tracked
+    attestation state when supplied (Audit-Readiness Plan §11.1).
+
+.DESCRIPTION
+    Pre-§11.1 this returned all-empty placeholder cells. It now reflects
+    the per-control lifecycle (State + owner + dates + reviewer + notes)
+    from the attestation state, defaulting to 'NotStarted' for controls
+    with no recorded attestation.
+
+.PARAMETER Catalog
+    Output of Get-SOC2TSCCatalog.
+
+.PARAMETER AttestationState
+    Hashtable from Import-SOC2AttestationState
+    (@{ Attestations = @{ <ControlId> = <record> } }). Optional — when
+    absent every manual control renders the NotStarted default.
 #>
 function Get-SOC2ManualAttestationRows {
     [CmdletBinding()]
     [OutputType([object[]])]
-    param([Parameter(Mandatory)][object[]]$Catalog)
+    param(
+        [Parameter(Mandatory)][object[]]$Catalog,
+        [hashtable]$AttestationState
+    )
+
+    $bucket = @{}
+    if ($AttestationState -and $AttestationState.ContainsKey('Attestations') -and $AttestationState['Attestations']) {
+        $bucket = $AttestationState['Attestations']
+    }
+
+    $field = {
+        param($Record, [string]$Name)
+        if (-not $Record) { return '' }
+        if ($Record -is [hashtable]) {
+            if ($Record.ContainsKey($Name)) { return [string]$Record[$Name] }
+            return ''
+        }
+        if ($Record.PSObject -and $Record.PSObject.Properties[$Name]) { return [string]$Record.$Name }
+        return ''
+    }
 
     $rows = [System.Collections.Generic.List[object]]::new()
     foreach ($control in $Catalog) {
         if ($control.Automation -ne 'Manual') { continue }
+
+        $controlId = [string]$control.Id
+        $record = $null
+        if ($bucket -is [hashtable] -and $bucket.ContainsKey($controlId)) {
+            $record = $bucket[$controlId]
+        }
+        elseif ($bucket.PSObject -and $bucket.PSObject.Properties[$controlId]) {
+            $record = $bucket.$controlId
+        }
+
+        $state = & $field $record 'State'
+        if (-not $state) { $state = 'NotStarted' }
+        $owner = & $field $record 'ControlOwner'
+        if (-not $owner -and $control.PSObject.Properties['ControlOwnerHint']) {
+            $owner = [string]$control.ControlOwnerHint
+        }
+
         $row = [pscustomobject]@{
-            ControlId = $control.Id
+            ControlId = $controlId
             Family = $control.Family
+            State = $state
+            ControlOwner = $owner
+            RequestedDate = (& $field $record 'RequestedDate')
+            ReceivedDate = (& $field $record 'ReceivedDate')
+            EvidenceLocation = (& $field $record 'EvidenceLocation')
+            Reviewer = (& $field $record 'Reviewer')
+            NextReviewDate = (& $field $record 'NextReviewDate')
+            Notes = (& $field $record 'Notes')
             Description = $control.Description
-            ControlOwner = ''
-            DescriptionOfOperation = ''
-            Frequency = ''
-            EvidenceLocation = ''
-            AttestedBy = ''
-            AttestedDate = ''
         }
         $rows.Add($row) | Out-Null
     }
@@ -1153,6 +1206,12 @@ function New-SOC2AuditReport {
     $catalog = $AssessmentResult.Catalog
     $summary = $AssessmentResult.Summary
     $evidence = $AssessmentResult.Evidence
+    # §11.1 — per-control manual attestation state (may be absent on older
+    # assessment results; Get-SOC2ManualAttestationRows tolerates $null).
+    $attestationState = $null
+    if ($AssessmentResult.PSObject.Properties['AttestationState']) {
+        $attestationState = $AssessmentResult.AttestationState
+    }
 
     # Ensure System.Web is loaded before HtmlEncode is called below.
     # In production (.NET Framework PowerShell 5.1) this is a no-op when the
@@ -1303,6 +1362,19 @@ table.evidence-matrix a { color: inherit; }
 .fresh-badge.fresh-aging { background: #fff4ce; color: #7b5e00; }
 .fresh-badge.fresh-stale { background: #fde7e9; color: #8b1a23; }
 .fresh-badge.fresh-unknown { background: #e8eaee; color: #555; }
+/* §11.1 — Manual Attestation Register */
+table.manual-attestation { width: 100%; border-collapse: collapse; font-size: 0.85em; }
+table.manual-attestation th { background: #f0f3f6; text-align: left; padding: 8px 10px; border-bottom: 2px solid #d0d5dc; }
+table.manual-attestation td { padding: 7px 10px; border-bottom: 1px solid #e5e8ec; vertical-align: top; }
+table.manual-attestation tr:hover td { background: #fafbfc; }
+table.manual-attestation a { color: inherit; }
+.att-badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 0.8em; font-weight: 600; }
+.att-badge.att-notstarted { background: #e8eaee; color: #555; }
+.att-badge.att-requested { background: #deecf9; color: #1d4d7f; }
+.att-badge.att-received { background: #e3f0fb; color: #16527e; }
+.att-badge.att-reviewed { background: #fff4ce; color: #7b5e00; }
+.att-badge.att-accepted { background: #dff6dd; color: #1f6f3a; }
+.att-badge.att-rejected { background: #fde7e9; color: #8b1a23; }
 /* Print stylesheet */
 @media print {
     body { background: white; }
@@ -1633,6 +1705,38 @@ table.evidence-matrix a { color: inherit; }
         [void]$sb.AppendLine('</section>')
     }
 
+    # §11.1 Manual Attestation Register — tracked lifecycle for manual
+    # controls (NotStarted → Requested → Received → Reviewed →
+    # Accepted/Rejected). Rendered after the Evidence Matrix, before the
+    # legacy per-family TSC sections. Omitted when the catalog has no
+    # manual controls in scope.
+    $manualAttRows = Get-SOC2ManualAttestationRows -Catalog $catalog -AttestationState $attestationState
+    $manualAttRows = @($manualAttRows)
+    if ($manualAttRows.Count -gt 0) {
+        [void]$sb.AppendLine('<section class="report" id="manual-attestation-register">')
+        [void]$sb.AppendLine('<h2>Manual Attestation Register</h2>')
+        [void]$sb.AppendLine('<p style="color:#555;font-size:0.9em;margin:8px 0 16px;">Controls that cannot be observed via Graph/Azure. Each is tracked through <strong>NotStarted &rarr; Requested &rarr; Received &rarr; Reviewed &rarr; Accepted</strong> (or Rejected). Non-accepted controls also surface in the analyst cockpit&rsquo;s Review Queue. State is held in a local, gitignored file (config <code>SOC2.AttestationStatePath</code>).</p>')
+        [void]$sb.AppendLine('<table class="manual-attestation">')
+        [void]$sb.AppendLine('<thead><tr><th>Control</th><th>Family</th><th>State</th><th>Owner</th><th>Requested</th><th>Received</th><th>Evidence Location</th><th>Reviewer</th><th>Next Review</th><th>Notes</th></tr></thead>')
+        [void]$sb.AppendLine('<tbody>')
+        foreach ($ma in $manualAttRows) {
+            $st = [string]$ma.State
+            $stCss = "att-$($st.ToLowerInvariant())"
+            $cId = [System.Web.HttpUtility]::HtmlEncode([string]$ma.ControlId)
+            $fam = [System.Web.HttpUtility]::HtmlEncode([string]$ma.Family)
+            $own = [System.Web.HttpUtility]::HtmlEncode([string]$ma.ControlOwner)
+            $req = [System.Web.HttpUtility]::HtmlEncode([string]$ma.RequestedDate)
+            $rcv = [System.Web.HttpUtility]::HtmlEncode([string]$ma.ReceivedDate)
+            $evl = [System.Web.HttpUtility]::HtmlEncode([string]$ma.EvidenceLocation)
+            $rev = [System.Web.HttpUtility]::HtmlEncode([string]$ma.Reviewer)
+            $nxt = [System.Web.HttpUtility]::HtmlEncode([string]$ma.NextReviewDate)
+            $nts = [System.Web.HttpUtility]::HtmlEncode([string]$ma.Notes)
+            [void]$sb.AppendLine("<tr class='$stCss'><td><a href='#family-$fam'>$cId</a></td><td>$fam</td><td><span class='att-badge $stCss'>$([System.Web.HttpUtility]::HtmlEncode($st))</span></td><td>$own</td><td>$req</td><td>$rcv</td><td>$evl</td><td>$rev</td><td>$nxt</td><td>$nts</td></tr>")
+        }
+        [void]$sb.AppendLine('</tbody></table>')
+        [void]$sb.AppendLine('</section>')
+    }
+
     # Control register grouped by family (anchor IDs wired for quick-nav links)
     foreach ($family in @('CC', 'A', 'C', 'PI', 'P')) {
         $controlsInFamily = @($catalog | Where-Object { $_.Family -eq $family })
@@ -1869,6 +1973,7 @@ function New-SOC2AuditWorkbook {
     $summary = $AssessmentResult.Summary
     $evidence = $AssessmentResult.Evidence
     $identityMapPath = if ($AssessmentResult.PSObject.Properties['IdentityMapPath']) { [string]$AssessmentResult.IdentityMapPath } else { '' }
+    $attestationState = if ($AssessmentResult.PSObject.Properties['AttestationState']) { $AssessmentResult.AttestationState } else { $null }
 
     # Row sets built once via private helpers; consumed by both Excel and CSV branches.
     $coverRows = @(
@@ -1897,7 +2002,8 @@ function New-SOC2AuditWorkbook {
     $evidenceMatrixRows = @($evidenceMatrixRows)
     $familyPreds = Get-SOC2FamilyPredicates
     $licensingRows = Get-SOC2LicensingGapRows -Summary $summary
-    $manualRows = Get-SOC2ManualAttestationRows -Catalog $catalog
+    # §11.1 — manual-attestation rows now reflect tracked lifecycle state.
+    $manualRows = Get-SOC2ManualAttestationRows -Catalog $catalog -AttestationState $attestationState
     $evidenceRows = Get-SOC2EvidenceRegisterRows -Evidence $evidence
 
     $useExcel = $null -ne (Get-Module -ListAvailable -Name ImportExcel)
@@ -2046,5 +2152,8 @@ Export-ModuleMember -Function @(
     # SOC 2 Audit-Readiness Plan PR 3 — per-control evidence pivot +
     # freshness bucketing. Exported for renderers and Pester tests.
     'Get-SOC2EvidenceMatrix',
-    'Get-SOC2EvidenceFreshness'
+    'Get-SOC2EvidenceFreshness',
+    # §11.1 Manual Attestation Workflow — register rows now reflect
+    # tracked state; exported for the Pester suite.
+    'Get-SOC2ManualAttestationRows'
 )

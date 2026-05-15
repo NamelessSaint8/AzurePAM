@@ -2570,7 +2570,12 @@ function Invoke-SOC2Assessment {
 
         [string[]]$DiagnosticSettingsRequiredCategories = @('AuditLogs', 'SignInLogs'),
 
-        [string]$DiagnosticSettingsRequiredWorkspaceId = ''
+        [string]$DiagnosticSettingsRequiredWorkspaceId = '',
+
+        # Audit-Readiness Plan §11.1 — Manual Attestation Workflow. Path to
+        # the per-control attestation state file. Empty disables the
+        # workflow (manual controls render NotStarted).
+        [string]$AttestationStatePath = ''
     )
 
     if (-not (Test-Path -LiteralPath $OutputDirectory)) {
@@ -2703,6 +2708,22 @@ function Invoke-SOC2Assessment {
         $allFindings = $normalized
     }
 
+    # Step 5c: Manual Attestation Workflow (Audit-Readiness Plan §11.1).
+    # Load the per-control attestation state and map it onto each manual
+    # stub's v2 ReviewStatus so non-accepted manual controls surface in
+    # the cockpit Review Queue and the SOC 2 report shows tracked state.
+    # Advisory: a missing/disabled path just leaves everything NotStarted.
+    $attestationState = @{ Attestations = @{} }
+    if ((Get-Command Import-SOC2AttestationState -ErrorAction SilentlyContinue) -and
+        (Get-Command Add-SOC2AttestationToFindings -ErrorAction SilentlyContinue)) {
+        $attestationState = Import-SOC2AttestationState -Path $AttestationStatePath
+        # Direct-assign (NOT @(...)): Add-SOC2AttestationToFindings returns a
+        # comma-wrapped array (module convention); @() around the call
+        # double-wraps it into a single element. It also mutates in place,
+        # so this is belt-and-braces.
+        $allFindings = Add-SOC2AttestationToFindings -Findings $allFindings -State $attestationState
+    }
+
     # Step 6: Redact if requested
     $identityMap = @{}
     $redactionResult = $null
@@ -2757,6 +2778,9 @@ function Invoke-SOC2Assessment {
         Summary = $summary
         IdentityMapPath = $resolutionMapPath
         OutputDirectory = $OutputDirectory
+        # §11.1 — per-control attestation state (loaded above) so the SOC 2
+        # report renderer can show tracked owner/dates/reviewer per control.
+        AttestationState = $attestationState
     }
 }
 

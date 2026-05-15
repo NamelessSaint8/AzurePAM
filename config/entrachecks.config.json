@@ -111,6 +111,8 @@
     "Type": "Type1",
     "Categories": ["CC", "A", "C", "PI", "P"],
     "IncludeManualAttestation": true,
+    "_attestationComment": "Manual Attestation Workflow (Audit-Readiness Plan 11.1). Local JSON file tracking per-control attestation lifecycle (NotStarted->Requested->Received->Reviewed->Accepted|Rejected), keyed by ControlId. Gitignored. Empty string disables the workflow (manual controls render NotStarted).",
+    "AttestationStatePath": ".\\config\\soc2-attestation-state.local.json",
     "TypeTwoPeriod": {
       "StartDate": "",
       "EndDate": "",
