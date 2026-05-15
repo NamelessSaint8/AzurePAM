@@ -267,7 +267,10 @@ function Get-SOC2ControlConclusion {
     Array of PSCustomObject rows with:
       ControlId, TscFamily, FamilyName, Automation, ControlDescription,
       Conclusion, DeficiencySeverity, FindingCount, EvidenceCount, Owner,
-      DueDate, ExceptionStatus, ManagementResponse, ControlOwnerHint.
+      DueDate, ExceptionStatus, ManagementResponse, ControlOwnerHint,
+      Reason, Remediation, ValidationSteps, EvidenceNeeded.
+    The last three are PR 2 source columns consumed by
+    Get-SOC2RemediationPlan.
 #>
 function Get-SOC2ControlConclusionRegister {
     [CmdletBinding()]
@@ -320,6 +323,8 @@ function Get-SOC2ControlConclusionRegister {
         $dueDate = ''
         $exceptionStatus = 'None'
         $managementResponse = ''
+        $remediation = ''
+        $validationSteps = ''
 
         $bf = $conclusion.BlockingFinding
         if ($bf) {
@@ -336,10 +341,43 @@ function Get-SOC2ControlConclusionRegister {
             if ($bf.PSObject.Properties['ManagementResponse'] -and $bf.ManagementResponse) {
                 $managementResponse = [string]$bf.ManagementResponse
             }
+            if ($bf.PSObject.Properties['Remediation'] -and $bf.Remediation) {
+                $remediation = [string]$bf.Remediation
+            }
+            # ValidationSteps: v2 RemediationGuidance carries a Verification
+            # array (how to confirm the fix landed). PR 2 §9.1 surfaces it in
+            # the Remediation Plan. Tolerate hashtable or pscustomobject.
+            if ($bf.PSObject.Properties['RemediationGuidance'] -and $bf.RemediationGuidance) {
+                $rg = $bf.RemediationGuidance
+                $verification = if ($rg -is [hashtable] -and $rg.ContainsKey('Verification')) {
+                    $rg['Verification']
+                } elseif ($rg.PSObject -and $rg.PSObject.Properties['Verification']) {
+                    $rg.Verification
+                } else { $null }
+                if ($verification) {
+                    $validationSteps = (@($verification) | Where-Object { $_ }) -join ' | '
+                }
+            }
         }
         if (-not $owner -and $control.PSObject.Properties['ControlOwnerHint']) {
             # Fall back to the catalog's owner hint so the column is never empty.
             $owner = [string]$control.ControlOwnerHint
+        }
+        if (-not $validationSteps) {
+            $validationSteps = 'Re-run Invoke-SOC2Assessment after remediation and confirm this control no longer reports a gap.'
+        }
+
+        # EvidenceNeeded: derived from the conclusion + control automation
+        # type. Licensing gaps need a SKU/assignment proof; manual controls
+        # need a signed attestation; automated controls need a fresh passing
+        # run plus a config screenshot.
+        $automation = if ($control.PSObject.Properties['Automation']) { [string]$control.Automation } else { '' }
+        $evidenceNeeded = if ($conclusion.Conclusion -eq 'Not Assessed - Licensing') {
+            'License / SKU assignment proof (invoice or admin-center screenshot showing the required plan is assigned).'
+        } elseif ($automation -eq 'Manual') {
+            "Signed management attestation in evidence-bundle/manual-attestation/$controlId.md (owner, operation, frequency, attested-by/date)."
+        } else {
+            'Re-run the SOC 2 assessment after remediation; capture the passing check output plus a configuration screenshot.'
         }
 
         $row = [pscustomobject]@{
@@ -358,11 +396,108 @@ function Get-SOC2ControlConclusionRegister {
             ManagementResponse = $managementResponse
             ControlOwnerHint = if ($control.PSObject.Properties['ControlOwnerHint']) { [string]$control.ControlOwnerHint } else { '' }
             Reason = $conclusion.Reason
+            # PR 2 §9.1 — remediation-plan source columns. Additive; the
+            # Control Conclusion Register HTML table does not render these
+            # (it picks columns explicitly), but the Excel/CSV gain them
+            # and Get-SOC2RemediationPlan projects them into its view.
+            Remediation = $remediation
+            ValidationSteps = $validationSteps
+            EvidenceNeeded = $evidenceNeeded
         }
         $rows.Add($row) | Out-Null
     }
 
     return , $rows.ToArray()
+}
+
+<#
+.SYNOPSIS
+    Builds the Remediation Plan: the actionable subset of the Control
+    Conclusion Register, prioritised and sorted for an owner to work
+    top-down. SOC 2 Audit-Readiness Plan PR 2 §9.
+
+.DESCRIPTION
+    A pure view over the register produced by
+    Get-SOC2ControlConclusionRegister — no finding walking, no new
+    collection. Steps:
+
+      1. Exclude rows whose Conclusion is Effective, Accepted Risk, or
+         Informational (nothing to remediate).
+      2. Derive Priority (1 = most urgent):
+           1  Deficiency, severity Critical or High
+           2  Deficiency (Medium/Low) or Deficiency - Minor
+           3  Manual Pending
+           4  Not Assessed - Licensing
+           5  Not Assessed - No Evidence
+         (Plan §9.1 wrote "5 = Warning"; PR 1 folded WARNING into
+         Deficiency - Minor, so tier 5 is now the residual no-evidence
+         gap — the closest analog. Decision recorded in the plan.)
+      3. Sort Priority asc, then DueDate asc (blank dates last so dated
+         work floats up), then ControlId asc — stable and deterministic.
+      4. Project the auditor-facing columns.
+
+.PARAMETER Register
+    Output of Get-SOC2ControlConclusionRegister.
+
+.OUTPUTS
+    Array of PSCustomObject rows:
+      Priority, ControlId, TscFamily, Gap, Owner, DueDate,
+      Remediation, ValidationSteps, EvidenceNeeded.
+#>
+function Get-SOC2RemediationPlan {
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Register
+    )
+
+    $excluded = @('Effective', 'Accepted Risk', 'Informational')
+
+    $scored = New-Object System.Collections.Generic.List[object]
+    foreach ($r in $Register) {
+        if ($null -eq $r) { continue }
+        $conclusion = [string]$r.Conclusion
+        if ($conclusion -in $excluded) { continue }
+
+        $severity = if ($r.PSObject.Properties['DeficiencySeverity']) { [string]$r.DeficiencySeverity } else { '' }
+        $priority = switch ($conclusion) {
+            'Deficiency' { if ($severity -in @('Critical', 'High')) { 1 } else { 2 } }
+            'Deficiency - Minor' { 2 }
+            'Manual Pending' { 3 }
+            'Not Assessed - Licensing' { 4 }
+            'Not Assessed - No Evidence' { 5 }
+            default { 6 }
+        }
+
+        $gap = if ($r.PSObject.Properties['Reason'] -and $r.Reason) {
+            "$conclusion - $([string]$r.Reason)"
+        } else {
+            $conclusion
+        }
+
+        $row = [pscustomobject]@{
+            Priority = $priority
+            ControlId = [string]$r.ControlId
+            TscFamily = if ($r.PSObject.Properties['TscFamily']) { [string]$r.TscFamily } else { '' }
+            Gap = $gap
+            Owner = if ($r.PSObject.Properties['Owner']) { [string]$r.Owner } else { '' }
+            DueDate = if ($r.PSObject.Properties['DueDate']) { [string]$r.DueDate } else { '' }
+            Remediation = if ($r.PSObject.Properties['Remediation']) { [string]$r.Remediation } else { '' }
+            ValidationSteps = if ($r.PSObject.Properties['ValidationSteps']) { [string]$r.ValidationSteps } else { '' }
+            EvidenceNeeded = if ($r.PSObject.Properties['EvidenceNeeded']) { [string]$r.EvidenceNeeded } else { '' }
+        }
+        $scored.Add($row) | Out-Null
+    }
+
+    # Sort key: Priority asc; then DueDate asc with blanks last (a blank
+    # due date sorts AFTER any real date so committed/dated work rises);
+    # then ControlId asc for a stable, deterministic order.
+    $byPriority = @{ Expression = { [int]$_.Priority } }
+    $byDue = @{ Expression = { if ([string]::IsNullOrWhiteSpace($_.DueDate)) { '9999-12-31' } else { [string]$_.DueDate } } }
+    $byControl = @{ Expression = { [string]$_.ControlId } }
+    $sorted = $scored.ToArray() | Sort-Object -Property $byPriority, $byDue, $byControl
+
+    return , @($sorted)
 }
 
 #endregion
@@ -932,6 +1067,23 @@ table.conclusion-register tr.row-no-evidence td { background: #f4f5f7; color: #5
 table.conclusion-register tr.row-info td { color: #1a1a1a; }
 table.conclusion-register tr:hover td { filter: brightness(0.97); }
 table.conclusion-register a { color: inherit; }
+/* PR 2 — Remediation Plan */
+table.remediation-plan { width: 100%; border-collapse: collapse; font-size: 0.88em; }
+table.remediation-plan th { background: #f0f3f6; text-align: left; padding: 8px 10px; border-bottom: 2px solid #d0d5dc; }
+table.remediation-plan td { padding: 8px 10px; border-bottom: 1px solid #e5e8ec; vertical-align: top; }
+table.remediation-plan tr.prio-1 td { background: #fdf2f3; }
+table.remediation-plan tr.prio-2 td { background: #fff6ec; }
+table.remediation-plan tr.prio-3 td { background: #f6f1fb; }
+table.remediation-plan tr.prio-4 td { background: #f5f2fa; }
+table.remediation-plan tr.prio-5 td { background: #f4f5f7; color: #555; }
+table.remediation-plan tr:hover td { filter: brightness(0.97); }
+table.remediation-plan a { color: inherit; }
+.prio-badge { display: inline-block; min-width: 1.4em; text-align: center; padding: 2px 7px; border-radius: 10px; font-weight: 700; font-size: 0.85em; color: #fff; }
+.prio-badge.prio-1 { background: #c8102e; }
+.prio-badge.prio-2 { background: #e8893a; }
+.prio-badge.prio-3 { background: #5c2d91; }
+.prio-badge.prio-4 { background: #6a5fb3; }
+.prio-badge.prio-5 { background: #6c757d; }
 /* Print stylesheet */
 @media print {
     body { background: white; }
@@ -1151,6 +1303,35 @@ table.conclusion-register a { color: inherit; }
             $exceptionStatus = [System.Web.HttpUtility]::HtmlEncode([string]$r.ExceptionStatus)
             $desc = [System.Web.HttpUtility]::HtmlEncode([string]$r.ControlDescription)
             [void]$sb.AppendLine("<tr class='$cssClass'><td><a href='#family-$family'>$controlId</a></td><td>$family</td><td>$conclusion</td><td>$severity</td><td>$($r.FindingCount)</td><td>$($r.EvidenceCount)</td><td>$owner</td><td>$due</td><td>$exceptionStatus</td><td>$desc</td></tr>")
+        }
+        [void]$sb.AppendLine('</tbody></table>')
+        [void]$sb.AppendLine('</section>')
+    }
+
+    # SOC 2 Audit-Readiness Plan PR 2 §9.2 — Remediation Plan. The
+    # actionable subset of the register, prioritised. Renders after the
+    # Control Conclusion Register, before the legacy per-family TSC
+    # sections. Empty (everything Effective/Accepted Risk) → section omitted.
+    $remediationRows = Get-SOC2RemediationPlan -Register $registerRows
+    $remediationRows = @($remediationRows)
+    if ($remediationRows.Count -gt 0) {
+        [void]$sb.AppendLine('<section class="report" id="remediation-plan">')
+        [void]$sb.AppendLine('<h2>Remediation Plan</h2>')
+        [void]$sb.AppendLine('<p style="color:#555;font-size:0.9em;margin:8px 0 16px;">Every control with an open gap, ordered by priority (1&nbsp;=&nbsp;most urgent). Effective and Accepted-Risk controls are excluded. Priority: <strong>1</strong> Critical/High deficiency, <strong>2</strong> minor deficiency, <strong>3</strong> manual attestation pending, <strong>4</strong> not assessed (licensing), <strong>5</strong> not assessed (no evidence).</p>')
+        [void]$sb.AppendLine('<table class="remediation-plan">')
+        [void]$sb.AppendLine('<thead><tr><th>Priority</th><th>Control</th><th>Family</th><th>Gap</th><th>Owner</th><th>Due</th><th>Remediation</th><th>Validation</th><th>Evidence Needed</th></tr></thead>')
+        [void]$sb.AppendLine('<tbody>')
+        foreach ($rp in $remediationRows) {
+            $pCss = "prio-$([int]$rp.Priority)"
+            $cId = [System.Web.HttpUtility]::HtmlEncode([string]$rp.ControlId)
+            $fam = [System.Web.HttpUtility]::HtmlEncode([string]$rp.TscFamily)
+            $gap = [System.Web.HttpUtility]::HtmlEncode([string]$rp.Gap)
+            $own = [System.Web.HttpUtility]::HtmlEncode([string]$rp.Owner)
+            $due = [System.Web.HttpUtility]::HtmlEncode([string]$rp.DueDate)
+            $rem = [System.Web.HttpUtility]::HtmlEncode([string]$rp.Remediation)
+            $val = [System.Web.HttpUtility]::HtmlEncode([string]$rp.ValidationSteps)
+            $evn = [System.Web.HttpUtility]::HtmlEncode([string]$rp.EvidenceNeeded)
+            [void]$sb.AppendLine("<tr class='$pCss'><td><span class='prio-badge $pCss'>$([int]$rp.Priority)</span></td><td><a href='#family-$fam'>$cId</a></td><td>$fam</td><td>$gap</td><td>$own</td><td>$due</td><td>$rem</td><td>$val</td><td>$evn</td></tr>")
         }
         [void]$sb.AppendLine('</tbody></table>')
         [void]$sb.AppendLine('</section>')
@@ -1411,6 +1592,9 @@ function New-SOC2AuditWorkbook {
     # @() — see the HTML render path for why @() around the call double-wraps.
     $conclusionRows = Get-SOC2ControlConclusionRegister -Catalog $catalog -Summary $summary -EvidenceBundle $evidence
     $conclusionRows = @($conclusionRows)
+    # PR 2 §9.2 — prioritised remediation view over the register.
+    $remediationRows = Get-SOC2RemediationPlan -Register $conclusionRows
+    $remediationRows = @($remediationRows)
     $familyPreds = Get-SOC2FamilyPredicates
     $licensingRows = Get-SOC2LicensingGapRows -Summary $summary
     $manualRows = Get-SOC2ManualAttestationRows -Catalog $catalog
@@ -1437,6 +1621,19 @@ function New-SOC2AuditWorkbook {
                 New-ConditionalText -Text 'Not Assessed - No Evidence' -ConditionalTextColor Black -BackgroundColor '#e8eaee'
             )
             $conclusionRows | Export-Excel -Path $OutputPath -WorksheetName 'Control Conclusions' -AutoSize -TableName 'tblConclusions' -FreezeTopRow -ConditionalText $conditional
+        }
+        if ($remediationRows -and $remediationRows.Count -gt 0) {
+            # Priority column is field 1 (Priority, ControlId, TscFamily,
+            # Gap, ...). Red→grey gradient by priority tier mirrors the
+            # HTML badge colours.
+            $prioConditional = @(
+                New-ConditionalText -Text '1' -ConditionalTextColor White -BackgroundColor '#c8102e'
+                New-ConditionalText -Text '2' -ConditionalTextColor Black -BackgroundColor '#e8893a'
+                New-ConditionalText -Text '3' -ConditionalTextColor White -BackgroundColor '#5c2d91'
+                New-ConditionalText -Text '4' -ConditionalTextColor White -BackgroundColor '#6a5fb3'
+                New-ConditionalText -Text '5' -ConditionalTextColor Black -BackgroundColor '#e8eaee'
+            )
+            $remediationRows | Export-Excel -Path $OutputPath -WorksheetName 'Remediation Plan' -AutoSize -TableName 'tblRemediation' -FreezeTopRow -ConditionalText $prioConditional
         }
         if ($summaryRows) { $summaryRows | Export-Excel -Path $OutputPath -WorksheetName 'Summary by Category' -AutoSize -TableName 'tblSummary' }
         if ($registerRows) { $registerRows | Export-Excel -Path $OutputPath -WorksheetName 'Control Register' -AutoSize -TableName 'tblRegister' }
@@ -1477,6 +1674,11 @@ function New-SOC2AuditWorkbook {
     # 01a so it sorts right after the Cover but before the legacy Summary.
     if ($conclusionRows -and $conclusionRows.Count -gt 0) {
         $conclusionRows | Export-Csv -Path (Join-Path $csvDir '01a-Control-Conclusions.csv') -NoTypeInformation -Encoding UTF8
+    }
+    # PR 2 — Remediation Plan at 01b: sorts right after the conclusions,
+    # still ahead of the legacy 02/03 files which keep their numbers.
+    if ($remediationRows -and $remediationRows.Count -gt 0) {
+        $remediationRows | Export-Csv -Path (Join-Path $csvDir '01b-Remediation-Plan.csv') -NoTypeInformation -Encoding UTF8
     }
     if ($summaryRows) {
         $summaryRows | Export-Csv -Path (Join-Path $csvDir '02-Summary-by-Category.csv') -NoTypeInformation -Encoding UTF8
@@ -1521,5 +1723,8 @@ Export-ModuleMember -Function @(
     'Get-SOC2ControlConclusionRegister',
     # Was previously consumed only inside this module via New-SOC2AuditReport;
     # PR 1 needs to test it directly to lock the verdict logic.
-    'Get-SOC2ExecutiveDigest'
+    'Get-SOC2ExecutiveDigest',
+    # SOC 2 Audit-Readiness Plan PR 2 — prioritised remediation view over
+    # the register. Exported for the report renderers and Pester tests.
+    'Get-SOC2RemediationPlan'
 )
