@@ -846,6 +846,211 @@ function Test-SOC2TypeTwoBundle {
 
 #endregion
 
+#region ==================== PERIOD COVERAGE DASHBOARD (§11.2) ====================
+
+<#
+.SYNOPSIS
+    Buckets an evidence timestamp's age into Fresh / Aging / Stale.
+    tz-kind safe. Local to this module so SOC2TypeTwo stays
+    self-contained (mirrors the SOC2Reporting freshness helper).
+
+.DESCRIPTION
+    Fresh  : age < 30 days
+    Aging  : 30 <= age < 90 days
+    Stale  : age >= 90 days
+    Unknown: timestamp missing or unparseable.
+
+    Half-open boundaries: 29d→Fresh, 30d→Aging, 89d→Aging, 90d→Stale.
+    Future timestamps (clock skew) clamp to Fresh.
+
+.PARAMETER IsoDate
+    ISO-8601 timestamp string.
+
+.PARAMETER AsOf
+    Reference "now" (its wall clock is interpreted as UTC to match the
+    AssumeUniversal parse on the timestamp side).
+#>
+function Get-SOC2TypeTwoFreshnessBucket {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowNull()][AllowEmptyString()][string]$IsoDate,
+        [datetime]$AsOf = ([datetime]::UtcNow)
+    )
+
+    if ([string]::IsNullOrWhiteSpace($IsoDate)) { return 'Unknown' }
+
+    $parsed = [System.DateTimeOffset]::MinValue
+    $ok = [System.DateTimeOffset]::TryParse(
+        $IsoDate,
+        [System.Globalization.CultureInfo]::InvariantCulture,
+        [System.Globalization.DateTimeStyles]::AssumeUniversal,
+        [ref]$parsed)
+    if (-not $ok) { return 'Unknown' }
+
+    $asOfUtc = [datetime]::SpecifyKind($AsOf, [System.DateTimeKind]::Utc)
+    $ageDays = ([System.DateTimeOffset]::new($asOfUtc) - $parsed).TotalDays
+    if ($ageDays -lt 0) { $ageDays = 0 }
+    if ($ageDays -lt 30) { return 'Fresh' }
+    if ($ageDays -lt 90) { return 'Aging' }
+    return 'Stale'
+}
+
+<#
+.SYNOPSIS
+    Computes the Type 2 Period Coverage dashboard model from a
+    Get-SOC2PeriodCoverage result. Pure — no I/O. (Audit-Readiness
+    Plan §11.2.)
+
+.DESCRIPTION
+    Rolls the coverage object into the executive dashboard metrics:
+
+      - Snapshots expected (MinSnapshotsRequired) vs collected
+        (SnapshotCount), with a coverage percentage.
+      - Largest / leading / trailing evidence gap vs the MaxGapDays
+        threshold, and whether all gaps are within it.
+      - Per-state consistency rollup across every analysed control.
+      - Flapping controls: those whose observed worst-status sequence
+        crosses the pass/fail boundary at least once. FlapCount is the
+        number of such crossings. WARNING counts as fail-ish (an
+        intermittent degradation is still an exception to investigate);
+        INFO entries are skipped, not treated as a boundary, so a
+        single noisy INFO snapshot doesn't fabricate a flap.
+      - Freshness distribution by TSC family: each control's most
+        recent observation (LastSeenUtc) bucketed Fresh/Aging/Stale,
+        defaulting to Unknown when never observed (covers manual /
+        unobserved controls).
+
+.PARAMETER Coverage
+    The hashtable returned by Get-SOC2PeriodCoverage.
+
+.PARAMETER AsOf
+    Reference time for freshness. Defaults to the period end (the
+    natural "as of" for a Type 2 report) when parseable, else UtcNow.
+
+.OUTPUTS
+    Hashtable dashboard model (see the render section / tests for the
+    exact shape).
+#>
+function Get-SOC2PeriodCoverageDashboard {
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter(Mandatory)][hashtable]$Coverage,
+        [datetime]$AsOf = ([datetime]::MinValue)
+    )
+
+    # Default AsOf to the period end so freshness is measured at the
+    # close of the observation window, not whenever the report runs.
+    if ($AsOf -eq [datetime]::MinValue) {
+        $endStr = ''
+        if ($Coverage.ContainsKey('Period') -and $Coverage['Period'] -and $Coverage['Period'].ContainsKey('EndUtc')) {
+            $endStr = [string]$Coverage['Period']['EndUtc']
+        }
+        $parsedEnd = [System.DateTimeOffset]::MinValue
+        if ($endStr -and [System.DateTimeOffset]::TryParse($endStr, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$parsedEnd)) {
+            $AsOf = $parsedEnd.UtcDateTime
+        } else {
+            $AsOf = [datetime]::UtcNow
+        }
+    }
+
+    $expected = [int]$Coverage['MinSnapshotsRequired']
+    $collected = [int]$Coverage['SnapshotCount']
+    $coveragePct = if ($expected -le 0) {
+        if ($collected -gt 0) { 100 } else { 0 }
+    } else {
+        [math]::Round([math]::Min(100.0, ($collected / [double]$expected) * 100.0), 1)
+    }
+
+    $largest = [double]$Coverage['LargestGapDays']
+    $leading = [double]$Coverage['LeadingGapDays']
+    $trailing = [double]$Coverage['TrailingGapDays']
+    $maxGap = [double]$Coverage['MaxGapDays']
+    $gapWithin = ($largest -le $maxGap -and $leading -le $maxGap -and $trailing -le $maxGap)
+
+    # Per-state consistency rollup + flap detection in one pass.
+    $stateOrder = @('ConsistentlyPassing', 'DegradedButOperating', 'Inconsistent', 'ConsistentlyFailing', 'Unobserved', 'ManualAttestationRequired')
+    $consistency = [ordered]@{}
+    foreach ($s in $stateOrder) { $consistency[$s] = 0 }
+    $totalControls = 0
+
+    $flapping = New-Object System.Collections.Generic.List[object]
+    $freshnessByFamily = @{}
+
+    $analysis = if ($Coverage.ContainsKey('ControlAnalysis')) { $Coverage['ControlAnalysis'] } else { @{} }
+    foreach ($controlId in ($analysis.Keys | Sort-Object)) {
+        $a = $analysis[$controlId]
+        if (-not $a) { continue }
+        $totalControls++
+
+        $state = [string]$a['State']
+        if ($consistency.Contains($state)) { $consistency[$state]++ }
+
+        $family = [string]$a['Family']
+        if (-not $freshnessByFamily.ContainsKey($family)) {
+            $freshnessByFamily[$family] = [ordered]@{ Fresh = 0; Aging = 0; Stale = 0; Unknown = 0 }
+        }
+        $lastSeen = if ($a.ContainsKey('LastSeenUtc')) { [string]$a['LastSeenUtc'] } else { '' }
+        $bucket = Get-SOC2TypeTwoFreshnessBucket -IsoDate $lastSeen -AsOf $AsOf
+        $freshnessByFamily[$family][$bucket]++
+
+        # Flap detection over the observed worst-status trace. Collapse
+        # to pass/fail, skipping INFO/unknown so a lone INFO snapshot is
+        # not a boundary.
+        $trace = if ($a.ContainsKey('Trace')) { @($a['Trace']) } else { @() }
+        $classes = New-Object System.Collections.Generic.List[string]
+        foreach ($t in $trace) {
+            $ws = [string]$t['WorstStatus']
+            $cls = switch ($ws) {
+                'FAIL' { 'fail' }
+                'WARNING' { 'fail' }
+                'OK' { 'pass' }
+                'PASS' { 'pass' }
+                default { $null }
+            }
+            if ($cls) { $classes.Add($cls) | Out-Null }
+        }
+        $flapCount = 0
+        for ($i = 1; $i -lt $classes.Count; $i++) {
+            if ($classes[$i] -ne $classes[$i - 1]) { $flapCount++ }
+        }
+        if ($flapCount -ge 1) {
+            $flapping.Add([pscustomobject]@{
+                    ControlId = [string]$a['ControlId']
+                    Family = $family
+                    FlapCount = $flapCount
+                    PassOccurrences = [int]$a['PassOccurrences']
+                    FailOccurrences = [int]$a['FailOccurrences']
+                    WarningOccurrences = [int]$a['WarningOccurrences']
+                }) | Out-Null
+        }
+    }
+
+    $flappingSorted = @($flapping | Sort-Object @{ Expression = { -1 * [int]$_.FlapCount } }, @{ Expression = { [string]$_.ControlId } })
+
+    return @{
+        SnapshotsExpected = $expected
+        SnapshotsCollected = $collected
+        CoveragePercent = $coveragePct
+        LargestGapDays = $largest
+        LeadingGapDays = $leading
+        TrailingGapDays = $trailing
+        MaxGapDays = $maxGap
+        GapWithinThreshold = $gapWithin
+        MeetsTypeTwoThreshold = [bool]$Coverage['MeetsTypeTwoThreshold']
+        ThresholdDetail = @($Coverage['ThresholdDetail'])
+        TotalControls = $totalControls
+        ConsistencyCounts = $consistency
+        FlappingControls = $flappingSorted
+        FlappingCount = $flappingSorted.Count
+        FreshnessByFamily = $freshnessByFamily
+        AsOfUtc = ([datetime]::SpecifyKind($AsOf, [System.DateTimeKind]::Utc)).ToString('yyyy-MM-ddTHH:mm:ssZ')
+    }
+}
+
+#endregion
+
 #region ==================== HTML REPORT ====================
 
 <#
@@ -943,6 +1148,16 @@ td { padding: 8px 12px; border-bottom: 1px solid #e5e8ec; vertical-align: top; }
 .summary-card .family { font-weight: 600; font-size: 1.1em; margin-bottom: 8px; }
 .summary-card .row { font-size: 0.85em; color: #555; }
 .evidence-hash { font-family: monospace; font-size: 0.85em; word-break: break-all; }
+.dash-tiles { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 16px 0; }
+.dash-tile { background: #f8f9fb; padding: 16px; border-left: 4px solid $primaryColor; border-radius: 4px; }
+.dash-tile .dash-label { font-size: 0.8em; text-transform: uppercase; letter-spacing: 0.04em; color: #6c757d; }
+.dash-tile .dash-value { font-size: 1.5em; font-weight: 700; margin: 6px 0; }
+.dash-tile .dash-sub { font-size: 0.8em; color: #555; }
+h3 { color: #333; margin-top: 24px; }
+.fresh-fresh { color: #2a8c3c; font-weight: 600; }
+.fresh-aging { color: #d89b00; font-weight: 600; }
+.fresh-stale { color: #c8102e; font-weight: 600; }
+.fresh-unknown { color: #6c757d; }
 footer { background: #2a3441; color: #d0d5dc; text-align: center; padding: 16px; font-size: 0.85em; }
 </style>
 "@)
@@ -990,6 +1205,56 @@ footer { background: #2a3441; color: #d0d5dc; text-align: center; padding: 16px;
         }
         [void]$sb.AppendLine('</ul>Per-control analysis still rendered below; treat as Type 1-equivalent evidence over the available snapshots.</div>')
     }
+
+    # §11.2 — Period Coverage dashboard. Executive rollup of the
+    # observation window: snapshot coverage, evidence gaps, control
+    # consistency, flapping controls, and freshness by family.
+    $dash = Get-SOC2PeriodCoverageDashboard -Coverage $Coverage
+    [void]$sb.AppendLine('<section class="report" id="period-coverage"><h2>Period Coverage</h2>')
+    $thresholdBadge = if ($dash.MeetsTypeTwoThreshold) {
+        "<span class='badge badge-met'>Type 2 threshold met</span>"
+    } else {
+        "<span class='badge badge-unmet'>Type 2 threshold not met</span>"
+    }
+    $covClass = if ($dash.CoveragePercent -ge 100) { 'state-ConsistentlyPassing' } elseif ($dash.CoveragePercent -ge 75) { 'state-DegradedButOperating' } else { 'state-ConsistentlyFailing' }
+    $gapClass = if ($dash.GapWithinThreshold) { 'state-ConsistentlyPassing' } else { 'state-ConsistentlyFailing' }
+    [void]$sb.AppendLine('<div class="dash-tiles">')
+    [void]$sb.AppendLine("<div class='dash-tile'><div class='dash-label'>Snapshots collected</div><div class='dash-value $covClass'>$($dash.SnapshotsCollected) / $($dash.SnapshotsExpected)</div><div class='dash-sub'>$($dash.CoveragePercent)% of expected</div></div>")
+    [void]$sb.AppendLine("<div class='dash-tile'><div class='dash-label'>Largest evidence gap</div><div class='dash-value $gapClass'>$($dash.LargestGapDays) d</div><div class='dash-sub'>threshold $($dash.MaxGapDays) d &middot; lead $($dash.LeadingGapDays) / trail $($dash.TrailingGapDays)</div></div>")
+    [void]$sb.AppendLine("<div class='dash-tile'><div class='dash-label'>Controls analysed</div><div class='dash-value'>$($dash.TotalControls)</div><div class='dash-sub'>$($dash.FlappingCount) flapping</div></div>")
+    [void]$sb.AppendLine("<div class='dash-tile'><div class='dash-label'>Type 2 readiness</div><div class='dash-value'>$thresholdBadge</div><div class='dash-sub'>as of $($dash.AsOfUtc)</div></div>")
+    [void]$sb.AppendLine('</div>')
+
+    # Consistency rollup
+    [void]$sb.AppendLine('<h3>Control consistency over the period</h3>')
+    [void]$sb.AppendLine('<table><thead><tr><th>State</th><th>Controls</th></tr></thead><tbody>')
+    foreach ($entry in $dash.ConsistencyCounts.GetEnumerator()) {
+        [void]$sb.AppendLine("<tr><td class='state-$($entry.Key)'>$($entry.Key)</td><td>$($entry.Value)</td></tr>")
+    }
+    [void]$sb.AppendLine('</tbody></table>')
+
+    # Flapping controls
+    if ($dash.FlappingCount -gt 0) {
+        [void]$sb.AppendLine('<h3>Controls with intermittent failures</h3>')
+        [void]$sb.AppendLine('<p style="color:#555;font-size:0.9em;">Worst-status crossed the pass/fail boundary at least once during the period (WARNING counts as fail-ish; INFO snapshots ignored). A high flap count is an exception that needs a root-cause narrative for the auditor.</p>')
+        [void]$sb.AppendLine('<table><thead><tr><th>Control</th><th>Family</th><th>Flap count</th><th>Pass</th><th>Warn</th><th>Fail</th></tr></thead><tbody>')
+        foreach ($fc in $dash.FlappingControls) {
+            [void]$sb.AppendLine("<tr><td><strong>$([System.Web.HttpUtility]::HtmlEncode([string]$fc.ControlId))</strong></td><td>$([System.Web.HttpUtility]::HtmlEncode([string]$fc.Family))</td><td class='state-Inconsistent'>$($fc.FlapCount)</td><td>$($fc.PassOccurrences)</td><td>$($fc.WarningOccurrences)</td><td>$($fc.FailOccurrences)</td></tr>")
+        }
+        [void]$sb.AppendLine('</tbody></table>')
+    }
+
+    # Freshness by family
+    [void]$sb.AppendLine('<h3>Evidence freshness by TSC family</h3>')
+    [void]$sb.AppendLine('<p style="color:#555;font-size:0.9em;">Age of each control&rsquo;s most recent observation at period end: Fresh&nbsp;&lt;&nbsp;30d, Aging&nbsp;30&ndash;90d, Stale&nbsp;&ge;&nbsp;90d, Unknown = never observed in the window.</p>')
+    [void]$sb.AppendLine('<table><thead><tr><th>Family</th><th>Fresh</th><th>Aging</th><th>Stale</th><th>Unknown</th></tr></thead><tbody>')
+    foreach ($fam in @('CC', 'A', 'C', 'PI', 'P')) {
+        if (-not $dash.FreshnessByFamily.ContainsKey($fam)) { continue }
+        $fb = $dash.FreshnessByFamily[$fam]
+        [void]$sb.AppendLine("<tr><td><strong>$fam</strong></td><td class='fresh-fresh'>$($fb['Fresh'])</td><td class='fresh-aging'>$($fb['Aging'])</td><td class='fresh-stale'>$($fb['Stale'])</td><td class='fresh-unknown'>$($fb['Unknown'])</td></tr>")
+    }
+    [void]$sb.AppendLine('</tbody></table>')
+    [void]$sb.AppendLine('</section>')
 
     # Summary by category
     [void]$sb.AppendLine('<section class="report"><h2>Summary by Trust Services Category</h2>')
@@ -1116,7 +1381,11 @@ Export-ModuleMember -Function @(
     'Get-SOC2PeriodCoverage',
     'New-SOC2TypeTwoEvidenceBundle',
     'Test-SOC2TypeTwoBundle',
-    'New-SOC2TypeTwoReport'
+    'New-SOC2TypeTwoReport',
+    # Audit-Readiness Plan §11.2 — period-coverage dashboard aggregator
+    # + its freshness helper. Exported for renderers and Pester tests.
+    'Get-SOC2PeriodCoverageDashboard',
+    'Get-SOC2TypeTwoFreshnessBucket'
 )
 
 #endregion
