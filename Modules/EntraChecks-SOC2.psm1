@@ -1130,6 +1130,108 @@ function Get-SOC2LicensingCapabilities {
 
 <#
 .SYNOPSIS
+    Returns the actionability detail for a licensing-gap feature
+    (Audit-Readiness Plan §11.3): the human-readable license needed,
+    what evidence is blocked without it, a manual evidence
+    alternative, the exact config-override key + recommendation, and
+    the audit risk if the gap is left unassessed.
+
+.DESCRIPTION
+    Pure lookup over a static catalog. Unknown features return a safe
+    generic record (never $null) so callers don't have to special-case
+    a feature added to New-SOC2LicensingGapFindings before its catalog
+    entry. The OverrideKey is the real config path
+    (SOC2.AzureReadiness.Licensing.Overrides.<Feature>).
+
+.PARAMETER Feature
+    The feature name (IdentityProtection, Intune, PurviewE5,
+    DefenderForCloud, DefenderForEndpoint, Priva).
+
+.OUTPUTS
+    PSCustomObject: Feature, LicenseNeeded, EvidenceBlocked,
+    ManualAlternative, OverrideKey, OverrideRecommendation,
+    RiskIfUnassessed.
+#>
+function Get-SOC2LicensingGapActionability {
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)][string]$Feature
+    )
+
+    if (-not $script:SOC2LicensingActionability) {
+        $script:SOC2LicensingActionability = @{
+            'IdentityProtection' = @{
+                LicenseNeeded = 'Microsoft Entra ID P2 (or EMS E5)'
+                EvidenceBlocked = 'Risk-based Conditional Access, risky-user and risky-sign-in detections, and the Identity Protection risk policy posture cannot be read from Graph.'
+                ManualAlternative = 'Attach a screenshot of Entra > Protection > Identity Protection (risk policies + last 30 days of risk detections) and a signed statement of the risk-remediation process.'
+                RiskIfUnassessed = 'CC7.3 (system monitoring for anomalies) is unverified — an auditor cannot confirm identity-risk is detected and acted on.'
+            }
+            'Intune' = @{
+                LicenseNeeded = 'Microsoft Intune (or EMS E3+)'
+                EvidenceBlocked = 'Device compliance policies, enrollment state, and managed-device configuration cannot be enumerated.'
+                ManualAlternative = 'Provide an Intune compliance-policy export plus an MDM enrollment report, or a signed attestation of the device-management standard with sampled evidence.'
+                RiskIfUnassessed = 'CC6.4 (logical access to facilities/devices) is unverified — endpoint compliance is asserted, not evidenced.'
+            }
+            'PurviewE5' = @{
+                LicenseNeeded = 'Microsoft Purview (E5 or the Compliance add-on)'
+                EvidenceBlocked = 'DLP policies, sensitivity/retention labels, and data-lifecycle configuration cannot be read.'
+                ManualAlternative = 'Supply Purview compliance-portal exports (DLP + label policies + retention) or a signed data-handling attestation with sampled label/DLP evidence.'
+                RiskIfUnassessed = 'CC6.7 and C1.1/C1.2 (confidential-information handling) are unverified — data-protection controls are claimed without evidence.'
+            }
+            'DefenderForCloud' = @{
+                LicenseNeeded = 'Microsoft Defender for Cloud (a paid plan, e.g. Defender for Servers/Storage)'
+                EvidenceBlocked = 'Regulatory-compliance posture, security recommendations, and alerting from Defender for Cloud cannot be assessed.'
+                ManualAlternative = 'Attach the Defender for Cloud regulatory-compliance dashboard export and a screenshot of the active plans, or a signed cloud-security-monitoring attestation.'
+                RiskIfUnassessed = 'CC4.2/CC6.7/CC6.8 (monitoring + threat detection) are unverified — cloud workload protection is asserted only.'
+            }
+            'DefenderForEndpoint' = @{
+                LicenseNeeded = 'Microsoft Defender for Endpoint (P1/P2 or M365 E5 Security)'
+                EvidenceBlocked = 'EDR onboarding state and anti-malware/endpoint-protection posture cannot be read via the connector.'
+                ManualAlternative = 'Provide a Defender for Endpoint device-inventory/onboarding export, or a signed EDR-coverage attestation with a sampled device list.'
+                RiskIfUnassessed = 'CC6.8 (malicious-software prevention) is unverified — endpoint threat protection is claimed without evidence.'
+            }
+            'Priva' = @{
+                LicenseNeeded = 'Microsoft Priva (Privacy Risk Management / Subject Rights)'
+                EvidenceBlocked = 'Privacy-risk signals and subject-rights-request handling configuration cannot be enumerated.'
+                ManualAlternative = 'Supply the privacy program policy, a subject-rights-request log sample, and a signed privacy-operations attestation.'
+                RiskIfUnassessed = 'P1.1/P2.1/P3.1 (privacy notice, choice/consent, collection) are unverified — privacy commitments are asserted only.'
+            }
+        }
+    }
+
+    $entry = $null
+    if ($script:SOC2LicensingActionability.ContainsKey($Feature)) {
+        $entry = $script:SOC2LicensingActionability[$Feature]
+    }
+
+    $overrideKey = "SOC2.AzureReadiness.Licensing.Overrides.$Feature"
+    if ($entry) {
+        return [pscustomobject]@{
+            Feature = $Feature
+            LicenseNeeded = $entry.LicenseNeeded
+            EvidenceBlocked = $entry.EvidenceBlocked
+            ManualAlternative = $entry.ManualAlternative
+            OverrideKey = $overrideKey
+            OverrideRecommendation = "If $($entry.LicenseNeeded) is in scope, set $overrideKey to 'WARNING' (or 'FAIL') so the gap blocks the readiness verdict instead of sitting as INFO. If the feature is genuinely out of scope, leave it 'INFO' and record the exclusion rationale."
+            RiskIfUnassessed = $entry.RiskIfUnassessed
+        }
+    }
+
+    # Unknown feature — safe generic record (never $null).
+    return [pscustomobject]@{
+        Feature = $Feature
+        LicenseNeeded = "(license for $Feature — see Microsoft licensing docs)"
+        EvidenceBlocked = "Automated assessment for $Feature is unavailable without the required licensing."
+        ManualAlternative = 'Provide a signed management attestation with sampled evidence for the affected controls.'
+        OverrideKey = $overrideKey
+        OverrideRecommendation = "Set $overrideKey to 'WARNING'/'FAIL' if in scope, otherwise leave 'INFO' and document the exclusion."
+        RiskIfUnassessed = 'Affected TSC controls are asserted without automated evidence.'
+    }
+}
+
+<#
+.SYNOPSIS
     Emits SOC2_LicensingGap_* INFO findings for each missing capability.
 
 .DESCRIPTION
@@ -1231,18 +1333,37 @@ function New-SOC2LicensingGapFindings {
             }
         }
 
+        # §11.3 — actionability detail makes the gap workable instead of
+        # just reported. Attached as a structured property and folded into
+        # the Description / Remediation text so even consumers that don't
+        # read LicensingGapDetail get the actionable guidance.
+        $act = Get-SOC2LicensingGapActionability -Feature $gap.Feature
+        $tscList = @($gap.TSC) -join ', '
+        $detail = [pscustomobject]@{
+            Feature = $gap.Feature
+            LicenseNeeded = $act.LicenseNeeded
+            AffectedTSCs = $tscList
+            EvidenceBlocked = $act.EvidenceBlocked
+            ManualAlternative = $act.ManualAlternative
+            OverrideKey = $act.OverrideKey
+            OverrideRecommendation = $act.OverrideRecommendation
+            RiskIfUnassessed = $act.RiskIfUnassessed
+        }
+
         $params = @{
             CheckName = 'Get-SOC2LicensingCapabilities'
             Type = $gap.Type
             Status = $status
             Severity = $severity
             Object = "Licensing: $($gap.Feature)"
-            Description = $gap.Reason + '. Affected TSCs are not assessed.'
-            Remediation = "If this feature is in scope for your SOC 2 readiness, procure the required licensing. Otherwise, document exclusion scope and leave this finding as INFO to acknowledge the gap."
+            Description = "$($gap.Reason). License needed: $($act.LicenseNeeded). Affected TSCs ($tscList) are not assessed: $($act.EvidenceBlocked)"
+            Remediation = "Manual alternative: $($act.ManualAlternative) Config: $($act.OverrideRecommendation) Audit risk if left unassessed: $($act.RiskIfUnassessed)"
             TSCReferences = $gap.TSC
             ControlOwnerHint = $gap.Owner
         }
-        $gaps.Add((Get-SOC2Finding @params)) | Out-Null
+        $finding = Get-SOC2Finding @params
+        Add-Member -InputObject $finding -MemberType NoteProperty -Name 'LicensingGapDetail' -Value $detail -Force
+        $gaps.Add($finding) | Out-Null
     }
 
     return $gaps.ToArray()
@@ -3195,6 +3316,8 @@ Export-ModuleMember -Function @(
     # Phase 2 - Azure helpers + licensing
     'Get-SOC2LicensingCapabilities',
     'New-SOC2LicensingGapFindings',
+    # Audit-Readiness Plan §11.3 — licensing-gap actionability catalog.
+    'Get-SOC2LicensingGapActionability',
     # Phase 2 - synthetic checks
     'Test-SOC2BackupConfiguration',
     'Test-SOC2ServiceHealthBaseline',

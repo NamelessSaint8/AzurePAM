@@ -830,11 +830,28 @@ function Get-SOC2LicensingGapRows {
         if ($finding.PSObject.Properties['TSCReferences']) { $tscList = ($finding.TSCReferences -join ', ') }
         $severity = if ($finding.PSObject.Properties['Severity']) { $finding.Severity } else { '' }
         $owner = if ($finding.PSObject.Properties['ControlOwnerHint']) { $finding.ControlOwnerHint } else { '' }
+
+        # §11.3 — pull the actionability detail off the finding. Older
+        # findings (pre-§11.3) won't carry it; fall back to empty cells so
+        # the sheet stays stable.
+        $d = if ($finding.PSObject.Properties['LicensingGapDetail']) { $finding.LicensingGapDetail } else { $null }
+        $licenseNeeded = if ($d -and $d.PSObject.Properties['LicenseNeeded']) { [string]$d.LicenseNeeded } else { '' }
+        $evidenceBlocked = if ($d -and $d.PSObject.Properties['EvidenceBlocked']) { [string]$d.EvidenceBlocked } else { '' }
+        $manualAlt = if ($d -and $d.PSObject.Properties['ManualAlternative']) { [string]$d.ManualAlternative } else { '' }
+        $overrideRec = if ($d -and $d.PSObject.Properties['OverrideRecommendation']) { [string]$d.OverrideRecommendation } else { '' }
+        $riskUnassessed = if ($d -and $d.PSObject.Properties['RiskIfUnassessed']) { [string]$d.RiskIfUnassessed } else { '' }
+        if ($d -and $d.PSObject.Properties['AffectedTSCs'] -and $d.AffectedTSCs) { $tscList = [string]$d.AffectedTSCs }
+
         $row = [pscustomobject]@{
             Feature = $feature
+            LicenseNeeded = $licenseNeeded
             Status = $finding.Status
             Severity = $severity
             AffectedTSCs = $tscList
+            EvidenceBlocked = $evidenceBlocked
+            ManualAlternative = $manualAlt
+            OverrideRecommendation = $overrideRec
+            RiskIfUnassessed = $riskUnassessed
             Description = $finding.Description
             Remediation = $finding.Remediation
             ControlOwnerHint = $owner
@@ -1259,6 +1276,14 @@ tr:hover { background: #fafbfc; }
 .licensing-panel .title { font-weight: 600; color: #6a5fb3; margin-bottom: 8px; }
 .licensing-panel .breakdown { font-size: 0.9em; color: #555; }
 .licensing-panel .breakdown span { display: inline-block; margin-right: 14px; }
+/* §11.3 — Licensing Gap Actionability */
+.lga-card { border: 1px solid #d6dce5; border-left: 4px solid #6a5fb3; border-radius: 4px; padding: 12px 16px; margin: 12px 0; background: #faf9fd; }
+.lga-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
+.lga-head .lga-feature { font-weight: 700; font-size: 1.05em; color: #4a3c7a; }
+.lga-head .lga-tsc { font-size: 0.82em; color: #555; }
+table.lga-table { width: 100%; border-collapse: collapse; font-size: 0.88em; margin-top: 4px; }
+table.lga-table th { width: 170px; text-align: left; vertical-align: top; padding: 6px 10px; background: #f0edf7; border-bottom: 1px solid #e5e8ec; color: #4a3c7a; }
+table.lga-table td { padding: 6px 10px; border-bottom: 1px solid #e5e8ec; vertical-align: top; }
 .severity-Critical { background: #c8102e; color: white; padding: 2px 8px; border-radius: 3px; font-size: 0.85em; }
 .severity-High { background: #ff6f00; color: white; padding: 2px 8px; border-radius: 3px; font-size: 0.85em; }
 .severity-Medium { background: #d89b00; color: white; padding: 2px 8px; border-radius: 3px; font-size: 0.85em; }
@@ -1531,6 +1556,33 @@ table.manual-attestation a { color: inherit; }
     }
 
     [void]$sb.AppendLine('</section>')
+
+    # §11.3 — Licensing Gap Actionability. Turns each "not assessed due
+    # to licensing" gap into a worklist: what license, what evidence is
+    # blocked, the manual alternative, the exact config override, and the
+    # audit risk if left unassessed. Rendered only when gaps exist.
+    $licGapRows = Get-SOC2LicensingGapRows -Summary $summary
+    $licGapRows = @($licGapRows)
+    if ($licGapRows.Count -gt 0) {
+        [void]$sb.AppendLine('<section class="report" id="licensing-gap-actionability">')
+        [void]$sb.AppendLine('<h2>Licensing Gap Actionability</h2>')
+        [void]$sb.AppendLine('<p style="color:#555;font-size:0.9em;margin:8px 0 16px;">Each control family below is <em>not assessed</em> because the tenant lacks the required licensing. For every gap: the license needed, what evidence the scan cannot collect, a manual evidence alternative an auditor will accept, the exact config override to escalate the gap, and the audit risk if it is left unassessed.</p>')
+        foreach ($lg in $licGapRows) {
+            $feat = [System.Web.HttpUtility]::HtmlEncode([string]$lg.Feature)
+            $statusCls = "status-$(([string]$lg.Status).ToLowerInvariant())"
+            [void]$sb.AppendLine('<div class="lga-card">')
+            [void]$sb.AppendLine("<div class='lga-head'><span class='lga-feature'>$feat</span> <span class='badge $statusCls'>$([System.Web.HttpUtility]::HtmlEncode([string]$lg.Status))</span> <span class='lga-tsc'>TSCs: $([System.Web.HttpUtility]::HtmlEncode([string]$lg.AffectedTSCs))</span></div>")
+            [void]$sb.AppendLine('<table class="lga-table"><tbody>')
+            [void]$sb.AppendLine("<tr><th>License needed</th><td>$([System.Web.HttpUtility]::HtmlEncode([string]$lg.LicenseNeeded))</td></tr>")
+            [void]$sb.AppendLine("<tr><th>Evidence blocked</th><td>$([System.Web.HttpUtility]::HtmlEncode([string]$lg.EvidenceBlocked))</td></tr>")
+            [void]$sb.AppendLine("<tr><th>Manual alternative</th><td>$([System.Web.HttpUtility]::HtmlEncode([string]$lg.ManualAlternative))</td></tr>")
+            [void]$sb.AppendLine("<tr><th>Config override</th><td>$([System.Web.HttpUtility]::HtmlEncode([string]$lg.OverrideRecommendation))</td></tr>")
+            [void]$sb.AppendLine("<tr><th>Risk if unassessed</th><td>$([System.Web.HttpUtility]::HtmlEncode([string]$lg.RiskIfUnassessed))</td></tr>")
+            [void]$sb.AppendLine('</tbody></table>')
+            [void]$sb.AppendLine('</div>')
+        }
+        [void]$sb.AppendLine('</section>')
+    }
 
     # SOC 2 Audit-Readiness Plan PR 1 §8.3 — Control Conclusion Register.
     # The auditor-facing headline view: one row per control, with the
