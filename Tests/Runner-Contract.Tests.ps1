@@ -1,0 +1,272 @@
+<#
+.SYNOPSIS
+    Pester 5 tests for the headless-runner contract
+    (plans/Native-App-Phase1-Headless-Core-Plan.md §4/§5/§8).
+
+.DESCRIPTION
+    The NDJSON event stream and the run-result manifest are the public
+    API every UI + automation depends on. They are frozen at v1.0 and
+    tested here as data:
+
+      1. Schema shape — every event carries schemaVersion/type/runId/utc.
+      2. Ordering invariants — run.started first, run.result last,
+         balanced phase.started/phase.completed, progress only in-phase.
+      3. Manifest correctness — the §5 status-derivation table.
+      4. No-Read-Host guard — the runner module is non-interactive.
+      5. Sanitization — params echo is allowlisted; no secret leakage.
+      6. NDJSON emission — -EmitEvents writes one compact JSON line per
+         event to stdout; run history equals the final manifest.
+
+    Driver/parity tests (Invoke-EntraChecksRun end-to-end vs. the legacy
+    -Mode Quick path) are added with the driver in the same phase.
+
+    Run: Invoke-Pester -Path Tests/Runner-Contract.Tests.ps1
+#>
+
+#Requires -Version 5.1
+#Requires -Modules @{ ModuleName = 'Pester'; ModuleVersion = '5.0.0' }
+
+BeforeAll {
+    if (-not $env:TEMP) {
+        $env:TEMP = if ($env:TMPDIR) { $env:TMPDIR.TrimEnd('/') } else { '/tmp' }
+    }
+    $repoRoot = Split-Path -Parent $PSScriptRoot
+    $script:RunnerModulePath = Join-Path $repoRoot 'Modules/EntraChecks-Runner.psm1'
+    Import-Module $script:RunnerModulePath -Force
+
+    function script:New-FullRun {
+        param([hashtable]$Params, [string]$OutDir, [switch]$EmitEvents)
+        $ctx = New-EcfRunContext -RunId 'test-run' -Params $Params -OutputDirectory $OutDir -EmitEvents:$EmitEvents
+        Start-EcfRun -Context $ctx
+        Start-EcfPhase -Context $ctx -Phase 'Prereqs'
+        Complete-EcfPhase -Context $ctx -Phase 'Prereqs' -Status ok
+        Start-EcfPhase -Context $ctx -Phase 'Core'
+        Write-EcfProgress -Context $ctx -Phase 'Core' -Current 1 -Total 25 -Message 'Conditional Access'
+        Write-EcfLog -Context $ctx -Message 'narration' -Level info
+        Complete-EcfPhase -Context $ctx -Phase 'Core' -Status ok
+        return $ctx
+    }
+}
+
+Describe 'Schema shape — every event' {
+
+    BeforeAll {
+        $script:Ctx = New-FullRun -Params @{ TenantName = 'Contoso' } -OutDir $env:TEMP
+        $null = Complete-EcfRun -Context $script:Ctx -Summary @{ findings = 0 }
+    }
+
+    It 'every event carries schemaVersion=1.0, type, runId, utc' {
+        foreach ($e in $script:Ctx.Events) {
+            $e.schemaVersion | Should -BeExactly '1.0'
+            [string]$e.type | Should -Not -BeNullOrEmpty
+            $e.runId | Should -BeExactly 'test-run'
+            ([string]$e.utc) | Should -Match '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$'
+        }
+    }
+
+    It 'only emits known v1.0 event types' {
+        $known = @('run.started', 'phase.started', 'phase.progress', 'phase.completed', 'log', 'warning', 'auth.info', 'run.result')
+        foreach ($e in $script:Ctx.Events) { $known | Should -Contain $e.type }
+    }
+
+    It 'reserved keys cannot be overwritten by event data' {
+        $ctx = New-EcfRunContext -RunId 'x' -Params @{}
+        Write-EcfEvent -Context $ctx -Type 'log' -Data @{ runId = 'HIJACK'; schemaVersion = '9.9'; message = 'm' }
+        $ctx.Events[0].runId | Should -BeExactly 'x'
+        $ctx.Events[0].schemaVersion | Should -BeExactly '1.0'
+        $ctx.Events[0].message | Should -BeExactly 'm'
+    }
+}
+
+Describe 'Ordering invariants' {
+
+    BeforeAll {
+        $script:Ctx = New-FullRun -Params @{ TenantName = 'Contoso' } -OutDir $env:TEMP
+        $null = Complete-EcfRun -Context $script:Ctx -Summary @{ findings = 0 }
+        $script:Types = @($script:Ctx.Events | ForEach-Object { $_.type })
+    }
+
+    It 'run.started is the first event' { $script:Types[0] | Should -BeExactly 'run.started' }
+    It 'run.result is the last event' { $script:Types[-1] | Should -BeExactly 'run.result' }
+    It 'exactly one run.started and one run.result' {
+        @($script:Types | Where-Object { $_ -eq 'run.started' }).Count | Should -Be 1
+        @($script:Types | Where-Object { $_ -eq 'run.result' }).Count | Should -Be 1
+    }
+
+    It 'phase.started / phase.completed are balanced per phase' {
+        $started = $script:Ctx.Events | Where-Object { $_.type -eq 'phase.started' } | ForEach-Object { $_.phase }
+        $completed = $script:Ctx.Events | Where-Object { $_.type -eq 'phase.completed' } | ForEach-Object { $_.phase }
+        ($started | Sort-Object) | Should -Be ($completed | Sort-Object)
+    }
+
+    It 'phase.progress only appears inside an open phase' {
+        $depth = 0
+        foreach ($e in $script:Ctx.Events) {
+            switch ($e.type) {
+                'phase.started' { $depth++ }
+                'phase.completed' { $depth-- }
+                'phase.progress' { $depth | Should -BeGreaterThan 0 }
+            }
+        }
+    }
+
+    It 'Start-EcfRun is idempotent (no duplicate run.started)' {
+        $ctx = New-EcfRunContext -RunId 'y' -Params @{}
+        Start-EcfRun -Context $ctx
+        Start-EcfRun -Context $ctx
+        @($ctx.Events | Where-Object { $_.type -eq 'run.started' }).Count | Should -Be 1
+    }
+
+    It 'unknown phase names are rejected' {
+        $ctx = New-EcfRunContext -RunId 'z' -Params @{}
+        { Start-EcfPhase -Context $ctx -Phase 'Bogus' } | Should -Throw -ExpectedMessage '*Unknown phase*'
+    }
+}
+
+Describe 'Manifest — §5 status derivation' {
+
+    It 'all phases ok + an artifact = Succeeded' {
+        $ctx = New-FullRun -Params @{} -OutDir $env:TEMP
+        Add-EcfArtifact -Context $ctx -Kind 'cockpit-html' -Path $env:TEMP
+        (New-EcfRunManifest -Context $ctx).status | Should -BeExactly 'Succeeded'
+    }
+
+    It 'artifact present but a phase failed = PartiallySucceeded' {
+        $ctx = New-EcfRunContext -RunId 'p' -Params @{} -OutputDirectory $env:TEMP
+        Start-EcfRun -Context $ctx
+        Start-EcfPhase -Context $ctx -Phase 'Modules'
+        Complete-EcfPhase -Context $ctx -Phase 'Modules' -Status failed
+        Add-EcfArtifact -Context $ctx -Kind 'csv' -Path $env:TEMP
+        (New-EcfRunManifest -Context $ctx).status | Should -BeExactly 'PartiallySucceeded'
+    }
+
+    It 'fatal error and no artifact = Failed' {
+        $ctx = New-EcfRunContext -RunId 'f' -Params @{} -OutputDirectory $env:TEMP
+        Start-EcfRun -Context $ctx
+        Write-EcfError -Context $ctx -Message 'boom' -Code 'E1' -Fatal
+        (New-EcfRunManifest -Context $ctx).status | Should -BeExactly 'Failed'
+    }
+
+    It 'non-fatal error with an artifact = PartiallySucceeded' {
+        $ctx = New-EcfRunContext -RunId 'n' -Params @{} -OutputDirectory $env:TEMP
+        Start-EcfRun -Context $ctx
+        Write-EcfError -Context $ctx -Message 'soft' -Code 'E2'
+        Add-EcfArtifact -Context $ctx -Kind 'json' -Path $env:TEMP
+        (New-EcfRunManifest -Context $ctx).status | Should -BeExactly 'PartiallySucceeded'
+    }
+
+    It 'manifest carries summary, artifacts, errors, warnings, sanitized params' {
+        $ctx = New-FullRun -Params @{ TenantName = 'Contoso'; SkipAuthentication = $true } -OutDir $env:TEMP
+        Write-EcfWarning -Context $ctx -Message 'w' -Code 'W'
+        Add-EcfArtifact -Context $ctx -Kind 'cockpit-html' -Path $env:TEMP
+        $m = New-EcfRunManifest -Context $ctx -Summary @{ findings = 7; critical = 1; modulesRun = @('Core'); soc2 = @{ ran = $true; verdict = 'AUDIT-READY' } }
+        $m.type | Should -BeExactly 'run.result'
+        $m.summary.findings | Should -Be 7
+        $m.summary.soc2.verdict | Should -BeExactly 'AUDIT-READY'
+        @($m.artifacts).Count | Should -Be 1
+        @($m.warnings).Count | Should -Be 1
+        $m.params.Contains('TenantName') | Should -BeTrue
+    }
+
+    It 'artifact paths are resolved absolute' {
+        $ctx = New-EcfRunContext -RunId 'abs' -Params @{}
+        Add-EcfArtifact -Context $ctx -Kind 'cockpit-html' -Path $env:TEMP
+        [System.IO.Path]::IsPathRooted($ctx.Artifacts[0].path) | Should -BeTrue
+    }
+}
+
+Describe 'Sanitization — §6 allowlist' {
+
+    It 'keeps allowlisted keys and drops everything else' {
+        $safe = ConvertTo-EcfSafeParams -Params @{
+            TenantName = 'Contoso'; OutputDirectory = 'C:\out'; Modules = @('Core')
+            ClientSecret = 'topsecret'; AccessToken = 'eyJ...'; Password = 'p@ss'
+        }
+        $safe.Contains('TenantName') | Should -BeTrue
+        $safe.Contains('OutputDirectory') | Should -BeTrue
+        $safe.Contains('Modules') | Should -BeTrue
+        $safe.Contains('ClientSecret') | Should -BeFalse
+        $safe.Contains('AccessToken') | Should -BeFalse
+        $safe.Contains('Password') | Should -BeFalse
+    }
+
+    It 'normalizes SwitchParameter to bool' {
+        $safe = ConvertTo-EcfSafeParams -Params @{ SkipAuthentication = [switch]$true }
+        $safe['SkipAuthentication'] | Should -BeOfType [bool]
+        $safe['SkipAuthentication'] | Should -BeTrue
+    }
+
+    It 'tolerates null and pscustomobject input' {
+        (ConvertTo-EcfSafeParams -Params $null).Count | Should -Be 0
+        $safe = ConvertTo-EcfSafeParams -Params ([pscustomobject]@{ TenantName = 'X'; Secret = 'y' })
+        $safe.Contains('TenantName') | Should -BeTrue
+        $safe.Contains('Secret') | Should -BeFalse
+    }
+}
+
+Describe 'No-Read-Host guard — runner is non-interactive' {
+
+    It 'EntraChecks-Runner.psm1 contains no Read-Host' {
+        $src = Get-Content -LiteralPath $script:RunnerModulePath -Raw
+        # Strip block comments so doc prose can't trip the scan, then look
+        # for an actual Read-Host invocation.
+        $code = [regex]::Replace($src, '<#[\s\S]*?#>', '')
+        $code | Should -Not -Match '(?im)(^|[^-\w])Read-Host\b'
+    }
+}
+
+Describe 'NDJSON emission + run history' {
+
+    BeforeEach {
+        $script:Tmp = Join-Path $env:TEMP "rc-ndjson-$((Get-Random))"
+        $null = New-Item -Path $script:Tmp -ItemType Directory -Force
+    }
+    AfterEach {
+        if (Test-Path $script:Tmp) { Remove-Item -LiteralPath $script:Tmp -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'with -EmitEvents writes one compact JSON line per event to stdout' {
+        $out = Join-Path $script:Tmp 'stream.txt'
+        $sb = {
+            param($modPath, $dir)
+            Import-Module $modPath -Force
+            $ctx = New-EcfRunContext -RunId 'emit' -Params @{ TenantName = 'C' } -OutputDirectory $dir -EmitEvents
+            Start-EcfRun -Context $ctx
+            Start-EcfPhase -Context $ctx -Phase 'Core'
+            Complete-EcfPhase -Context $ctx -Phase 'Core' -Status ok
+            $null = Complete-EcfRun -Context $ctx -Summary @{ findings = 0 }
+        }
+        # Run in a child pwsh so [Console]::Out is a clean captured stream.
+        & pwsh -NoProfile -Command "& { $($sb.ToString()) } '$script:RunnerModulePath' '$script:Tmp'" > $out
+        $lines = @(Get-Content -LiteralPath $out | Where-Object { $_.Trim() })
+        $lines.Count | Should -BeGreaterThan 0
+        foreach ($l in $lines) {
+            $obj = $l | ConvertFrom-Json   # each line must be valid standalone JSON
+            $obj.schemaVersion | Should -BeExactly '1.0'
+            $l | Should -Not -Match "`n"   # compact: single line
+        }
+        ($lines[0] | ConvertFrom-Json).type | Should -BeExactly 'run.started'
+        ($lines[-1] | ConvertFrom-Json).type | Should -BeExactly 'run.result'
+    }
+
+    It 'writes run history to <out>/.runs/<runId>.json equal to the manifest' {
+        $ctx = New-EcfRunContext -RunId 'hist1' -Params @{ TenantName = 'C' } -OutputDirectory $script:Tmp
+        Start-EcfRun -Context $ctx
+        Add-EcfArtifact -Context $ctx -Kind 'cockpit-html' -Path $script:Tmp
+        $m = Complete-EcfRun -Context $ctx -Summary @{ findings = 3 }
+        $histPath = Join-Path (Join-Path $script:Tmp '.runs') 'hist1.json'
+        Test-Path $histPath | Should -BeTrue
+        $fromDisk = Get-Content -LiteralPath $histPath -Raw | ConvertFrom-Json
+        $fromDisk.runId | Should -BeExactly 'hist1'
+        $fromDisk.status | Should -BeExactly $m.status
+        $fromDisk.summary.findings | Should -Be 3
+    }
+
+    It 'Complete-EcfRun is idempotent' {
+        $ctx = New-EcfRunContext -RunId 'idem' -Params @{} -OutputDirectory $script:Tmp
+        Start-EcfRun -Context $ctx
+        $null = Complete-EcfRun -Context $ctx -Summary @{}
+        $null = Complete-EcfRun -Context $ctx -Summary @{}
+        @($ctx.Events | Where-Object { $_.type -eq 'run.result' }).Count | Should -Be 1
+    }
+}
