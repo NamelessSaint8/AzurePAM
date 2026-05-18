@@ -23,7 +23,14 @@
 
 BeforeAll {
     $repoRoot = Split-Path -Parent $PSScriptRoot
-    $scriptPath = Join-Path $repoRoot 'Start-EntraChecks.ps1'
+    # Native App Plan Phase 1 (4/4): the orchestration function definitions
+    # moved out of Start-EntraChecks.ps1 into the dot-sourceable
+    # EntraChecks.Orchestration.ps1 include. Fall back to the old location
+    # so this test works before and after the split.
+    $scriptPath = Join-Path $repoRoot 'EntraChecks.Orchestration.ps1'
+    if (-not (Test-Path -LiteralPath $scriptPath)) {
+        $scriptPath = Join-Path $repoRoot 'Start-EntraChecks.ps1'
+    }
 
     # Extract Get-SOC2EnabledFromConfig function definition via AST — avoids
     # sourcing the whole script (which would launch the interactive menu).
@@ -34,7 +41,7 @@ BeforeAll {
         $true
     )
     $fnAst = $functions | Where-Object { $_.Name -eq 'Get-SOC2EnabledFromConfig' } | Select-Object -First 1
-    if (-not $fnAst) { throw 'Get-SOC2EnabledFromConfig not found in Start-EntraChecks.ps1' }
+    if (-not $fnAst) { throw "Get-SOC2EnabledFromConfig not found in $scriptPath" }
 
     # Define the function in this scope via dot-sourced scriptblock so tests
     # can invoke it directly. (Avoids Invoke-Expression per PSScriptAnalyzer.)
