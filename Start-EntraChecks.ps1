@@ -2519,31 +2519,87 @@ function Start-InteractiveMode {
 
 #region ==================== QUICK/SCHEDULED MODES ====================
 
-function Start-QuickMode {
-    Write-Host "`n[+] Quick Assessment Mode" -ForegroundColor Magenta
-    
-    if (-not $TenantName) {
-        $TenantName = Read-Host "Enter tenant name"
+function Invoke-EcfAssessmentSequence {
+    <#
+    .SYNOPSIS
+        Shared non-interactive assessment sequence — the common body of
+        Start-QuickMode / Start-ScheduledMode / Start-HybridMode.
+
+    .DESCRIPTION
+        Native App Plan, Phase 1 (incremental step 2): a pure,
+        behaviour-identical DRY consolidation. The three non-interactive
+        modes keep their mode-specific preamble (banner, tenant prompt,
+        auth) and call this single sequence. No logic changes — this is
+        the seam the runner's event lifecycle wraps in the next step.
+
+        Mode-varying inputs are explicit parameters; everything else is
+        read from the script-scope parameters exactly as the three modes
+        did inline.
+
+    .PARAMETER TenantNameValue
+        Resolved tenant name (modes pass their post-prompt value — the
+        sequence must not rely on the modes' function-local $TenantName).
+
+    .PARAMETER ModuleSet
+        The module set to assess (mode-specific).
+
+    .PARAMETER RunHybridCorrelation
+        Hybrid mode only: run the cloud↔on-prem correlation pass and
+        stash $script:HybridCorrelationData for Export-AssessmentResult.
+
+    .PARAMETER DoCompareWithLast
+        Quick mode only (gated on -CompareWithLast): emit the delta report.
+
+    .PARAMETER ErrorActionStop
+        Scheduled mode only: run the sequence under
+        $ErrorActionPreference='Stop' (the inline scheduled body set this
+        before these same calls; preserved here so the refactor is
+        behaviour-identical).
+    #>
+    param(
+        [Parameter(Mandatory)][string]$TenantNameValue,
+        [Parameter(Mandatory)][string[]]$ModuleSet,
+        [switch]$RunHybridCorrelation,
+        [switch]$DoCompareWithLast,
+        [switch]$ErrorActionStop
+    )
+
+    if ($ErrorActionStop) { $ErrorActionPreference = "Stop" }
+
+    $results = Invoke-ModuleAssessment -SelectedModules $ModuleSet -TenantName $TenantNameValue -OutputDir $OutputDirectory
+
+    $hybridCorrelation = $null
+    if ($RunHybridCorrelation) {
+        # Correlation pass. Script:Findings was populated by the module dispatcher.
+        $corrModule = Join-Path $script:ModulesPath "EntraChecks-HybridCorrelation.psm1"
+        if (Test-Path $corrModule) {
+            Import-Module $corrModule -Force
+            try {
+                $hybridCorrelation = Get-HybridIdentityCorrelation -Findings $script:Findings
+                Write-Host "    [OK] Correlated $($hybridCorrelation.CorrelationCount) principals across cloud + on-prem." -ForegroundColor Green
+                # PR 5 - push cross-surface findings back into the main pool so risk scoring,
+                # HTML / Excel / CSV renderers, and delta reporting all see them alongside
+                # standard findings. They carry Source='HybridCorrelation' so downstream code
+                # can group / filter if needed.
+                if ($hybridCorrelation.CrossSurfaceCount -gt 0) {
+                    $script:Findings += $hybridCorrelation.CrossSurfaceFindings
+                    Write-Host "    [OK] Emitted $($hybridCorrelation.CrossSurfaceCount) cross-surface finding(s)." -ForegroundColor Green
+                }
+            }
+            catch {
+                Write-Host "    [!] Correlation pass failed: $($_.Exception.Message)" -ForegroundColor Yellow
+            }
+        }
+        # Stash correlation output on a script-scope variable so Export-AssessmentResult can pick it up.
+        $script:HybridCorrelationData = $hybridCorrelation
     }
-    
-    if (-not $SkipAuthentication) {
-        Connect-EntraCheck
-    }
-    
-    $modulesToRun = if ($Modules -contains "All" -or -not $Modules) {
-        @("Core", "IdentityProtection", "Devices", "SecureScore", "Defender", "AzurePolicy", "Purview")
-    }
-    else {
-        $Modules
-    }
-    
-    $results = Invoke-ModuleAssessment -SelectedModules $modulesToRun -TenantName $TenantName -OutputDir $OutputDirectory
-    $reportDir = Export-AssessmentResult -OutputDir $OutputDirectory -TenantName $TenantName -IncludeUnified -GenerateComprehensiveReport:$GenerateComprehensiveReport -GenerateExecutiveSummary:$GenerateExecutiveSummary -GenerateExcelReport:$GenerateExcelReport -GenerateRemediationScripts:$GenerateRemediationScripts -HtmlReportSet $HtmlReportSet -HtmlDeepDiveDomains $HtmlDeepDiveDomains
+
+    $reportDir = Export-AssessmentResult -OutputDir $OutputDirectory -TenantName $TenantNameValue -IncludeUnified -GenerateComprehensiveReport:$GenerateComprehensiveReport -GenerateExecutiveSummary:$GenerateExecutiveSummary -GenerateExcelReport:$GenerateExcelReport -GenerateRemediationScripts:$GenerateRemediationScripts -HtmlReportSet $HtmlReportSet -HtmlDeepDiveDomains $HtmlDeepDiveDomains
 
     if ($SaveSnapshot) {
         $deltaModule = Join-Path $script:ModulesPath "EntraChecks-DeltaReporting.psm1"
         Import-Module $deltaModule -Force
-        Save-ComplianceSnapshot -OutputDirectory $script:SnapshotsPath -TenantName $TenantName `
+        Save-ComplianceSnapshot -OutputDirectory $script:SnapshotsPath -TenantName $TenantNameValue `
             -SecureScoreData $script:SecureScoreData `
             -DefenderComplianceData $script:DefenderComplianceData `
             -AzurePolicyData $script:AzurePolicyData `
@@ -2551,29 +2607,56 @@ function Start-QuickMode {
     }
 
     # Auto-run SOC 2 readiness when SOC2.Enabled = true in config. Browser
-    # open is suppressed in scripted Quick/Scheduled mode (automation friendly).
-    Invoke-SOC2ReadinessIfEnabled -TenantName $TenantName -OutputDirectory $OutputDirectory -OpenBrowser $false
+    # open is suppressed in scripted modes (automation friendly).
+    Invoke-SOC2ReadinessIfEnabled -TenantName $TenantNameValue -OutputDirectory $OutputDirectory -OpenBrowser $false
 
-    if ($CompareWithLast) {
+    if ($DoCompareWithLast) {
         $deltaModule = Join-Path $script:ModulesPath "EntraChecks-DeltaReporting.psm1"
         Import-Module $deltaModule -Force
-        
+
         # Get the two most recent snapshots and compare them
         $snapshots = Get-ComplianceSnapshots -SnapshotDirectory $script:SnapshotsPath
         if ($snapshots -and $snapshots.Count -ge 2) {
             $currentSnap = Import-ComplianceSnapshot -SnapshotPath $snapshots[0].FilePath
             $baselineSnap = Import-ComplianceSnapshot -SnapshotPath $snapshots[1].FilePath
             $delta = Compare-ComplianceSnapshots -BaselineSnapshot $baselineSnap -CurrentSnapshot $currentSnap
-            Export-DeltaReport -DeltaData $delta -OutputDirectory $OutputDirectory -TenantName $TenantName
+            Export-DeltaReport -DeltaData $delta -OutputDirectory $OutputDirectory -TenantName $TenantNameValue
         }
         else {
             Write-Host "[!] Need at least 2 snapshots for comparison. Save a snapshot first." -ForegroundColor Yellow
         }
     }
-    
+
+    return [pscustomobject]@{
+        Results = $results
+        ReportDir = $reportDir
+        HybridCorrelation = $hybridCorrelation
+    }
+}
+
+function Start-QuickMode {
+    Write-Host "`n[+] Quick Assessment Mode" -ForegroundColor Magenta
+
+    if (-not $TenantName) {
+        $TenantName = Read-Host "Enter tenant name"
+    }
+
+    if (-not $SkipAuthentication) {
+        Connect-EntraCheck
+    }
+
+    $modulesToRun = if ($Modules -contains "All" -or -not $Modules) {
+        @("Core", "IdentityProtection", "Devices", "SecureScore", "Defender", "AzurePolicy", "Purview")
+    }
+    else {
+        $Modules
+    }
+
+    $seq = Invoke-EcfAssessmentSequence -TenantNameValue $TenantName -ModuleSet $modulesToRun -DoCompareWithLast:$CompareWithLast
+
     Write-Host "`n[+] Assessment Complete" -ForegroundColor Green
-    Write-Host "    Duration: $($results.Duration.TotalMinutes.ToString('0.0')) minutes" -ForegroundColor Cyan
-    Write-Host "    Reports: $reportDir" -ForegroundColor Cyan
+    Write-Host "    Duration: $($seq.Results.Duration.TotalMinutes.ToString('0.0')) minutes" -ForegroundColor Cyan
+    Write-Host "    Reports: $($seq.ReportDir)" -ForegroundColor Cyan
 }
 
 function Start-HybridMode {
@@ -2600,52 +2683,13 @@ function Start-HybridMode {
     # Core cloud set + Hybrid (AD Connect health) + on-prem AD.
     $hybridModules = @('Core', 'IdentityProtection', 'Devices', 'SecureScore', 'Defender', 'AzurePolicy', 'Purview', 'ActiveDirectory')
 
-    $results = Invoke-ModuleAssessment -SelectedModules $hybridModules -TenantName $TenantName -OutputDir $OutputDirectory
-
-    # Correlation pass. Script:Findings was populated by the module dispatcher.
-    $corrModule = Join-Path $script:ModulesPath "EntraChecks-HybridCorrelation.psm1"
-    $hybridCorrelation = $null
-    if (Test-Path $corrModule) {
-        Import-Module $corrModule -Force
-        try {
-            $hybridCorrelation = Get-HybridIdentityCorrelation -Findings $script:Findings
-            Write-Host "    [OK] Correlated $($hybridCorrelation.CorrelationCount) principals across cloud + on-prem." -ForegroundColor Green
-            # PR 5 - push cross-surface findings back into the main pool so risk scoring,
-            # HTML / Excel / CSV renderers, and delta reporting all see them alongside
-            # standard findings. They carry Source='HybridCorrelation' so downstream code
-            # can group / filter if needed.
-            if ($hybridCorrelation.CrossSurfaceCount -gt 0) {
-                $script:Findings += $hybridCorrelation.CrossSurfaceFindings
-                Write-Host "    [OK] Emitted $($hybridCorrelation.CrossSurfaceCount) cross-surface finding(s)." -ForegroundColor Green
-            }
-        }
-        catch {
-            Write-Host "    [!] Correlation pass failed: $($_.Exception.Message)" -ForegroundColor Yellow
-        }
-    }
-    # Stash correlation output on a script-scope variable so Export-AssessmentResult can pick it up.
-    $script:HybridCorrelationData = $hybridCorrelation
-
-    $reportDir = Export-AssessmentResult -OutputDir $OutputDirectory -TenantName $TenantName -IncludeUnified -GenerateComprehensiveReport:$GenerateComprehensiveReport -GenerateExecutiveSummary:$GenerateExecutiveSummary -GenerateExcelReport:$GenerateExcelReport -GenerateRemediationScripts:$GenerateRemediationScripts -HtmlReportSet $HtmlReportSet -HtmlDeepDiveDomains $HtmlDeepDiveDomains
-
-    if ($SaveSnapshot) {
-        $deltaModule = Join-Path $script:ModulesPath "EntraChecks-DeltaReporting.psm1"
-        Import-Module $deltaModule -Force
-        Save-ComplianceSnapshot -OutputDirectory $script:SnapshotsPath -TenantName $TenantName `
-            -SecureScoreData $script:SecureScoreData `
-            -DefenderComplianceData $script:DefenderComplianceData `
-            -AzurePolicyData $script:AzurePolicyData `
-            -PurviewComplianceData $script:PurviewComplianceData
-    }
-
-    # Auto-run SOC 2 readiness when SOC2.Enabled = true in config.
-    Invoke-SOC2ReadinessIfEnabled -TenantName $TenantName -OutputDirectory $OutputDirectory -OpenBrowser $false
+    $seq = Invoke-EcfAssessmentSequence -TenantNameValue $TenantName -ModuleSet $hybridModules -RunHybridCorrelation
 
     Write-Host "`n[+] Hybrid Analysis Complete" -ForegroundColor Green
-    Write-Host "    Duration: $($results.Duration.TotalMinutes.ToString('0.0')) minutes" -ForegroundColor Cyan
-    Write-Host "    Reports: $reportDir" -ForegroundColor Cyan
-    if ($hybridCorrelation -and $hybridCorrelation.CorrelationCount -gt 0) {
-        Write-Host "    [!] $($hybridCorrelation.CorrelationCount) principals are flagged in BOTH cloud and on-prem. See the Hybrid Correlation section of the report." -ForegroundColor Yellow
+    Write-Host "    Duration: $($seq.Results.Duration.TotalMinutes.ToString('0.0')) minutes" -ForegroundColor Cyan
+    Write-Host "    Reports: $($seq.ReportDir)" -ForegroundColor Cyan
+    if ($seq.HybridCorrelation -and $seq.HybridCorrelation.CorrelationCount -gt 0) {
+        Write-Host "    [!] $($seq.HybridCorrelation.CorrelationCount) principals are flagged in BOTH cloud and on-prem. See the Hybrid Correlation section of the report." -ForegroundColor Yellow
     }
 }
 
@@ -2674,29 +2718,15 @@ function Start-ScheduledMode {
     else {
         $Modules
     }
-    
-    $results = Invoke-ModuleAssessment -SelectedModules $modulesToRun -TenantName $TenantName -OutputDir $OutputDirectory
-    Export-AssessmentResult -OutputDir $OutputDirectory -TenantName $TenantName -IncludeUnified -GenerateComprehensiveReport:$GenerateComprehensiveReport -GenerateExecutiveSummary:$GenerateExecutiveSummary -GenerateExcelReport:$GenerateExcelReport -GenerateRemediationScripts:$GenerateRemediationScripts -HtmlReportSet $HtmlReportSet -HtmlDeepDiveDomains $HtmlDeepDiveDomains
-    
-    if ($SaveSnapshot) {
-        $deltaModule = Join-Path $script:ModulesPath "EntraChecks-DeltaReporting.psm1"
-        Import-Module $deltaModule -Force
-        Save-ComplianceSnapshot -OutputDirectory $script:SnapshotsPath -TenantName $TenantName `
-            -SecureScoreData $script:SecureScoreData `
-            -DefenderComplianceData $script:DefenderComplianceData `
-            -AzurePolicyData $script:AzurePolicyData `
-            -PurviewComplianceData $script:PurviewComplianceData
-    }
 
-    # Auto-run SOC 2 readiness when SOC2.Enabled = true in config.
-    Invoke-SOC2ReadinessIfEnabled -TenantName $TenantName -OutputDirectory $OutputDirectory -OpenBrowser $false
+    $seq = Invoke-EcfAssessmentSequence -TenantNameValue $TenantName -ModuleSet $modulesToRun -ErrorActionStop
 
     # Return structured result for automation
     return @{
-        Success = $results.Errors.Count -eq 0
-        Duration = $results.Duration
-        Modules = $results.Modules
-        Errors = $results.Errors
+        Success = $seq.Results.Errors.Count -eq 0
+        Duration = $seq.Results.Duration
+        Modules = $seq.Results.Modules
+        Errors = $seq.Results.Errors
     }
 }
 
