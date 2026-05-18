@@ -254,3 +254,76 @@ Describe 'Runner parity — cooperative cancellation (Phase 3a)' {
         Should -Invoke Export-AssessmentResult -Times 1 -Exactly
     }
 }
+
+Describe 'Runner parity — orchestration-layer error taxonomy (Phase 3b)' {
+
+    BeforeEach {
+        $script:Tmp = Join-Path $env:TEMP "runner-err-$([guid]::NewGuid().ToString('N'))"
+        $null = New-Item -Path $script:Tmp -ItemType Directory -Force
+        $OutputDirectory = $script:Tmp
+        $null = $OutputDirectory
+        $script:Findings = @([pscustomobject]@{ Severity = 'High'; Description = 'h' })
+        $script:ErrReportDir = Join-Path $script:Tmp 'report'
+        $null = New-Item -Path $script:ErrReportDir -ItemType Directory -Force
+        Set-Content -LiteralPath (Join-Path $script:ErrReportDir 'EntraChecks-cockpit.html') -Value '<html></html>' -Encoding UTF8
+        Mock Invoke-SOC2ReadinessIfEnabled { }
+    }
+    AfterEach {
+        if (Test-Path $script:Tmp) { Remove-Item -LiteralPath $script:Tmp -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'a thrown Export-AssessmentResult becomes report.writeFailed (fatal): status Failed, Report failed, downstream skipped, no unhandled throw' {
+        Mock Invoke-ModuleAssessment { [pscustomobject]@{ Duration = [timespan]::FromMinutes(1); Errors = @(); Modules = @{ Core = 'ok' } } }
+        Mock Export-AssessmentResult { throw 'disk full' }
+        $seen = New-Object System.Collections.Generic.List[object]
+        $sink = { param($e) $seen.Add($e) | Out-Null }
+
+        # If the sequence let the exception escape, this call throws and
+        # the It fails — that IS the "no unhandled throw" assertion.
+        $seq = Invoke-EcfAssessmentSequence -TenantNameValue 'Contoso' -ModuleSet @('Core') `
+            -InvocationParams @{ TenantName = 'Contoso'; OutputDirectory = $script:Tmp } -EventSink $sink
+
+        $seq.Manifest.status | Should -BeExactly 'Failed'
+        $err = @($seq.Manifest.errors | Where-Object { $_.code -eq 'report.writeFailed' })
+        $err.Count | Should -Be 1
+        $err[0].fatal | Should -BeTrue
+        $err[0].remediation | Should -Not -BeNullOrEmpty
+        # Report phase recorded failed; SOC2 never started (fatal abort).
+        @($seen | Where-Object { $_.type -eq 'phase.completed' -and $_.phase -eq 'Report' -and $_.status -eq 'failed' }).Count | Should -Be 1
+        @($seen | Where-Object { $_.type -eq 'phase.started' -and $_.phase -eq 'SOC2' }).Count | Should -Be 0
+        Should -Invoke Invoke-SOC2ReadinessIfEnabled -Times 0 -Exactly
+    }
+
+    It 'a thrown Invoke-ModuleAssessment is engine.moduleFailed (non-fatal): run continues, status PartiallySucceeded' {
+        Mock Invoke-ModuleAssessment { throw 'graph 500' }
+        Mock Export-AssessmentResult { $script:ErrReportDir }
+
+        $seq = Invoke-EcfAssessmentSequence -TenantNameValue 'Contoso' -ModuleSet @('Core') `
+            -InvocationParams @{ TenantName = 'Contoso'; OutputDirectory = $script:Tmp } -EmitEvents
+        # Modules failed but Report still ran and produced an artifact.
+        Should -Invoke Export-AssessmentResult -Times 1 -Exactly
+        $seq.Manifest.status | Should -BeExactly 'PartiallySucceeded'
+        @($seq.Manifest.errors | Where-Object { $_.code -eq 'engine.moduleFailed' -and -not $_.fatal }).Count | Should -Be 1
+    }
+
+    It 'phases stay balanced even when a phase throws' {
+        Mock Invoke-ModuleAssessment { [pscustomobject]@{ Duration = [timespan]::Zero; Errors = @(); Modules = @{} } }
+        Mock Export-AssessmentResult { throw 'boom' }
+        $seen = New-Object System.Collections.Generic.List[object]
+        $sink = { param($e) $seen.Add($e) | Out-Null }
+        $null = Invoke-EcfAssessmentSequence -TenantNameValue 'Contoso' -ModuleSet @('Core') `
+            -InvocationParams @{ TenantName = 'Contoso'; OutputDirectory = $script:Tmp } -EventSink $sink
+        $st = @($seen | Where-Object { $_.type -eq 'phase.started' } | ForEach-Object { $_.phase } | Sort-Object)
+        $cp = @($seen | Where-Object { $_.type -eq 'phase.completed' } | ForEach-Object { $_.phase } | Sort-Object)
+        $st | Should -Be $cp
+    }
+
+    It 'no throw → unchanged Succeeded (regression)' {
+        Mock Invoke-ModuleAssessment { [pscustomobject]@{ Duration = [timespan]::FromMinutes(1); Errors = @(); Modules = @{ Core = 'ok' } } }
+        Mock Export-AssessmentResult { $script:ErrReportDir }
+        $seq = Invoke-EcfAssessmentSequence -TenantNameValue 'Contoso' -ModuleSet @('Core') `
+            -InvocationParams @{ TenantName = 'Contoso'; OutputDirectory = $script:Tmp } -EmitEvents
+        $seq.Manifest.status | Should -BeExactly 'Succeeded'
+        @($seq.Manifest.errors).Count | Should -Be 0
+    }
+}

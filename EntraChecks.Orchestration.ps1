@@ -2255,116 +2255,167 @@ function Invoke-EcfAssessmentSequence {
         return $false
     }
 
+    # Phase 3b — turn a thrown orchestration-layer error into a
+    # taxonomy'd Write-EcfError + a failed phase instead of an unhandled
+    # crash. Returns $true if the run should abort (catalog says the code
+    # is fatal). When there is no run context (legacy install without the
+    # runner module) it preserves the pre-3b fail-fast behaviour (the
+    # error used to propagate / abort the run).
+    function failPhase {
+        param([string]$Phase, [string]$Code, [string]$Message)
+        if ($useEvents) {
+            Write-EcfError -Context $RunContext -Code $Code -Message $Message
+            Complete-EcfPhase -Context $RunContext -Phase $Phase -Status 'failed'
+            return [bool]((Get-EcfErrorInfo -Code $Code).Fatal)
+        }
+        Write-Host "    [!] $Phase failed ($Code): $Message" -ForegroundColor Red
+        return $true
+    }
+
     # Null-init so the return object is safe if phases are skipped by a
-    # pre-run / mid-run cancel.
+    # pre-run / mid-run cancel or a fatal phase failure.
     $results = $null
     $reportDir = $null
     $hybridCorrelation = $null
+    $fatalAbort = $false
     $cancelled = [bool](checkpoint)   # pre-run cancel aborts before any work
 
     if (-not $cancelled) {
         phaseStart 'Modules'
-        $results = Invoke-ModuleAssessment -SelectedModules $ModuleSet -TenantName $TenantNameValue -OutputDir $OutputDirectory
+        try {
+            $results = Invoke-ModuleAssessment -SelectedModules $ModuleSet -TenantName $TenantNameValue -OutputDir $OutputDirectory
 
-        if ($RunHybridCorrelation) {
-            # Correlation pass. Script:Findings was populated by the module dispatcher.
-            $corrModule = Join-Path $script:ModulesPath "EntraChecks-HybridCorrelation.psm1"
-            if (Test-Path $corrModule) {
-                Import-Module $corrModule -Force
-                try {
-                    $hybridCorrelation = Get-HybridIdentityCorrelation -Findings $script:Findings
-                    narrate "    [OK] Correlated $($hybridCorrelation.CorrelationCount) principals across cloud + on-prem." 'info' 'Green'
-                    # PR 5 - push cross-surface findings back into the main pool so risk scoring,
-                    # HTML / Excel / CSV renderers, and delta reporting all see them alongside
-                    # standard findings. They carry Source='HybridCorrelation' so downstream code
-                    # can group / filter if needed.
-                    if ($hybridCorrelation.CrossSurfaceCount -gt 0) {
-                        $script:Findings += $hybridCorrelation.CrossSurfaceFindings
-                        narrate "    [OK] Emitted $($hybridCorrelation.CrossSurfaceCount) cross-surface finding(s)." 'info' 'Green'
+            if ($RunHybridCorrelation) {
+                # Correlation pass. Script:Findings was populated by the module dispatcher.
+                $corrModule = Join-Path $script:ModulesPath "EntraChecks-HybridCorrelation.psm1"
+                if (Test-Path $corrModule) {
+                    Import-Module $corrModule -Force
+                    try {
+                        $hybridCorrelation = Get-HybridIdentityCorrelation -Findings $script:Findings
+                        narrate "    [OK] Correlated $($hybridCorrelation.CorrelationCount) principals across cloud + on-prem." 'info' 'Green'
+                        # PR 5 - push cross-surface findings back into the main pool so risk scoring,
+                        # HTML / Excel / CSV renderers, and delta reporting all see them alongside
+                        # standard findings. They carry Source='HybridCorrelation' so downstream code
+                        # can group / filter if needed.
+                        if ($hybridCorrelation.CrossSurfaceCount -gt 0) {
+                            $script:Findings += $hybridCorrelation.CrossSurfaceFindings
+                            narrate "    [OK] Emitted $($hybridCorrelation.CrossSurfaceCount) cross-surface finding(s)." 'info' 'Green'
+                        }
+                    }
+                    catch {
+                        narrate "    [!] Correlation pass failed: $($_.Exception.Message)" 'warn' 'Yellow'
                     }
                 }
-                catch {
-                    narrate "    [!] Correlation pass failed: $($_.Exception.Message)" 'warn' 'Yellow'
-                }
+                # Stash correlation output on a script-scope variable so Export-AssessmentResult can pick it up.
+                $script:HybridCorrelationData = $hybridCorrelation
             }
-            # Stash correlation output on a script-scope variable so Export-AssessmentResult can pick it up.
-            $script:HybridCorrelationData = $hybridCorrelation
+            phaseDone 'Modules'
         }
-        phaseDone 'Modules'
+        catch {
+            # engine.moduleFailed is non-fatal — keep going so a partial
+            # report is still produced from whatever findings exist.
+            if (failPhase 'Modules' 'engine.moduleFailed' $_.Exception.Message) { $fatalAbort = $true }
+        }
     }
 
-    if (-not $cancelled -and (checkpoint)) { $cancelled = $true }
-    if (-not $cancelled) {
+    if (-not $cancelled -and -not $fatalAbort -and (checkpoint)) { $cancelled = $true }
+    if (-not $cancelled -and -not $fatalAbort) {
         phaseStart 'Report'
-        $reportDir = Export-AssessmentResult -OutputDir $OutputDirectory -TenantName $TenantNameValue -IncludeUnified -GenerateComprehensiveReport:$GenerateComprehensiveReport -GenerateExecutiveSummary:$GenerateExecutiveSummary -GenerateExcelReport:$GenerateExcelReport -GenerateRemediationScripts:$GenerateRemediationScripts -HtmlReportSet $HtmlReportSet -HtmlDeepDiveDomains $HtmlDeepDiveDomains
-        if ($useEvents -and $reportDir -and (Test-Path -LiteralPath $reportDir)) {
-            # Best-effort artifact enumeration so GUI run-history can open
-            # outputs blind. Precise per-renderer enumeration is hardened in
-            # step 4 when the orchestration moves into the module.
-            foreach ($f in (Get-ChildItem -LiteralPath $reportDir -File -ErrorAction SilentlyContinue)) {
-                $kind = switch -Wildcard ($f.Name) {
-                    '*.xlsx' { 'excel'; break }
-                    '*.csv' { 'csv'; break }
-                    '*.json' { 'json'; break }
-                    '*cockpit*.html' { 'cockpit-html'; break }
-                    '*.html' { 'legacy-html'; break }
-                    default { $null }
+        try {
+            $reportDir = Export-AssessmentResult -OutputDir $OutputDirectory -TenantName $TenantNameValue -IncludeUnified -GenerateComprehensiveReport:$GenerateComprehensiveReport -GenerateExecutiveSummary:$GenerateExecutiveSummary -GenerateExcelReport:$GenerateExcelReport -GenerateRemediationScripts:$GenerateRemediationScripts -HtmlReportSet $HtmlReportSet -HtmlDeepDiveDomains $HtmlDeepDiveDomains
+            if ($useEvents -and $reportDir -and (Test-Path -LiteralPath $reportDir)) {
+                # Best-effort artifact enumeration so GUI run-history can open
+                # outputs blind. Precise per-renderer enumeration is hardened in
+                # step 4 when the orchestration moves into the module.
+                foreach ($f in (Get-ChildItem -LiteralPath $reportDir -File -ErrorAction SilentlyContinue)) {
+                    $kind = switch -Wildcard ($f.Name) {
+                        '*.xlsx' { 'excel'; break }
+                        '*.csv' { 'csv'; break }
+                        '*.json' { 'json'; break }
+                        '*cockpit*.html' { 'cockpit-html'; break }
+                        '*.html' { 'legacy-html'; break }
+                        default { $null }
+                    }
+                    if ($kind) { Add-EcfArtifact -Context $RunContext -Kind $kind -Path $f.FullName }
                 }
-                if ($kind) { Add-EcfArtifact -Context $RunContext -Kind $kind -Path $f.FullName }
             }
+            phaseDone 'Report'
         }
-        phaseDone 'Report'
+        catch {
+            # report.writeFailed is fatal — no report means nothing
+            # downstream is worth doing; abort the remaining phases.
+            if (failPhase 'Report' 'report.writeFailed' $_.Exception.Message) { $fatalAbort = $true }
+        }
     }
 
-    if (-not $cancelled -and (checkpoint)) { $cancelled = $true }
-    if (-not $cancelled -and -not $SkipSequenceSnapshot -and $SaveSnapshot) {
+    if (-not $cancelled -and -not $fatalAbort -and (checkpoint)) { $cancelled = $true }
+    if (-not $cancelled -and -not $fatalAbort -and -not $SkipSequenceSnapshot -and $SaveSnapshot) {
         phaseStart 'Snapshot'
-        $deltaModule = Join-Path $script:ModulesPath "EntraChecks-DeltaReporting.psm1"
-        Import-Module $deltaModule -Force
-        Save-ComplianceSnapshot -OutputDirectory $script:SnapshotsPath -TenantName $TenantNameValue `
-            -SecureScoreData $script:SecureScoreData `
-            -DefenderComplianceData $script:DefenderComplianceData `
-            -AzurePolicyData $script:AzurePolicyData `
-            -PurviewComplianceData $script:PurviewComplianceData
-        phaseDone 'Snapshot'
+        try {
+            $deltaModule = Join-Path $script:ModulesPath "EntraChecks-DeltaReporting.psm1"
+            Import-Module $deltaModule -Force
+            Save-ComplianceSnapshot -OutputDirectory $script:SnapshotsPath -TenantName $TenantNameValue `
+                -SecureScoreData $script:SecureScoreData `
+                -DefenderComplianceData $script:DefenderComplianceData `
+                -AzurePolicyData $script:AzurePolicyData `
+                -PurviewComplianceData $script:PurviewComplianceData
+            phaseDone 'Snapshot'
+        }
+        catch {
+            # snapshot.failed is non-fatal — the assessment + report
+            # already succeeded; just record it and continue.
+            if (failPhase 'Snapshot' 'snapshot.failed' $_.Exception.Message) { $fatalAbort = $true }
+        }
     }
 
-    if (-not $cancelled -and (checkpoint)) { $cancelled = $true }
-    if (-not $cancelled) {
+    if (-not $cancelled -and -not $fatalAbort -and (checkpoint)) { $cancelled = $true }
+    if (-not $cancelled -and -not $fatalAbort) {
         # Auto-run SOC 2 readiness when SOC2.Enabled = true in config. Browser
         # open is suppressed in scripted modes (automation friendly); the
         # interactive menu passes -OpenSoc2Browser to preserve its behaviour.
         phaseStart 'SOC2'
-        Invoke-SOC2ReadinessIfEnabled -TenantName $TenantNameValue -OutputDirectory $OutputDirectory -OpenBrowser ([bool]$OpenSoc2Browser)
-        phaseDone 'SOC2'
+        try {
+            Invoke-SOC2ReadinessIfEnabled -TenantName $TenantNameValue -OutputDirectory $OutputDirectory -OpenBrowser ([bool]$OpenSoc2Browser)
+            phaseDone 'SOC2'
+        }
+        catch {
+            # SOC 2 readiness is auxiliary + config-gated; treat a failure
+            # as non-fatal so the core assessment still completes.
+            if (failPhase 'SOC2' 'internal' $_.Exception.Message) { $fatalAbort = $true }
+        }
     }
 
-    if (-not $cancelled -and (checkpoint)) { $cancelled = $true }
-    if (-not $cancelled -and $DoCompareWithLast) {
+    if (-not $cancelled -and -not $fatalAbort -and (checkpoint)) { $cancelled = $true }
+    if (-not $cancelled -and -not $fatalAbort -and $DoCompareWithLast) {
         phaseStart 'Snapshot'
-        $deltaModule = Join-Path $script:ModulesPath "EntraChecks-DeltaReporting.psm1"
-        Import-Module $deltaModule -Force
+        try {
+            $deltaModule = Join-Path $script:ModulesPath "EntraChecks-DeltaReporting.psm1"
+            Import-Module $deltaModule -Force
 
-        # Get the two most recent snapshots and compare them
-        $snapshots = Get-ComplianceSnapshots -SnapshotDirectory $script:SnapshotsPath
-        if ($snapshots -and $snapshots.Count -ge 2) {
-            $currentSnap = Import-ComplianceSnapshot -SnapshotPath $snapshots[0].FilePath
-            $baselineSnap = Import-ComplianceSnapshot -SnapshotPath $snapshots[1].FilePath
-            $delta = Compare-ComplianceSnapshots -BaselineSnapshot $baselineSnap -CurrentSnapshot $currentSnap
-            $deltaPath = Export-DeltaReport -DeltaData $delta -OutputDirectory $OutputDirectory -TenantName $TenantNameValue
-            if ($useEvents -and $deltaPath -and (Test-Path -LiteralPath $deltaPath -ErrorAction SilentlyContinue)) {
-                Add-EcfArtifact -Context $RunContext -Kind 'delta' -Path $deltaPath
-            }
-            phaseDone 'Snapshot'
-        }
-        else {
-            if ($useEvents) {
-                Write-EcfWarning -Context $RunContext -Message 'Need at least 2 snapshots for comparison. Save a snapshot first.' -Code 'snapshot.insufficient'
+            # Get the two most recent snapshots and compare them
+            $snapshots = Get-ComplianceSnapshots -SnapshotDirectory $script:SnapshotsPath
+            if ($snapshots -and $snapshots.Count -ge 2) {
+                $currentSnap = Import-ComplianceSnapshot -SnapshotPath $snapshots[0].FilePath
+                $baselineSnap = Import-ComplianceSnapshot -SnapshotPath $snapshots[1].FilePath
+                $delta = Compare-ComplianceSnapshots -BaselineSnapshot $baselineSnap -CurrentSnapshot $currentSnap
+                $deltaPath = Export-DeltaReport -DeltaData $delta -OutputDirectory $OutputDirectory -TenantName $TenantNameValue
+                if ($useEvents -and $deltaPath -and (Test-Path -LiteralPath $deltaPath -ErrorAction SilentlyContinue)) {
+                    Add-EcfArtifact -Context $RunContext -Kind 'delta' -Path $deltaPath
+                }
+                phaseDone 'Snapshot'
             }
             else {
-                Write-Host "[!] Need at least 2 snapshots for comparison. Save a snapshot first." -ForegroundColor Yellow
+                if ($useEvents) {
+                    Write-EcfWarning -Context $RunContext -Message 'Need at least 2 snapshots for comparison. Save a snapshot first.' -Code 'snapshot.insufficient'
+                }
+                else {
+                    Write-Host "[!] Need at least 2 snapshots for comparison. Save a snapshot first." -ForegroundColor Yellow
+                }
+                phaseDone 'Snapshot' 'skipped'
             }
-            phaseDone 'Snapshot' 'skipped'
+        }
+        catch {
+            if (failPhase 'Snapshot' 'snapshot.failed' $_.Exception.Message) { $fatalAbort = $true }
         }
     }
 

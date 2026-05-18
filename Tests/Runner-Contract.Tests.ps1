@@ -398,3 +398,65 @@ Describe 'Cancellation primitives (Phase 3a)' {
         (Test-Path (Get-EcfCancelSentinelPath -Context $ctx)) | Should -BeFalse
     }
 }
+
+Describe 'Error taxonomy (Phase 3b)' {
+
+    It 'Get-EcfErrorInfo is pure + total: every catalog code maps to {Code,Fatal,Remediation}' {
+        foreach ($code in @('auth.failed', 'auth.cancelled', 'auth.insufficientPrivileges',
+                'prereq.moduleMissing', 'prereq.azContextMissing', 'engine.moduleFailed',
+                'report.writeFailed', 'snapshot.failed', 'snapshot.insufficient', 'cancelled', 'internal')) {
+            $i = Get-EcfErrorInfo -Code $code
+            $i.Code | Should -BeExactly $code
+            $i.Remediation | Should -Not -BeNullOrEmpty
+            $i.Fatal | Should -BeOfType [bool]
+        }
+    }
+
+    It 'an unknown code degrades to internal (keeps the code, never throws)' {
+        $i = Get-EcfErrorInfo -Code 'totally.made.up'
+        $i.Code | Should -BeExactly 'totally.made.up'
+        $i.Fatal | Should -BeFalse
+        $i.Remediation | Should -BeExactly (Get-EcfErrorInfo -Code 'internal').Remediation
+    }
+
+    It 'fatal defaults come from the catalog (e.g. report.writeFailed is fatal)' {
+        (Get-EcfErrorInfo -Code 'report.writeFailed').Fatal | Should -BeTrue
+        (Get-EcfErrorInfo -Code 'prereq.azContextMissing').Fatal | Should -BeFalse
+    }
+
+    It 'Write-EcfError auto-fills remediation + fatality from the code' {
+        $ctx = New-EcfRunContext -RunId 'et1' -Params @{} -OutputDirectory $env:TEMP
+        Write-EcfError -Context $ctx -Code 'report.writeFailed' -Message 'disk full'
+        $err = $ctx.Errors[0]
+        $err.code | Should -BeExactly 'report.writeFailed'
+        $err.fatal | Should -BeTrue
+        $err.remediation | Should -Not -BeNullOrEmpty
+        # surfaced on the emitted log event too
+        $ev = $ctx.Events | Where-Object { $_.type -eq 'log' -and $_.code -eq 'report.writeFailed' } | Select-Object -Last 1
+        $ev.remediation | Should -BeExactly $err.remediation
+        $ev.fatal | Should -BeTrue
+    }
+
+    It 'explicit -Fatal / -Remediation override the catalog' {
+        $ctx = New-EcfRunContext -RunId 'et2' -Params @{} -OutputDirectory $env:TEMP
+        Write-EcfError -Context $ctx -Code 'prereq.azContextMissing' -Message 'no az' -Fatal -Remediation 'custom hint'
+        $ctx.Errors[0].fatal | Should -BeTrue
+        $ctx.Errors[0].remediation | Should -BeExactly 'custom hint'
+    }
+
+    It 'backward compat: an ad-hoc code with no -Fatal stays non-fatal (now with a hint)' {
+        $ctx = New-EcfRunContext -RunId 'et3' -Params @{} -OutputDirectory $env:TEMP
+        Write-EcfError -Context $ctx -Code 'E2' -Message 'soft'
+        $ctx.Errors[0].fatal | Should -BeFalse
+        $ctx.Errors[0].remediation | Should -Not -BeNullOrEmpty
+    }
+
+    It 'the manifest + run-history errors[] carry remediation' {
+        $ctx = New-EcfRunContext -RunId 'et4' -Params @{} -OutputDirectory $env:TEMP
+        Start-EcfRun -Context $ctx
+        Write-EcfError -Context $ctx -Code 'engine.moduleFailed' -Message 'mod x failed'
+        $m = New-EcfRunManifest -Context $ctx
+        $m.errors[0].remediation | Should -Not -BeNullOrEmpty
+        $m.errors[0].code | Should -BeExactly 'engine.moduleFailed'
+    }
+}

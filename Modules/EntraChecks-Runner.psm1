@@ -328,10 +328,57 @@ function Write-EcfWarning {
     }
 }
 
+# Phase 3b — the fixed error-code vocabulary. Each entry pins a default
+# fatality and a human remediation hint a UI can show instead of raw
+# exception text. Additive within v1 (the manifest errors[] gains a
+# `remediation` field; the code set is documented + total — unknown
+# codes degrade to `internal`, never throw).
+$script:EcfErrorCatalog = [ordered]@{
+    'auth.failed' = @{ Fatal = $true; Remediation = 'Authentication to Microsoft Graph/Azure failed. Re-run and sign in, or use -SkipAuthentication with a pre-authenticated session.' }
+    'auth.cancelled' = @{ Fatal = $true; Remediation = 'Sign-in was cancelled or timed out. Re-run and complete the device-code / browser prompt.' }
+    'auth.insufficientPrivileges' = @{ Fatal = $true; Remediation = 'The signed-in identity lacks the required read scopes. Sign in as Global Reader (or consent the requested scopes) and re-run.' }
+    'prereq.moduleMissing' = @{ Fatal = $true; Remediation = 'A required PowerShell module is not installed. Install the Microsoft.Graph / Az modules (see Install-Prerequisites.ps1) and re-run.' }
+    'prereq.azContextMissing' = @{ Fatal = $false; Remediation = 'No Azure context. Run Connect-AzAccount before the assessment to include the Azure-side checks; the Graph-only checks still ran.' }
+    'engine.moduleFailed' = @{ Fatal = $false; Remediation = 'An assessment module failed. The run continued; review the module error and re-run that module to fill the gap.' }
+    'report.writeFailed' = @{ Fatal = $true; Remediation = 'Writing the report output failed. Check the output directory exists and is writable, then re-run.' }
+    'snapshot.failed' = @{ Fatal = $false; Remediation = 'Saving / comparing the compliance snapshot failed. The assessment itself completed; retry the snapshot step.' }
+    'snapshot.insufficient' = @{ Fatal = $false; Remediation = 'At least two snapshots are required to compare. Save a snapshot now and compare on a later run.' }
+    'cancelled' = @{ Fatal = $false; Remediation = 'The run was cancelled by request. Re-run to produce a complete assessment.' }
+    'internal' = @{ Fatal = $false; Remediation = 'An unexpected error occurred. Re-run with -Verbose and report the message if it persists.' }
+}
+
+<#
+.SYNOPSIS
+    Pure, total mapper: a code → its catalogued { Code; Fatal;
+    Remediation }. An unknown/unmapped code degrades to the `internal`
+    entry (keeping the caller's code so it is still visible) and never
+    throws. Used by Write-EcfError to auto-fill and by tests/consumers.
+#>
+function Get-EcfErrorInfo {
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param([Parameter(Mandatory)][string]$Code)
+
+    if ($script:EcfErrorCatalog.Contains($Code)) {
+        $e = $script:EcfErrorCatalog[$Code]
+        return [pscustomobject]@{ Code = $Code; Fatal = [bool]$e.Fatal; Remediation = [string]$e.Remediation }
+    }
+    $gen = $script:EcfErrorCatalog['internal']
+    return [pscustomobject]@{ Code = $Code; Fatal = [bool]$gen.Fatal; Remediation = [string]$gen.Remediation }
+}
+
 <#
 .SYNOPSIS
     Records a structured error (also surfaced in the manifest). Fatal
     errors drive the terminal status to Failed.
+
+    Phase 3b: -Code is matched against the fixed vocabulary
+    ($script:EcfErrorCatalog). When -Remediation is omitted it is
+    auto-filled from the catalog; when -Fatal is not explicitly passed
+    the catalog's default fatality applies (an unknown code → the
+    `internal` defaults: non-fatal, generic hint — so pre-3b callers
+    that passed an ad-hoc code without -Fatal keep their old non-fatal
+    behaviour, now with a remediation string added).
 #>
 function Write-EcfError {
     [CmdletBinding()]
@@ -340,18 +387,25 @@ function Write-EcfError {
         [Parameter(Mandatory)][pscustomobject]$Context,
         [Parameter(Mandatory)][string]$Message,
         [string]$Code = 'error',
+        [string]$Remediation,
         [switch]$Fatal
     )
+    $info = Get-EcfErrorInfo -Code $Code
+    $isFatal = if ($PSBoundParameters.ContainsKey('Fatal')) { [bool]$Fatal } else { [bool]$info.Fatal }
+    $remed = if ($PSBoundParameters.ContainsKey('Remediation')) { [string]$Remediation } else { [string]$info.Remediation }
+
     $Context.Errors.Add([pscustomobject]@{
             code = $Code
             message = $Message
-            fatal = [bool]$Fatal
+            fatal = $isFatal
+            remediation = $remed
         }) | Out-Null
     Write-EcfEvent -Context $Context -Type 'log' -Data @{
         level = 'error'
         message = $Message
         code = $Code
-        fatal = [bool]$Fatal
+        fatal = $isFatal
+        remediation = $remed
     }
 }
 
@@ -636,6 +690,7 @@ Export-ModuleMember -Function @(
     'Write-EcfLog',
     'Write-EcfWarning',
     'Write-EcfError',
+    'Get-EcfErrorInfo',
     'Write-EcfAuthInfo',
     'Add-EcfArtifact',
     'Get-EcfRunStatus',
