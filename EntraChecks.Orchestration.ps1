@@ -1038,7 +1038,7 @@ function Invoke-SOC2ReadinessFromMenu {
     if (-not $SkipCoreSeed -and (-not $script:Findings -or $script:Findings.Count -eq 0)) {
         Write-Host "  [i] No prior findings in this session; running Core assessment to seed SOC 2 mapping..." -ForegroundColor Gray
         if (-not $TenantName) { $TenantName = Read-Host "  Enter tenant name" }
-        if (-not $SkipAuthentication) { Connect-EntraCheck }
+        if (-not $SkipAuthentication) { $null = Connect-EntraCheck }
         $null = Invoke-ModuleAssessment -SelectedModules @('Core') -TenantName $TenantName -OutputDir $OutputDirectory
     }
 
@@ -1881,7 +1881,7 @@ function Start-InteractiveMode {
                 }
                 
                 if (-not $SkipAuthentication) {
-                    Connect-EntraCheck
+                    $null = Connect-EntraCheck
                 }
                 
                 $allModules = @("Core", "IdentityProtection", "Devices", "SecureScore", "Defender", "AzurePolicy", "Purview")
@@ -1943,7 +1943,7 @@ function Start-InteractiveMode {
                                 }
 
                                 if (-not $SkipAuthentication) {
-                                    Connect-EntraCheck
+                                    $null = Connect-EntraCheck
                                 }
 
                                 # Phase 2 (2c): same single runner seam +
@@ -2073,7 +2073,7 @@ function Start-InteractiveMode {
             "A" {
                 # Authentication
                 Write-Host ""
-                Connect-EntraCheck
+                $null = Connect-EntraCheck
                 Read-Host "`n  Press Enter to continue"
             }
 
@@ -2235,7 +2235,7 @@ function Invoke-EcfAssessmentSequence {
         # triggers cancellation at the next phase checkpoint.
         [ref]$CancelFlag,
         # Phase 3c — auth as an observed phase. The caller injects its
-        # existing auth logic (e.g. { Connect-EntraCheck }); no auth code
+        # existing auth logic (e.g. { $null = Connect-EntraCheck }); no auth code
         # moves into the runner (the Phase 1 substrate rule). When
         # supplied, the sequence runs it inside a wrapped `Auth` phase
         # FIRST and emits auth.browser/auth.devicecode (per -AuthMethod)
@@ -2509,7 +2509,7 @@ function Start-QuickMode {
     }
 
     if (-not $SkipAuthentication) {
-        Connect-EntraCheck
+        $null = Connect-EntraCheck
     }
 
     $modulesToRun = if ($Modules -contains "All" -or -not $Modules) {
@@ -2544,7 +2544,7 @@ function Start-HybridMode {
     }
 
     if (-not $SkipAuthentication) {
-        Connect-EntraCheck
+        $null = Connect-EntraCheck
     }
 
     # Core cloud set + Hybrid (AD Connect health) + on-prem AD.

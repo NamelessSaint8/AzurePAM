@@ -74,7 +74,10 @@ Describe 'Menu run actions route through the runner seam' {
 
     It 'preserves the interactive UX: tenant prompt, Connect preamble, press-enter' {
         $script:Menu | Should -Match 'Enter tenant name'
-        $script:Menu | Should -Match 'if \(-not \$SkipAuthentication\) \{\s*Connect-EntraCheck'
+        # Connect preamble preserved. The real-run hardening fix
+        # suppresses the return ($null = Connect-EntraCheck) so the
+        # function's success bool can't leak to stdout — allow that.
+        $script:Menu | Should -Match 'if \(-not \$SkipAuthentication\) \{\s*(\$null = )?Connect-EntraCheck'
         $script:Menu | Should -Match 'Press Enter to continue'
     }
 
