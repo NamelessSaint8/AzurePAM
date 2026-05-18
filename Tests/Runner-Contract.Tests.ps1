@@ -270,3 +270,37 @@ Describe 'NDJSON emission + run history' {
         @($ctx.Events | Where-Object { $_.type -eq 'run.result' }).Count | Should -Be 1
     }
 }
+
+Describe 'In-process EventSink (Phase 2 2a)' {
+
+    It 'receives every emitted event object, in order, same instances' {
+        $seen = New-Object System.Collections.Generic.List[object]
+        $sink = { param($e) $seen.Add($e) | Out-Null }
+        $ctx = New-EcfRunContext -RunId 'sink1' -Params @{ TenantName = 'C' } -EventSink $sink
+        Start-EcfRun -Context $ctx
+        Start-EcfPhase -Context $ctx -Phase 'Core'
+        Complete-EcfPhase -Context $ctx -Phase 'Core' -Status ok
+        $null = Complete-EcfRun -Context $ctx -Summary @{ findings = 0 }
+
+        @($seen | ForEach-Object { $_.type }) | Should -Be @($ctx.Events | ForEach-Object { $_.type })
+        # Same object instances, not copies.
+        [object]::ReferenceEquals($seen[0], $ctx.Events[0]) | Should -BeTrue
+        $seen[0].type | Should -BeExactly 'run.started'
+        $seen[-1].type | Should -BeExactly 'run.result'
+    }
+
+    It 'a throwing sink never breaks the run (event still recorded + manifest valid)' {
+        $ctx = New-EcfRunContext -RunId 'sink2' -Params @{} -EventSink { param($e) throw 'renderer boom' }
+        { Start-EcfRun -Context $ctx } | Should -Not -Throw
+        $m = Complete-EcfRun -Context $ctx -Summary @{}
+        $m.status | Should -BeExactly 'Succeeded'
+        @($ctx.Events | Where-Object { $_.type -eq 'run.started' }).Count | Should -Be 1
+    }
+
+    It 'no sink is the default and changes nothing' {
+        $ctx = New-EcfRunContext -RunId 'sink3' -Params @{}
+        $ctx.EventSink | Should -BeNullOrEmpty
+        Start-EcfRun -Context $ctx
+        $ctx.Events[0].type | Should -BeExactly 'run.started'
+    }
+}

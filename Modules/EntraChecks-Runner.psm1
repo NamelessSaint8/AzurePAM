@@ -111,7 +111,15 @@ function New-EcfRunContext {
         [string]$RunId,
         [AllowNull()]$Params,
         [string]$OutputDirectory = '',
-        [switch]$EmitEvents
+        [switch]$EmitEvents,
+        # Native App Plan, Phase 2 (2a). Optional in-process consumer.
+        # When supplied, every emitted event object is also handed to
+        # this scriptblock (same object as the in-memory list / NDJSON —
+        # no serialization round-trip), so an in-process renderer (the
+        # re-platformed TUI's Show-EcfRunStream) can react live without
+        # parsing the runner's own stdout. Additive: the contract /
+        # schema is unchanged; the sink only observes.
+        [scriptblock]$EventSink
     )
 
     if (-not $RunId) { $RunId = [guid]::NewGuid().ToString() }
@@ -123,6 +131,7 @@ function New-EcfRunContext {
         EndedUtc = ''
         OutputDirectory = $OutputDirectory
         EmitEvents = [bool]$EmitEvents
+        EventSink = $EventSink
         SafeParams = (ConvertTo-EcfSafeParams -Params $Params)
         Events = (New-Object System.Collections.Generic.List[object])
         Artifacts = (New-Object System.Collections.Generic.List[object])
@@ -168,6 +177,14 @@ function Write-EcfEvent {
 
     $obj = [pscustomobject]$evt
     $Context.Events.Add($obj) | Out-Null
+
+    # In-process sink (Phase 2): hand the same object to a live consumer.
+    # A presentation/renderer fault must never break the assessment, so
+    # sink failures are swallowed (the event is still in the list + NDJSON).
+    if ($Context.PSObject.Properties['EventSink'] -and $Context.EventSink) {
+        try { & $Context.EventSink $obj }
+        catch { Write-Verbose "EventSink threw (ignored): $_" }
+    }
 
     if ($Context.EmitEvents) {
         $line = $obj | ConvertTo-Json -Depth 12 -Compress
