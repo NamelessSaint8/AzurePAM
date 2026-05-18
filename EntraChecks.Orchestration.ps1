@@ -234,6 +234,18 @@ function Connect-EntraCheck {
         Write-Host "    Connecting to Microsoft Graph..." -ForegroundColor Gray
         Write-Log -Level INFO -Message "Connecting to Microsoft Graph API" -Category "Authentication"
 
+        # Preflight: a missing Microsoft.Graph module surfaces a raw
+        # "The term 'Connect-MgGraph' is not recognized" + an ERROR-level
+        # log, which reads like a hard failure. Detect it up front and
+        # degrade with an actionable install hint instead.
+        if (-not (Get-Command -Name 'Connect-MgGraph' -ErrorAction SilentlyContinue)) {
+            Write-Host "    [!] Microsoft.Graph module is not installed." -ForegroundColor Yellow
+            Write-Host "    [i] Install prerequisites first:  .\Install-Prerequisites.ps1" -ForegroundColor Gray
+            Write-Host "    [i] (or: Install-Module Microsoft.Graph -Scope CurrentUser)" -ForegroundColor Gray
+            Write-Log -Level WARN -Message "Microsoft Graph authentication skipped - Microsoft.Graph module not installed" -Category "Authentication"
+            return $false
+        }
+
         try {
             # Check if already connected with sufficient scopes
             $existingContext = Get-EcfMgContextSafe
@@ -294,6 +306,17 @@ function Connect-EntraCheck {
     if (-not $GraphOnly) {
         Write-Host "    Connecting to Azure..." -ForegroundColor Gray
         Write-Log -Level INFO -Message "Connecting to Azure" -Category "Authentication"
+
+        # Same preflight as Graph: a missing Az module would otherwise
+        # raise a raw CommandNotFound. Azure is non-fatal (Defender /
+        # Azure Policy just go unavailable), so warn and skip cleanly.
+        if (-not (Get-Command -Name 'Connect-AzAccount' -ErrorAction SilentlyContinue)) {
+            Write-Host "    [!] Az module is not installed - skipping Azure sign-in." -ForegroundColor Yellow
+            Write-Host "    [i] Defender and Azure Policy modules will be unavailable." -ForegroundColor Gray
+            Write-Host "    [i] Install prerequisites:  .\Install-Prerequisites.ps1" -ForegroundColor Gray
+            Write-Log -Level WARN -Message "Azure authentication skipped - Az module not installed" -Category "Authentication"
+            return $true
+        }
 
         try {
             $azContext = Get-EcfAzContextSafe
