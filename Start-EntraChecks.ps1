@@ -155,7 +155,14 @@ param(
 
     [Parameter()]
     [ValidateSet('SecureScore', 'DefenderCompliance', 'AzurePolicy', 'PurviewCompliance', 'Delta', 'PrivilegedIdentity')]
-    [string[]]$HtmlDeepDiveDomains
+    [string[]]$HtmlDeepDiveDomains,
+
+    # Native App Plan, Phase 1. When set, the non-interactive modes
+    # (Quick/Scheduled/Hybrid) stream the runner's versioned NDJSON
+    # event contract to stdout. Off by default: the run is silent
+    # (the run-history manifest is still written). The Phase 2 console
+    # renderer is what restores rich progress for interactive CLI use.
+    [switch]$EmitEvents
 )
 
 # Default comprehensive report and executive summary to enabled
@@ -314,6 +321,16 @@ if (Test-Path $dsModule) {
 $schemaModule = Join-Path $script:ModulesPath "EntraChecks-FindingSchema.psm1"
 if (Test-Path $schemaModule) {
     Import-Module $schemaModule -Force -ErrorAction SilentlyContinue
+}
+
+# Native App Plan, Phase 1 — the headless-runner contract. The
+# non-interactive modes wrap Invoke-EcfAssessmentSequence with this
+# module's NDJSON event lifecycle + run-history manifest. Loaded behind
+# a Get-Command guard at the call site so a legacy install without the
+# module still runs (events simply not emitted).
+$runnerModule = Join-Path $script:ModulesPath "EntraChecks-Runner.psm1"
+if (Test-Path $runnerModule) {
+    Import-Module $runnerModule -Force -ErrorAction SilentlyContinue
 }
 
 # Initialize logging subsystem (from config or defaults)
@@ -2519,6 +2536,33 @@ function Start-InteractiveMode {
 
 #region ==================== QUICK/SCHEDULED MODES ====================
 
+function Get-EcfInvocationParams {
+    <#
+    .SYNOPSIS
+        Collects the script-scope invocation parameters into a hashtable
+        for the runner's allowlist sanitizer (ConvertTo-EcfSafeParams).
+        Reads script-scope params directly; -ResolvedTenant carries the
+        post-prompt tenant so the manifest reflects what actually ran.
+    #>
+    param([string]$ResolvedTenant)
+    return @{
+        TenantName = $ResolvedTenant
+        OutputDirectory = $OutputDirectory
+        Modules = $Modules
+        ExportFormat = $ExportFormat
+        ConfigFile = $ConfigFile
+        Environment = $Environment
+        SaveSnapshot = [bool]$SaveSnapshot
+        CompareWithLast = [bool]$CompareWithLast
+        HtmlReportSet = $HtmlReportSet
+        HtmlDeepDiveDomains = $HtmlDeepDiveDomains
+        EmitPrivilegedRoster = [bool]$EmitPrivilegedRoster
+        IdentityOverridesPath = $IdentityOverridesPath
+        SkipAuthentication = [bool]$SkipAuthentication
+        EmitEvents = [bool]$EmitEvents
+    }
+}
+
 function Invoke-EcfAssessmentSequence {
     <#
     .SYNOPSIS
@@ -2555,17 +2599,60 @@ function Invoke-EcfAssessmentSequence {
         $ErrorActionPreference='Stop' (the inline scheduled body set this
         before these same calls; preserved here so the refactor is
         behaviour-identical).
+
+    .PARAMETER InvocationParams
+        Native App Plan, Phase 1 (incremental step 3). The script-scope
+        invocation parameters, used (after allowlist sanitization) for
+        the run.started event + run-history manifest.
+
+    .PARAMETER EmitEvents
+        When set, the runner streams the versioned NDJSON event contract
+        to stdout. The run-history manifest is written regardless (when
+        the EntraChecks-Runner module is present). On a legacy install
+        without that module the sequence behaves byte-identically to the
+        post-DRY step 2 (the same Write-Host narration, no events) and
+        the modes' own banner/completion Write-Host is unchanged either
+        way, so the existing CLI UX does not regress before the Phase 2
+        console renderer lands. (This intentionally relaxes the Phase 1
+        plan §9 "no decorative output" wording in favour of not
+        regressing human CLI output in the 1->2 window — recorded in the
+        plan status.)
     #>
     param(
         [Parameter(Mandatory)][string]$TenantNameValue,
         [Parameter(Mandatory)][string[]]$ModuleSet,
         [switch]$RunHybridCorrelation,
         [switch]$DoCompareWithLast,
-        [switch]$ErrorActionStop
+        [switch]$ErrorActionStop,
+        [hashtable]$InvocationParams,
+        [switch]$EmitEvents
     )
 
     if ($ErrorActionStop) { $ErrorActionPreference = "Stop" }
 
+    # The sequence owns the run lifecycle. Context is created here (not by
+    # the modes) so the modes stay thin and their preamble is untouched.
+    $RunContext = $null
+    if (Get-Command New-EcfRunContext -ErrorAction SilentlyContinue) {
+        $ctxParams = $InvocationParams
+        if (-not $ctxParams) { $ctxParams = @{} }
+        $RunContext = New-EcfRunContext -RunId ([guid]::NewGuid().ToString()) -Params $ctxParams -OutputDirectory $OutputDirectory -EmitEvents:$EmitEvents
+        Start-EcfRun -Context $RunContext
+    }
+    $useEvents = ($null -ne $RunContext) -and [bool](Get-Command Write-EcfEvent -ErrorAction SilentlyContinue)
+
+    # Narration shim: an event when wrapped, else the original Write-Host.
+    # Preserves byte-identical legacy behaviour while making the wrapped
+    # path emit the contract instead of decorating the console.
+    function narrate {
+        param([string]$Message, [ValidateSet('info', 'warn', 'error')][string]$Level = 'info', [string]$Color = 'Gray')
+        if ($useEvents) { Write-EcfLog -Context $RunContext -Message $Message -Level $Level }
+        else { Write-Host $Message -ForegroundColor $Color }
+    }
+    function phaseStart { param([string]$Phase) if ($useEvents) { Start-EcfPhase -Context $RunContext -Phase $Phase } }
+    function phaseDone { param([string]$Phase, [string]$Status = 'ok') if ($useEvents) { Complete-EcfPhase -Context $RunContext -Phase $Phase -Status $Status } }
+
+    phaseStart 'Modules'
     $results = Invoke-ModuleAssessment -SelectedModules $ModuleSet -TenantName $TenantNameValue -OutputDir $OutputDirectory
 
     $hybridCorrelation = $null
@@ -2576,27 +2663,47 @@ function Invoke-EcfAssessmentSequence {
             Import-Module $corrModule -Force
             try {
                 $hybridCorrelation = Get-HybridIdentityCorrelation -Findings $script:Findings
-                Write-Host "    [OK] Correlated $($hybridCorrelation.CorrelationCount) principals across cloud + on-prem." -ForegroundColor Green
+                narrate "    [OK] Correlated $($hybridCorrelation.CorrelationCount) principals across cloud + on-prem." 'info' 'Green'
                 # PR 5 - push cross-surface findings back into the main pool so risk scoring,
                 # HTML / Excel / CSV renderers, and delta reporting all see them alongside
                 # standard findings. They carry Source='HybridCorrelation' so downstream code
                 # can group / filter if needed.
                 if ($hybridCorrelation.CrossSurfaceCount -gt 0) {
                     $script:Findings += $hybridCorrelation.CrossSurfaceFindings
-                    Write-Host "    [OK] Emitted $($hybridCorrelation.CrossSurfaceCount) cross-surface finding(s)." -ForegroundColor Green
+                    narrate "    [OK] Emitted $($hybridCorrelation.CrossSurfaceCount) cross-surface finding(s)." 'info' 'Green'
                 }
             }
             catch {
-                Write-Host "    [!] Correlation pass failed: $($_.Exception.Message)" -ForegroundColor Yellow
+                narrate "    [!] Correlation pass failed: $($_.Exception.Message)" 'warn' 'Yellow'
             }
         }
         # Stash correlation output on a script-scope variable so Export-AssessmentResult can pick it up.
         $script:HybridCorrelationData = $hybridCorrelation
     }
+    phaseDone 'Modules'
 
+    phaseStart 'Report'
     $reportDir = Export-AssessmentResult -OutputDir $OutputDirectory -TenantName $TenantNameValue -IncludeUnified -GenerateComprehensiveReport:$GenerateComprehensiveReport -GenerateExecutiveSummary:$GenerateExecutiveSummary -GenerateExcelReport:$GenerateExcelReport -GenerateRemediationScripts:$GenerateRemediationScripts -HtmlReportSet $HtmlReportSet -HtmlDeepDiveDomains $HtmlDeepDiveDomains
+    if ($useEvents -and $reportDir -and (Test-Path -LiteralPath $reportDir)) {
+        # Best-effort artifact enumeration so GUI run-history can open
+        # outputs blind. Precise per-renderer enumeration is hardened in
+        # step 4 when the orchestration moves into the module.
+        foreach ($f in (Get-ChildItem -LiteralPath $reportDir -File -ErrorAction SilentlyContinue)) {
+            $kind = switch -Wildcard ($f.Name) {
+                '*.xlsx' { 'excel'; break }
+                '*.csv' { 'csv'; break }
+                '*.json' { 'json'; break }
+                '*cockpit*.html' { 'cockpit-html'; break }
+                '*.html' { 'legacy-html'; break }
+                default { $null }
+            }
+            if ($kind) { Add-EcfArtifact -Context $RunContext -Kind $kind -Path $f.FullName }
+        }
+    }
+    phaseDone 'Report'
 
     if ($SaveSnapshot) {
+        phaseStart 'Snapshot'
         $deltaModule = Join-Path $script:ModulesPath "EntraChecks-DeltaReporting.psm1"
         Import-Module $deltaModule -Force
         Save-ComplianceSnapshot -OutputDirectory $script:SnapshotsPath -TenantName $TenantNameValue `
@@ -2604,13 +2711,17 @@ function Invoke-EcfAssessmentSequence {
             -DefenderComplianceData $script:DefenderComplianceData `
             -AzurePolicyData $script:AzurePolicyData `
             -PurviewComplianceData $script:PurviewComplianceData
+        phaseDone 'Snapshot'
     }
 
     # Auto-run SOC 2 readiness when SOC2.Enabled = true in config. Browser
     # open is suppressed in scripted modes (automation friendly).
+    phaseStart 'SOC2'
     Invoke-SOC2ReadinessIfEnabled -TenantName $TenantNameValue -OutputDirectory $OutputDirectory -OpenBrowser $false
+    phaseDone 'SOC2'
 
     if ($DoCompareWithLast) {
+        phaseStart 'Snapshot'
         $deltaModule = Join-Path $script:ModulesPath "EntraChecks-DeltaReporting.psm1"
         Import-Module $deltaModule -Force
 
@@ -2620,17 +2731,62 @@ function Invoke-EcfAssessmentSequence {
             $currentSnap = Import-ComplianceSnapshot -SnapshotPath $snapshots[0].FilePath
             $baselineSnap = Import-ComplianceSnapshot -SnapshotPath $snapshots[1].FilePath
             $delta = Compare-ComplianceSnapshots -BaselineSnapshot $baselineSnap -CurrentSnapshot $currentSnap
-            Export-DeltaReport -DeltaData $delta -OutputDirectory $OutputDirectory -TenantName $TenantNameValue
+            $deltaPath = Export-DeltaReport -DeltaData $delta -OutputDirectory $OutputDirectory -TenantName $TenantNameValue
+            if ($useEvents -and $deltaPath -and (Test-Path -LiteralPath $deltaPath -ErrorAction SilentlyContinue)) {
+                Add-EcfArtifact -Context $RunContext -Kind 'delta' -Path $deltaPath
+            }
+            phaseDone 'Snapshot'
         }
         else {
-            Write-Host "[!] Need at least 2 snapshots for comparison. Save a snapshot first." -ForegroundColor Yellow
+            if ($useEvents) {
+                Write-EcfWarning -Context $RunContext -Message 'Need at least 2 snapshots for comparison. Save a snapshot first.' -Code 'snapshot.insufficient'
+            }
+            else {
+                Write-Host "[!] Need at least 2 snapshots for comparison. Save a snapshot first." -ForegroundColor Yellow
+            }
+            phaseDone 'Snapshot' 'skipped'
         }
+    }
+
+    $manifest = $null
+    if ($useEvents) {
+        # Severity rollup from the populated finding pool. Precise SOC 2
+        # verdict + per-renderer artifact kinds are hardened in step 4
+        # when the orchestration moves into the module.
+        $pool = @()
+        if ($script:Findings) { $pool = @($script:Findings) }
+        $sevOf = {
+            param($f)
+            if ($f.PSObject.Properties['RiskLevel'] -and $f.RiskLevel) { return ([string]$f.RiskLevel) }
+            if ($f.PSObject.Properties['Severity'] -and $f.Severity) { return ([string]$f.Severity) }
+            return ''
+        }
+        $crit = 0; $high = 0; $med = 0; $low = 0
+        foreach ($f in $pool) {
+            switch (([string](& $sevOf $f)).ToLowerInvariant()) {
+                'critical' { $crit++ }
+                'high' { $high++ }
+                'medium' { $med++ }
+                'low' { $low++ }
+            }
+        }
+        $summary = @{
+            findings = $pool.Count
+            critical = $crit
+            high = $high
+            medium = $med
+            low = $low
+            modulesRun = $ModuleSet
+            soc2 = @{ ran = $false; verdict = $null }
+        }
+        $manifest = Complete-EcfRun -Context $RunContext -Summary $summary
     }
 
     return [pscustomobject]@{
         Results = $results
         ReportDir = $reportDir
         HybridCorrelation = $hybridCorrelation
+        Manifest = $manifest
     }
 }
 
@@ -2652,7 +2808,7 @@ function Start-QuickMode {
         $Modules
     }
 
-    $seq = Invoke-EcfAssessmentSequence -TenantNameValue $TenantName -ModuleSet $modulesToRun -DoCompareWithLast:$CompareWithLast
+    $seq = Invoke-EcfAssessmentSequence -TenantNameValue $TenantName -ModuleSet $modulesToRun -DoCompareWithLast:$CompareWithLast -InvocationParams (Get-EcfInvocationParams -ResolvedTenant $TenantName) -EmitEvents:$EmitEvents
 
     Write-Host "`n[+] Assessment Complete" -ForegroundColor Green
     Write-Host "    Duration: $($seq.Results.Duration.TotalMinutes.ToString('0.0')) minutes" -ForegroundColor Cyan
@@ -2683,7 +2839,7 @@ function Start-HybridMode {
     # Core cloud set + Hybrid (AD Connect health) + on-prem AD.
     $hybridModules = @('Core', 'IdentityProtection', 'Devices', 'SecureScore', 'Defender', 'AzurePolicy', 'Purview', 'ActiveDirectory')
 
-    $seq = Invoke-EcfAssessmentSequence -TenantNameValue $TenantName -ModuleSet $hybridModules -RunHybridCorrelation
+    $seq = Invoke-EcfAssessmentSequence -TenantNameValue $TenantName -ModuleSet $hybridModules -RunHybridCorrelation -InvocationParams (Get-EcfInvocationParams -ResolvedTenant $TenantName) -EmitEvents:$EmitEvents
 
     Write-Host "`n[+] Hybrid Analysis Complete" -ForegroundColor Green
     Write-Host "    Duration: $($seq.Results.Duration.TotalMinutes.ToString('0.0')) minutes" -ForegroundColor Cyan
@@ -2719,7 +2875,7 @@ function Start-ScheduledMode {
         $Modules
     }
 
-    $seq = Invoke-EcfAssessmentSequence -TenantNameValue $TenantName -ModuleSet $modulesToRun -ErrorActionStop
+    $seq = Invoke-EcfAssessmentSequence -TenantNameValue $TenantName -ModuleSet $modulesToRun -ErrorActionStop -InvocationParams (Get-EcfInvocationParams -ResolvedTenant $TenantName) -EmitEvents:$EmitEvents
 
     # Return structured result for automation
     return @{
