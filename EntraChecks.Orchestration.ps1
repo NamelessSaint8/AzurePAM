@@ -1855,10 +1855,18 @@ function Start-InteractiveMode {
                 }
                 
                 $allModules = @("Core", "IdentityProtection", "Devices", "SecureScore", "Defender", "AzurePolicy", "Purview")
-                $results = Invoke-ModuleAssessment -SelectedModules $allModules -TenantName $tenantName -OutputDir $OutputDirectory
-                
-                $reportDir = Export-AssessmentResult -OutputDir $OutputDirectory -TenantName $tenantName -IncludeUnified -GenerateComprehensiveReport:$GenerateComprehensiveReport -GenerateExecutiveSummary:$GenerateExecutiveSummary -GenerateExcelReport:$GenerateExcelReport -GenerateRemediationScripts:$GenerateRemediationScripts -HtmlReportSet $HtmlReportSet -HtmlDeepDiveDomains $HtmlDeepDiveDomains
-                
+
+                # Phase 2 (2c): the run goes through the single runner seam;
+                # progress + completion render via the in-process console
+                # renderer (one formatting place). The menu keeps its own
+                # post-run snapshot prompt (preserving prompt timing and
+                # avoiding a double save), so the sequence skips snapshot.
+                # SOC 2 browser-open is preserved via -OpenSoc2Browser.
+                $renderSink = { param($e) Show-EcfRunStream -Event $e }
+                $null = Invoke-EcfAssessmentSequence -TenantNameValue $tenantName -ModuleSet $allModules `
+                    -InvocationParams (Get-EcfInvocationParams -ResolvedTenant $tenantName) `
+                    -SkipSequenceSnapshot -OpenSoc2Browser -EventSink $renderSink
+
                 if ($SaveSnapshot -or (Read-Host "`n  Save snapshot for future comparison? (Y/N)").ToUpper() -eq "Y") {
                     $deltaModule = Join-Path $script:ModulesPath "EntraChecks-DeltaReporting.psm1"
                     Import-Module $deltaModule -Force
@@ -1868,12 +1876,6 @@ function Start-InteractiveMode {
                         -AzurePolicyData $script:AzurePolicyData `
                         -PurviewComplianceData $script:PurviewComplianceData
                 }
-
-                Write-Host "`n  Assessment complete! Duration: $($results.Duration.TotalMinutes.ToString('0.0')) minutes" -ForegroundColor Green
-                Write-Host "  Reports saved to: $reportDir" -ForegroundColor Cyan
-
-                # Auto-run SOC 2 readiness when SOC2.Enabled = true in config
-                Invoke-SOC2ReadinessIfEnabled -TenantName $tenantName -OutputDirectory $OutputDirectory -OpenBrowser $true
 
                 Read-Host "`n  Press Enter to continue"
             }
@@ -1909,15 +1911,22 @@ function Start-InteractiveMode {
                                 if (-not $tenantName) {
                                     $tenantName = Read-Host "`n  Enter tenant name"
                                 }
-                                
+
                                 if (-not $SkipAuthentication) {
                                     Connect-EntraCheck
                                 }
-                                
-                                $results = Invoke-ModuleAssessment -SelectedModules $selectedModules -TenantName $tenantName -OutputDir $OutputDirectory
-                                $reportDir = Export-AssessmentResult -OutputDir $OutputDirectory -TenantName $tenantName -IncludeUnified -GenerateComprehensiveReport:$GenerateComprehensiveReport -GenerateExecutiveSummary:$GenerateExecutiveSummary -GenerateExcelReport:$GenerateExcelReport -GenerateRemediationScripts:$GenerateRemediationScripts -HtmlReportSet $HtmlReportSet -HtmlDeepDiveDomains $HtmlDeepDiveDomains
-                                
-                                Write-Host "`n  Assessment complete!" -ForegroundColor Green
+
+                                # Phase 2 (2c): same single runner seam +
+                                # console renderer as Quick Assessment. No
+                                # snapshot here (this branch never saved one);
+                                # config-gated SOC 2 readiness now runs too,
+                                # consistent with Quick (no-op when
+                                # SOC2.Enabled is false — the default).
+                                $renderSink = { param($e) Show-EcfRunStream -Event $e }
+                                $null = Invoke-EcfAssessmentSequence -TenantNameValue $tenantName -ModuleSet $selectedModules `
+                                    -InvocationParams (Get-EcfInvocationParams -ResolvedTenant $tenantName) `
+                                    -SkipSequenceSnapshot -OpenSoc2Browser -EventSink $renderSink
+
                                 Read-Host "  Press Enter to continue"
                             }
                             $continueSelection = $false
@@ -2174,7 +2183,21 @@ function Invoke-EcfAssessmentSequence {
         [switch]$DoCompareWithLast,
         [switch]$ErrorActionStop,
         [hashtable]$InvocationParams,
-        [switch]$EmitEvents
+        [switch]$EmitEvents,
+        # Native App Plan, Phase 2 (2c). Additive — defaults preserve the
+        # non-interactive modes exactly:
+        #   -SkipSequenceSnapshot : the interactive menu keeps its own
+        #     post-run "Save snapshot? (Y/N)" prompt + save (preserving
+        #     prompt *timing* and avoiding a double save); it tells the
+        #     sequence not to do its own snapshot.
+        #   -OpenSoc2Browser      : the menu opened the SOC 2 report in a
+        #     browser ($true); scripted modes keep $false.
+        #   -EventSink            : in-process renderer (the re-platformed
+        #     TUI passes { param($e) Show-EcfRunStream -Event $e }); no
+        #     NDJSON, console output comes from the sink.
+        [switch]$SkipSequenceSnapshot,
+        [switch]$OpenSoc2Browser,
+        [scriptblock]$EventSink
     )
 
     if ($ErrorActionStop) { $ErrorActionPreference = "Stop" }
@@ -2185,7 +2208,7 @@ function Invoke-EcfAssessmentSequence {
     if (Get-Command New-EcfRunContext -ErrorAction SilentlyContinue) {
         $ctxParams = $InvocationParams
         if (-not $ctxParams) { $ctxParams = @{} }
-        $RunContext = New-EcfRunContext -RunId ([guid]::NewGuid().ToString()) -Params $ctxParams -OutputDirectory $OutputDirectory -EmitEvents:$EmitEvents
+        $RunContext = New-EcfRunContext -RunId ([guid]::NewGuid().ToString()) -Params $ctxParams -OutputDirectory $OutputDirectory -EmitEvents:$EmitEvents -EventSink $EventSink
         Start-EcfRun -Context $RunContext
     }
     $useEvents = ($null -ne $RunContext) -and [bool](Get-Command Write-EcfEvent -ErrorAction SilentlyContinue)
@@ -2251,7 +2274,7 @@ function Invoke-EcfAssessmentSequence {
     }
     phaseDone 'Report'
 
-    if ($SaveSnapshot) {
+    if (-not $SkipSequenceSnapshot -and $SaveSnapshot) {
         phaseStart 'Snapshot'
         $deltaModule = Join-Path $script:ModulesPath "EntraChecks-DeltaReporting.psm1"
         Import-Module $deltaModule -Force
@@ -2264,9 +2287,10 @@ function Invoke-EcfAssessmentSequence {
     }
 
     # Auto-run SOC 2 readiness when SOC2.Enabled = true in config. Browser
-    # open is suppressed in scripted modes (automation friendly).
+    # open is suppressed in scripted modes (automation friendly); the
+    # interactive menu passes -OpenSoc2Browser to preserve its behaviour.
     phaseStart 'SOC2'
-    Invoke-SOC2ReadinessIfEnabled -TenantName $TenantNameValue -OutputDirectory $OutputDirectory -OpenBrowser $false
+    Invoke-SOC2ReadinessIfEnabled -TenantName $TenantNameValue -OutputDirectory $OutputDirectory -OpenBrowser ([bool]$OpenSoc2Browser)
     phaseDone 'SOC2'
 
     if ($DoCompareWithLast) {
