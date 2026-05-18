@@ -411,7 +411,8 @@ function Write-EcfError {
 
 <#
 .SYNOPSIS
-    Coarse auth narration (Phase 1). Device-code-as-events is Phase 3.
+    Coarse auth narration (Phase 1). Still used for app-only / managed
+    identity / "already connected" (no interactive prompt to surface).
 #>
 function Write-EcfAuthInfo {
     [CmdletBinding()]
@@ -424,6 +425,96 @@ function Write-EcfAuthInfo {
     Write-EcfEvent -Context $Context -Type 'auth.info' -Data @{
         method = $Method
         message = $Message
+    }
+}
+
+# ---- Phase 3c: auth-as-events ---------------------------------------
+# The Auth step runs inside an observed `Auth` phase; these surface the
+# flow so a GUI/TUI renders it instead of relying on the Graph SDK's
+# console output. Additive within v1 (new event types; the device-code
+# event intentionally carries a nullable userCode + a `capture` field
+# so a future real-code path is additive — see Phase 3 plan §5 / the
+# 3c-spike decision).
+
+<#
+.SYNOPSIS
+    Interactive-browser sign-in is starting (the system browser opens).
+#>
+function Write-EcfAuthBrowser {
+    [CmdletBinding()]
+    [OutputType([void])]
+    param(
+        [Parameter(Mandatory)][pscustomobject]$Context,
+        [string]$Message = 'Opening the system browser to sign in...'
+    )
+    Write-EcfEvent -Context $Context -Type 'auth.browser' -Data @{ message = $Message }
+}
+
+<#
+.SYNOPSIS
+    Device-code sign-in is starting. Per the 3c-spike, the Graph SDK
+    owns the code value, so by default userCode is $null and
+    capture='sdk-console' (the code is on the sidecar's stdout /
+    console). A future DeviceCodeCredential path can pass a real
+    -UserCode without a contract break.
+#>
+function Write-EcfAuthDeviceCode {
+    [CmdletBinding()]
+    [OutputType([void])]
+    param(
+        [Parameter(Mandatory)][pscustomobject]$Context,
+        [AllowNull()][string]$UserCode = $null,
+        [string]$VerificationUri = 'https://microsoft.com/devicelogin',
+        [ValidateSet('sdk-console', 'captured')][string]$Capture = 'sdk-console'
+    )
+    Write-EcfEvent -Context $Context -Type 'auth.devicecode' -Data @{
+        userCode = $UserCode
+        verificationUri = $VerificationUri
+        capture = $Capture
+    }
+}
+
+<#
+.SYNOPSIS
+    Sign-in succeeded.
+#>
+function Write-EcfAuthSucceeded {
+    [CmdletBinding()]
+    [OutputType([void])]
+    param(
+        [Parameter(Mandatory)][pscustomobject]$Context,
+        [string]$Account = '',
+        [string]$Method = ''
+    )
+    Write-EcfEvent -Context $Context -Type 'auth.succeeded' -Data @{
+        account = $Account
+        method = $Method
+    }
+}
+
+<#
+.SYNOPSIS
+    Sign-in failed. Records a taxonomy'd error (this is where the 3b
+    auth.* codes are wired now that auth is inside the observed run)
+    AND emits the auth.failed event for live renderers. -Code defaults
+    to auth.failed; pass auth.cancelled / auth.insufficientPrivileges
+    when the cause is known.
+#>
+function Write-EcfAuthFailed {
+    [CmdletBinding()]
+    [OutputType([void])]
+    param(
+        [Parameter(Mandatory)][pscustomobject]$Context,
+        [Parameter(Mandatory)][string]$Message,
+        [ValidateSet('auth.failed', 'auth.cancelled', 'auth.insufficientPrivileges')]
+        [string]$Code = 'auth.failed'
+    )
+    $info = Get-EcfErrorInfo -Code $Code
+    Write-EcfError -Context $Context -Code $Code -Message $Message
+    Write-EcfEvent -Context $Context -Type 'auth.failed' -Data @{
+        code = $Code
+        message = $Message
+        remediation = $info.Remediation
     }
 }
 
@@ -692,6 +783,10 @@ Export-ModuleMember -Function @(
     'Write-EcfError',
     'Get-EcfErrorInfo',
     'Write-EcfAuthInfo',
+    'Write-EcfAuthBrowser',
+    'Write-EcfAuthDeviceCode',
+    'Write-EcfAuthSucceeded',
+    'Write-EcfAuthFailed',
     'Add-EcfArtifact',
     'Get-EcfRunStatus',
     'New-EcfRunManifest',

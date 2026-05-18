@@ -65,8 +65,11 @@ Describe 'Schema shape — every event' {
     }
 
     It 'only emits known v1.x event types' {
-        # Additive within v1: run.cancelled added in Phase 3a.
-        $known = @('run.started', 'phase.started', 'phase.progress', 'phase.completed', 'log', 'warning', 'auth.info', 'run.cancelled', 'run.result')
+        # Additive within v1: run.cancelled (3a); auth.browser /
+        # auth.devicecode / auth.succeeded / auth.failed (3c).
+        $known = @('run.started', 'phase.started', 'phase.progress', 'phase.completed',
+            'log', 'warning', 'auth.info', 'auth.browser', 'auth.devicecode',
+            'auth.succeeded', 'auth.failed', 'run.cancelled', 'run.result')
         foreach ($e in $script:Ctx.Events) { $known | Should -Contain $e.type }
     }
 
@@ -458,5 +461,64 @@ Describe 'Error taxonomy (Phase 3b)' {
         $m = New-EcfRunManifest -Context $ctx
         $m.errors[0].remediation | Should -Not -BeNullOrEmpty
         $m.errors[0].code | Should -BeExactly 'engine.moduleFailed'
+    }
+}
+
+Describe 'Auth-as-events primitives (Phase 3c)' {
+
+    It 'auth.browser carries a message' {
+        $ctx = New-EcfRunContext -RunId 'ab1' -Params @{}
+        Write-EcfAuthBrowser -Context $ctx
+        $e = $ctx.Events[-1]
+        $e.type | Should -BeExactly 'auth.browser'
+        $e.message | Should -Not -BeNullOrEmpty
+    }
+
+    It 'auth.devicecode defaults to the spike Path-3 fallback shape' {
+        $ctx = New-EcfRunContext -RunId 'ad1' -Params @{}
+        Write-EcfAuthDeviceCode -Context $ctx
+        $e = $ctx.Events[-1]
+        $e.type | Should -BeExactly 'auth.devicecode'
+        $e.userCode | Should -BeNullOrEmpty
+        $e.verificationUri | Should -BeExactly 'https://microsoft.com/devicelogin'
+        $e.capture | Should -BeExactly 'sdk-console'
+    }
+
+    It 'auth.devicecode can carry a real code (future DeviceCodeCredential path; additive)' {
+        $ctx = New-EcfRunContext -RunId 'ad2' -Params @{}
+        Write-EcfAuthDeviceCode -Context $ctx -UserCode 'ABCD-EFGH' -Capture 'captured'
+        $e = $ctx.Events[-1]
+        $e.userCode | Should -BeExactly 'ABCD-EFGH'
+        $e.capture | Should -BeExactly 'captured'
+    }
+
+    It 'auth.succeeded carries account + method' {
+        $ctx = New-EcfRunContext -RunId 'as1' -Params @{}
+        Write-EcfAuthSucceeded -Context $ctx -Account 'admin@contoso.com' -Method 'Interactive'
+        $e = $ctx.Events[-1]
+        $e.type | Should -BeExactly 'auth.succeeded'
+        $e.account | Should -BeExactly 'admin@contoso.com'
+        $e.method | Should -BeExactly 'Interactive'
+    }
+
+    It 'auth.failed records a taxonomy error AND emits the event (3b auth wiring lands here)' {
+        $ctx = New-EcfRunContext -RunId 'af1' -Params @{}
+        Write-EcfAuthFailed -Context $ctx -Message 'AADSTS50058' -Code 'auth.cancelled'
+        # taxonomy error recorded
+        $err = @($ctx.Errors | Where-Object { $_.code -eq 'auth.cancelled' })
+        $err.Count | Should -Be 1
+        $err[0].fatal | Should -BeTrue
+        $err[0].remediation | Should -Not -BeNullOrEmpty
+        # auth.failed event emitted with the same code + remediation
+        $e = $ctx.Events | Where-Object { $_.type -eq 'auth.failed' } | Select-Object -Last 1
+        $e.code | Should -BeExactly 'auth.cancelled'
+        $e.remediation | Should -BeExactly $err[0].remediation
+    }
+
+    It 'auth.failed defaults to the auth.failed code' {
+        $ctx = New-EcfRunContext -RunId 'af2' -Params @{}
+        Write-EcfAuthFailed -Context $ctx -Message 'unknown'
+        ($ctx.Events | Where-Object { $_.type -eq 'auth.failed' } | Select-Object -Last 1).code | Should -BeExactly 'auth.failed'
+        (Get-EcfErrorInfo -Code 'auth.failed').Fatal | Should -BeTrue
     }
 }

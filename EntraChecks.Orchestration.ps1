@@ -31,6 +31,36 @@
 
 #Requires -Version 5.1
 
+#region ==================== SAFE CONTEXT READERS ====================
+
+# Bug fix: `Get-EcfMgContextSafe` (and the Az
+# equivalent) does NOT suppress a CommandNotFoundException — when the
+# Microsoft.Graph / Az modules are not installed, command discovery
+# fails *before* -ErrorAction applies, so the bare call throws and the
+# top-level handler reports "[CRITICAL] Unhandled error in main
+# execution", killing the script at the auth-status banner. Every
+# status-read site already treats a null context as "not connected",
+# so a missing module must degrade to $null, not crash.
+function Get-EcfMgContextSafe {
+    [CmdletBinding()]
+    param()
+    $cmd = Get-Command -Name 'Get-MgContext' -ErrorAction SilentlyContinue
+    if (-not $cmd) { return $null }
+    try { return (& $cmd -ErrorAction SilentlyContinue) }
+    catch { Write-Verbose "Get-MgContext failed (ignored): $_"; return $null }
+}
+
+function Get-EcfAzContextSafe {
+    [CmdletBinding()]
+    param()
+    $cmd = Get-Command -Name 'Get-AzContext' -ErrorAction SilentlyContinue
+    if (-not $cmd) { return $null }
+    try { return (& $cmd -ErrorAction SilentlyContinue) }
+    catch { Write-Verbose "Get-AzContext failed (ignored): $_"; return $null }
+}
+
+#endregion
+
 #region ==================== DISPLAY FUNCTIONS ====================
 
 function Show-Banner {
@@ -116,7 +146,7 @@ function Show-AuthStatus {
     Write-Host "`n  Authentication Status:" -ForegroundColor Cyan
 
     # Check Graph
-    $graphContext = Get-MgContext -ErrorAction SilentlyContinue
+    $graphContext = Get-EcfMgContextSafe
     if ($graphContext) {
         Write-Host "    [OK] Microsoft Graph: Connected as $($graphContext.Account)" -ForegroundColor Green
         # Show granted scopes relevant to EntraChecks
@@ -146,7 +176,7 @@ function Show-AuthStatus {
     }
 
     # Check Azure
-    $azContext = Get-AzContext -ErrorAction SilentlyContinue
+    $azContext = Get-EcfAzContextSafe
     if ($azContext -and $azContext.Account) {
         if ($azContext.Subscription -and $azContext.Subscription.Name) {
             Write-Host "    [OK] Azure: Connected to $($azContext.Subscription.Name)" -ForegroundColor Green
@@ -206,7 +236,7 @@ function Connect-EntraCheck {
 
         try {
             # Check if already connected with sufficient scopes
-            $existingContext = Get-MgContext -ErrorAction SilentlyContinue
+            $existingContext = Get-EcfMgContextSafe
             if ($existingContext -and $existingContext.Account) {
                 # Compare against the FULL scope union, not just a 3-scope critical
                 # subset. If the cached context is missing any required scope,
@@ -266,7 +296,7 @@ function Connect-EntraCheck {
         Write-Log -Level INFO -Message "Connecting to Azure" -Category "Authentication"
 
         try {
-            $azContext = Get-AzContext -ErrorAction SilentlyContinue
+            $azContext = Get-EcfAzContextSafe
             if (-not $azContext -or -not $azContext.Account) {
                 # WAM broker is disabled globally at script start (see WAM BROKER FIX region)
                 Connect-AzAccount -ErrorAction Stop | Out-Null
@@ -332,7 +362,7 @@ function Disconnect-EntraCheck {
     }
 
     # Disconnect Microsoft Graph
-    $graphContext = Get-MgContext -ErrorAction SilentlyContinue
+    $graphContext = Get-EcfMgContextSafe
     if ($graphContext) {
         try {
             Disconnect-MgGraph -ErrorAction Stop | Out-Null
@@ -354,7 +384,7 @@ function Disconnect-EntraCheck {
     }
 
     # Disconnect Azure
-    $azContext = Get-AzContext -ErrorAction SilentlyContinue
+    $azContext = Get-EcfAzContextSafe
     if ($azContext) {
         try {
             Disconnect-AzAccount -ErrorAction Stop | Out-Null
@@ -433,7 +463,7 @@ function Invoke-ModuleAssessment {
         }
 
         # Check Azure connection
-        $azContext = Get-AzContext -ErrorAction SilentlyContinue
+        $azContext = Get-EcfAzContextSafe
         if (-not $azContext) {
             $prerequisitesWarnings += "Azure not connected - Defender and AzurePolicy modules will attempt connection"
             Write-Host "    [!] Azure not connected - modules will prompt for authentication" -ForegroundColor Yellow
@@ -444,7 +474,7 @@ function Invoke-ModuleAssessment {
     }
 
     # Check Graph connection for all modules
-    $mgContext = Get-MgContext -ErrorAction SilentlyContinue
+    $mgContext = Get-EcfMgContextSafe
     if (-not $mgContext) {
         $prerequisitesFailed += "Microsoft Graph not connected"
         Write-Host "    [!] Microsoft Graph not connected" -ForegroundColor Red
@@ -512,7 +542,7 @@ function Invoke-ModuleAssessment {
                     $modulePath = Join-Path $script:ModulesPath "EntraChecks-IdentityProtection.psm1"
                     if (Test-Path $modulePath) {
                         # Check Graph connection (required for Identity Protection API)
-                        $graphContext = Get-MgContext -ErrorAction SilentlyContinue
+                        $graphContext = Get-EcfMgContextSafe
                         if (-not $graphContext) {
                             Write-Host "    [!] Microsoft Graph connection required for Identity Protection" -ForegroundColor Yellow
                             Write-Host "    [i] Connect via [A] Authentication menu first" -ForegroundColor Gray
@@ -555,7 +585,7 @@ function Invoke-ModuleAssessment {
                     $modulePath = Join-Path $script:ModulesPath "EntraChecks-Devices.psm1"
                     if (Test-Path $modulePath) {
                         # Check Graph connection (required for Device/Intune API)
-                        $graphContext = Get-MgContext -ErrorAction SilentlyContinue
+                        $graphContext = Get-EcfMgContextSafe
                         if (-not $graphContext) {
                             Write-Host "    [!] Microsoft Graph connection required for Device checks" -ForegroundColor Yellow
                             Write-Host "    [i] Connect via [A] Authentication menu first" -ForegroundColor Gray
@@ -598,7 +628,7 @@ function Invoke-ModuleAssessment {
                     $modulePath = Join-Path $script:ModulesPath "EntraChecks-SecureScore.psm1"
                     if (Test-Path $modulePath) {
                         # Check Graph connection (required for Secure Score API)
-                        $graphContext = Get-MgContext -ErrorAction SilentlyContinue
+                        $graphContext = Get-EcfMgContextSafe
                         if (-not $graphContext) {
                             Write-Host "    [!] Microsoft Graph connection required for Secure Score" -ForegroundColor Yellow
                             Write-Host "    [i] Connect via [A] Authentication menu first" -ForegroundColor Gray
@@ -651,7 +681,7 @@ function Invoke-ModuleAssessment {
                     $modulePath = Join-Path $script:ModulesPath "EntraChecks-DefenderCompliance.psm1"
                     if (Test-Path $modulePath) {
                         # Check Azure connection (required for Defender module)
-                        $azContext = Get-AzContext -ErrorAction SilentlyContinue
+                        $azContext = Get-EcfAzContextSafe
                         if (-not $azContext) {
                             Write-Host "    [!] Azure connection required for Defender module" -ForegroundColor Yellow
                             Write-Host "    [i] Connect via [A] Authentication menu first" -ForegroundColor Gray
@@ -721,7 +751,7 @@ function Invoke-ModuleAssessment {
                     $modulePath = Join-Path $script:ModulesPath "EntraChecks-AzurePolicy.psm1"
                     if (Test-Path $modulePath) {
                         # Check Azure connection (required for Azure Policy module)
-                        $azContext = Get-AzContext -ErrorAction SilentlyContinue
+                        $azContext = Get-EcfAzContextSafe
                         if (-not $azContext) {
                             Write-Host "    [!] Azure connection required for Azure Policy module" -ForegroundColor Yellow
                             Write-Host "    [i] Please ensure Azure connection via main authentication menu first" -ForegroundColor Gray
@@ -1018,8 +1048,8 @@ function Invoke-SOC2ReadinessFromMenu {
     # Resolve tenant info
     $tenantId = ''
     try {
-        if (Get-Command Get-MgContext -ErrorAction SilentlyContinue) {
-            $ctx = Get-MgContext -ErrorAction SilentlyContinue
+        if (Get-Command Get-EcfMgContextSafe) {
+            $ctx = Get-EcfMgContextSafe
             if ($ctx) { $tenantId = $ctx.TenantId }
         }
     } catch { $tenantId = '' }
@@ -1346,8 +1376,8 @@ function Invoke-SOC2TypeTwoFromMenu {
     # Resolve tenant info
     $tenantId = ''
     try {
-        if (Get-Command Get-MgContext -ErrorAction SilentlyContinue) {
-            $ctx = Get-MgContext -ErrorAction SilentlyContinue
+        if (Get-Command Get-EcfMgContextSafe) {
+            $ctx = Get-EcfMgContextSafe
             if ($ctx) { $tenantId = $ctx.TenantId }
         }
     } catch { $tenantId = '' }
@@ -2203,7 +2233,17 @@ function Invoke-EcfAssessmentSequence {
         # handler) for zero-latency cancel; a sidecar instead writes the
         # sentinel file once it reads runId from run.started. Either
         # triggers cancellation at the next phase checkpoint.
-        [ref]$CancelFlag
+        [ref]$CancelFlag,
+        # Phase 3c — auth as an observed phase. The caller injects its
+        # existing auth logic (e.g. { Connect-EntraCheck }); no auth code
+        # moves into the runner (the Phase 1 substrate rule). When
+        # supplied, the sequence runs it inside a wrapped `Auth` phase
+        # FIRST and emits auth.browser/auth.devicecode (per -AuthMethod)
+        # then auth.succeeded / auth.failed. $null = no Auth phase
+        # (pre-authenticated / -SkipAuthentication).
+        [scriptblock]$AuthAction,
+        [ValidateSet('Interactive', 'DeviceCode', 'AppOnly', 'ManagedIdentity', 'Skip')]
+        [string]$AuthMethod = 'Interactive'
     )
 
     if ($ErrorActionStop) { $ErrorActionPreference = "Stop" }
@@ -2531,8 +2571,8 @@ function Start-ScheduledMode {
     if (-not $SkipAuthentication) {
         # In scheduled mode, use managed identity or service principal
         # This assumes pre-authenticated session
-        $graphContext = Get-MgContext -ErrorAction SilentlyContinue
-        $azContext = Get-AzContext -ErrorAction SilentlyContinue
+        $graphContext = Get-EcfMgContextSafe
+        $azContext = Get-EcfAzContextSafe
         
         if (-not $graphContext -and -not $azContext) {
             throw "No active authentication session. Use -SkipAuthentication with pre-authenticated context."
