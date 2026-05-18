@@ -64,8 +64,9 @@ Describe 'Schema shape — every event' {
         }
     }
 
-    It 'only emits known v1.0 event types' {
-        $known = @('run.started', 'phase.started', 'phase.progress', 'phase.completed', 'log', 'warning', 'auth.info', 'run.result')
+    It 'only emits known v1.x event types' {
+        # Additive within v1: run.cancelled added in Phase 3a.
+        $known = @('run.started', 'phase.started', 'phase.progress', 'phase.completed', 'log', 'warning', 'auth.info', 'run.cancelled', 'run.result')
         foreach ($e in $script:Ctx.Events) { $known | Should -Contain $e.type }
     }
 
@@ -302,5 +303,98 @@ Describe 'In-process EventSink (Phase 2 2a)' {
         $ctx.EventSink | Should -BeNullOrEmpty
         Start-EcfRun -Context $ctx
         $ctx.Events[0].type | Should -BeExactly 'run.started'
+    }
+}
+
+Describe 'Cancellation primitives (Phase 3a)' {
+
+    BeforeEach {
+        $script:Tmp = Join-Path $env:TEMP "rc-cancel-$([guid]::NewGuid().ToString('N'))"
+        $null = New-Item -Path $script:Tmp -ItemType Directory -Force
+    }
+    AfterEach {
+        if (Test-Path $script:Tmp) { Remove-Item -LiteralPath $script:Tmp -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'sentinel path is <out>/.runs/<runId>.cancel' {
+        $ctx = New-EcfRunContext -RunId 'cx1' -Params @{} -OutputDirectory $script:Tmp
+        Get-EcfCancelSentinelPath -Context $ctx |
+            Should -BeExactly (Join-Path (Join-Path $script:Tmp '.runs') 'cx1.cancel')
+    }
+
+    It 'Test-EcfCancelled is false by default and has no side effects' {
+        $ctx = New-EcfRunContext -RunId 'cx2' -Params @{} -OutputDirectory $script:Tmp
+        Test-EcfCancelled -Context $ctx | Should -BeFalse
+        # side-effect-free: must not create the .runs dir or sentinel
+        (Test-Path (Join-Path $script:Tmp '.runs')) | Should -BeFalse
+    }
+
+    It 'cancels via the in-process ref flag' {
+        $flag = $false
+        $ref = [ref]$flag
+        $ctx = New-EcfRunContext -RunId 'cx3' -Params @{} -OutputDirectory $script:Tmp -CancelFlag $ref
+        Test-EcfCancelled -Context $ctx | Should -BeFalse
+        $ref.Value = $true
+        Test-EcfCancelled -Context $ctx | Should -BeTrue
+    }
+
+    It 'cancels via the filesystem sentinel' {
+        $ctx = New-EcfRunContext -RunId 'cx4' -Params @{} -OutputDirectory $script:Tmp
+        $null = New-Item -Path (Join-Path $script:Tmp '.runs') -ItemType Directory -Force
+        Set-Content -LiteralPath (Get-EcfCancelSentinelPath -Context $ctx) -Value '' -Encoding UTF8
+        Test-EcfCancelled -Context $ctx | Should -BeTrue
+    }
+
+    It 'Set-EcfCancelled marks the run and emits run.cancelled exactly once' {
+        $ctx = New-EcfRunContext -RunId 'cx5' -Params @{} -OutputDirectory $script:Tmp
+        Start-EcfRun -Context $ctx
+        Set-EcfCancelled -Context $ctx -Reason 'user requested'
+        Set-EcfCancelled -Context $ctx
+        $ctx.Cancelled | Should -BeTrue
+        @($ctx.Events | Where-Object { $_.type -eq 'run.cancelled' }).Count | Should -Be 1
+        ($ctx.Events | Where-Object { $_.type -eq 'run.cancelled' }).reason | Should -BeExactly 'user requested'
+    }
+
+    It 'Cancelled outranks a fatal error and retains partial artifacts' {
+        $ctx = New-EcfRunContext -RunId 'cx6' -Params @{} -OutputDirectory $script:Tmp
+        Start-EcfRun -Context $ctx
+        Add-EcfArtifact -Context $ctx -Kind 'cockpit-html' -Path $script:Tmp
+        Write-EcfError -Context $ctx -Message 'boom' -Code 'E1' -Fatal
+        Set-EcfCancelled -Context $ctx
+        $m = New-EcfRunManifest -Context $ctx
+        $m.status | Should -BeExactly 'Cancelled'
+        @($m.artifacts).Count | Should -BeGreaterThan 0
+    }
+
+    It 'Start-EcfRun clears a stale sentinel from a prior run' {
+        $ctx = New-EcfRunContext -RunId 'cx7' -Params @{} -OutputDirectory $script:Tmp
+        $null = New-Item -Path (Join-Path $script:Tmp '.runs') -ItemType Directory -Force
+        Set-Content -LiteralPath (Get-EcfCancelSentinelPath -Context $ctx) -Value '' -Encoding UTF8
+        Start-EcfRun -Context $ctx
+        Test-EcfCancelled -Context $ctx | Should -BeFalse
+        (Test-Path (Get-EcfCancelSentinelPath -Context $ctx)) | Should -BeFalse
+    }
+
+    It 'Complete-EcfRun clears the sentinel and derives Cancelled status' {
+        $ctx = New-EcfRunContext -RunId 'cx8' -Params @{} -OutputDirectory $script:Tmp
+        Start-EcfRun -Context $ctx
+        Set-EcfCancelled -Context $ctx
+        $m = Complete-EcfRun -Context $ctx -Summary @{}
+        $m.status | Should -BeExactly 'Cancelled'
+        (Test-Path (Get-EcfCancelSentinelPath -Context $ctx)) | Should -BeFalse
+        $hist = Get-Content -LiteralPath $m.historyPath -Raw | ConvertFrom-Json
+        $hist.status | Should -BeExactly 'Cancelled'
+        # run.cancelled is part of the emitted stream / sink, not the
+        # manifest shape — assert it on the context's recorded events.
+        @($ctx.Events | Where-Object { $_.type -eq 'run.cancelled' }).Count | Should -BeGreaterThan 0
+    }
+
+    It 'no-cancel run is unaffected (status Succeeded, no sentinel created)' {
+        $ctx = New-EcfRunContext -RunId 'cx9' -Params @{} -OutputDirectory $script:Tmp
+        Start-EcfRun -Context $ctx
+        Add-EcfArtifact -Context $ctx -Kind 'cockpit-html' -Path $script:Tmp
+        $m = Complete-EcfRun -Context $ctx -Summary @{}
+        $m.status | Should -BeExactly 'Succeeded'
+        (Test-Path (Get-EcfCancelSentinelPath -Context $ctx)) | Should -BeFalse
     }
 }

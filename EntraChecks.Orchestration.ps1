@@ -2197,7 +2197,13 @@ function Invoke-EcfAssessmentSequence {
         #     NDJSON, console output comes from the sink.
         [switch]$SkipSequenceSnapshot,
         [switch]$OpenSoc2Browser,
-        [scriptblock]$EventSink
+        [scriptblock]$EventSink,
+        # Phase 3a — in-process cancel signal forwarded to the run
+        # context. The in-process TUI flips this ref (e.g. from a Ctrl+C
+        # handler) for zero-latency cancel; a sidecar instead writes the
+        # sentinel file once it reads runId from run.started. Either
+        # triggers cancellation at the next phase checkpoint.
+        [ref]$CancelFlag
     )
 
     if ($ErrorActionStop) { $ErrorActionPreference = "Stop" }
@@ -2208,7 +2214,19 @@ function Invoke-EcfAssessmentSequence {
     if (Get-Command New-EcfRunContext -ErrorAction SilentlyContinue) {
         $ctxParams = $InvocationParams
         if (-not $ctxParams) { $ctxParams = @{} }
-        $RunContext = New-EcfRunContext -RunId ([guid]::NewGuid().ToString()) -Params $ctxParams -OutputDirectory $OutputDirectory -EmitEvents:$EmitEvents -EventSink $EventSink
+        $ctxArgs = @{
+            RunId = ([guid]::NewGuid().ToString())
+            Params = $ctxParams
+            OutputDirectory = $OutputDirectory
+            EmitEvents = [bool]$EmitEvents
+            EventSink = $EventSink
+        }
+        # [ref] cannot bind $null via an explicit argument — only forward
+        # the cancel ref when the caller actually supplied one.
+        if ($PSBoundParameters.ContainsKey('CancelFlag') -and $CancelFlag) {
+            $ctxArgs['CancelFlag'] = $CancelFlag
+        }
+        $RunContext = New-EcfRunContext @ctxArgs
         Start-EcfRun -Context $RunContext
     }
     $useEvents = ($null -ne $RunContext) -and [bool](Get-Command Write-EcfEvent -ErrorAction SilentlyContinue)
@@ -2223,58 +2241,83 @@ function Invoke-EcfAssessmentSequence {
     }
     function phaseStart { param([string]$Phase) if ($useEvents) { Start-EcfPhase -Context $RunContext -Phase $Phase } }
     function phaseDone { param([string]$Phase, [string]$Status = 'ok') if ($useEvents) { Complete-EcfPhase -Context $RunContext -Phase $Phase -Status $Status } }
+    # Phase 3a — cooperative, coarse cancellation. Polled only at phase
+    # boundaries (the 562-line engine stays uninterruptible mid-module —
+    # documented in the Phase 3 plan). Returns $true once a cancel signal
+    # (sentinel file or in-process ref) is seen, marking the run + emitting
+    # run.cancelled exactly once. No-op when there is no run context.
+    function checkpoint {
+        if (-not $useEvents) { return $false }
+        if (Test-EcfCancelled -Context $RunContext) {
+            Set-EcfCancelled -Context $RunContext
+            return $true
+        }
+        return $false
+    }
 
-    phaseStart 'Modules'
-    $results = Invoke-ModuleAssessment -SelectedModules $ModuleSet -TenantName $TenantNameValue -OutputDir $OutputDirectory
-
+    # Null-init so the return object is safe if phases are skipped by a
+    # pre-run / mid-run cancel.
+    $results = $null
+    $reportDir = $null
     $hybridCorrelation = $null
-    if ($RunHybridCorrelation) {
-        # Correlation pass. Script:Findings was populated by the module dispatcher.
-        $corrModule = Join-Path $script:ModulesPath "EntraChecks-HybridCorrelation.psm1"
-        if (Test-Path $corrModule) {
-            Import-Module $corrModule -Force
-            try {
-                $hybridCorrelation = Get-HybridIdentityCorrelation -Findings $script:Findings
-                narrate "    [OK] Correlated $($hybridCorrelation.CorrelationCount) principals across cloud + on-prem." 'info' 'Green'
-                # PR 5 - push cross-surface findings back into the main pool so risk scoring,
-                # HTML / Excel / CSV renderers, and delta reporting all see them alongside
-                # standard findings. They carry Source='HybridCorrelation' so downstream code
-                # can group / filter if needed.
-                if ($hybridCorrelation.CrossSurfaceCount -gt 0) {
-                    $script:Findings += $hybridCorrelation.CrossSurfaceFindings
-                    narrate "    [OK] Emitted $($hybridCorrelation.CrossSurfaceCount) cross-surface finding(s)." 'info' 'Green'
+    $cancelled = [bool](checkpoint)   # pre-run cancel aborts before any work
+
+    if (-not $cancelled) {
+        phaseStart 'Modules'
+        $results = Invoke-ModuleAssessment -SelectedModules $ModuleSet -TenantName $TenantNameValue -OutputDir $OutputDirectory
+
+        if ($RunHybridCorrelation) {
+            # Correlation pass. Script:Findings was populated by the module dispatcher.
+            $corrModule = Join-Path $script:ModulesPath "EntraChecks-HybridCorrelation.psm1"
+            if (Test-Path $corrModule) {
+                Import-Module $corrModule -Force
+                try {
+                    $hybridCorrelation = Get-HybridIdentityCorrelation -Findings $script:Findings
+                    narrate "    [OK] Correlated $($hybridCorrelation.CorrelationCount) principals across cloud + on-prem." 'info' 'Green'
+                    # PR 5 - push cross-surface findings back into the main pool so risk scoring,
+                    # HTML / Excel / CSV renderers, and delta reporting all see them alongside
+                    # standard findings. They carry Source='HybridCorrelation' so downstream code
+                    # can group / filter if needed.
+                    if ($hybridCorrelation.CrossSurfaceCount -gt 0) {
+                        $script:Findings += $hybridCorrelation.CrossSurfaceFindings
+                        narrate "    [OK] Emitted $($hybridCorrelation.CrossSurfaceCount) cross-surface finding(s)." 'info' 'Green'
+                    }
+                }
+                catch {
+                    narrate "    [!] Correlation pass failed: $($_.Exception.Message)" 'warn' 'Yellow'
                 }
             }
-            catch {
-                narrate "    [!] Correlation pass failed: $($_.Exception.Message)" 'warn' 'Yellow'
+            # Stash correlation output on a script-scope variable so Export-AssessmentResult can pick it up.
+            $script:HybridCorrelationData = $hybridCorrelation
+        }
+        phaseDone 'Modules'
+    }
+
+    if (-not $cancelled -and (checkpoint)) { $cancelled = $true }
+    if (-not $cancelled) {
+        phaseStart 'Report'
+        $reportDir = Export-AssessmentResult -OutputDir $OutputDirectory -TenantName $TenantNameValue -IncludeUnified -GenerateComprehensiveReport:$GenerateComprehensiveReport -GenerateExecutiveSummary:$GenerateExecutiveSummary -GenerateExcelReport:$GenerateExcelReport -GenerateRemediationScripts:$GenerateRemediationScripts -HtmlReportSet $HtmlReportSet -HtmlDeepDiveDomains $HtmlDeepDiveDomains
+        if ($useEvents -and $reportDir -and (Test-Path -LiteralPath $reportDir)) {
+            # Best-effort artifact enumeration so GUI run-history can open
+            # outputs blind. Precise per-renderer enumeration is hardened in
+            # step 4 when the orchestration moves into the module.
+            foreach ($f in (Get-ChildItem -LiteralPath $reportDir -File -ErrorAction SilentlyContinue)) {
+                $kind = switch -Wildcard ($f.Name) {
+                    '*.xlsx' { 'excel'; break }
+                    '*.csv' { 'csv'; break }
+                    '*.json' { 'json'; break }
+                    '*cockpit*.html' { 'cockpit-html'; break }
+                    '*.html' { 'legacy-html'; break }
+                    default { $null }
+                }
+                if ($kind) { Add-EcfArtifact -Context $RunContext -Kind $kind -Path $f.FullName }
             }
         }
-        # Stash correlation output on a script-scope variable so Export-AssessmentResult can pick it up.
-        $script:HybridCorrelationData = $hybridCorrelation
+        phaseDone 'Report'
     }
-    phaseDone 'Modules'
 
-    phaseStart 'Report'
-    $reportDir = Export-AssessmentResult -OutputDir $OutputDirectory -TenantName $TenantNameValue -IncludeUnified -GenerateComprehensiveReport:$GenerateComprehensiveReport -GenerateExecutiveSummary:$GenerateExecutiveSummary -GenerateExcelReport:$GenerateExcelReport -GenerateRemediationScripts:$GenerateRemediationScripts -HtmlReportSet $HtmlReportSet -HtmlDeepDiveDomains $HtmlDeepDiveDomains
-    if ($useEvents -and $reportDir -and (Test-Path -LiteralPath $reportDir)) {
-        # Best-effort artifact enumeration so GUI run-history can open
-        # outputs blind. Precise per-renderer enumeration is hardened in
-        # step 4 when the orchestration moves into the module.
-        foreach ($f in (Get-ChildItem -LiteralPath $reportDir -File -ErrorAction SilentlyContinue)) {
-            $kind = switch -Wildcard ($f.Name) {
-                '*.xlsx' { 'excel'; break }
-                '*.csv' { 'csv'; break }
-                '*.json' { 'json'; break }
-                '*cockpit*.html' { 'cockpit-html'; break }
-                '*.html' { 'legacy-html'; break }
-                default { $null }
-            }
-            if ($kind) { Add-EcfArtifact -Context $RunContext -Kind $kind -Path $f.FullName }
-        }
-    }
-    phaseDone 'Report'
-
-    if (-not $SkipSequenceSnapshot -and $SaveSnapshot) {
+    if (-not $cancelled -and (checkpoint)) { $cancelled = $true }
+    if (-not $cancelled -and -not $SkipSequenceSnapshot -and $SaveSnapshot) {
         phaseStart 'Snapshot'
         $deltaModule = Join-Path $script:ModulesPath "EntraChecks-DeltaReporting.psm1"
         Import-Module $deltaModule -Force
@@ -2286,14 +2329,18 @@ function Invoke-EcfAssessmentSequence {
         phaseDone 'Snapshot'
     }
 
-    # Auto-run SOC 2 readiness when SOC2.Enabled = true in config. Browser
-    # open is suppressed in scripted modes (automation friendly); the
-    # interactive menu passes -OpenSoc2Browser to preserve its behaviour.
-    phaseStart 'SOC2'
-    Invoke-SOC2ReadinessIfEnabled -TenantName $TenantNameValue -OutputDirectory $OutputDirectory -OpenBrowser ([bool]$OpenSoc2Browser)
-    phaseDone 'SOC2'
+    if (-not $cancelled -and (checkpoint)) { $cancelled = $true }
+    if (-not $cancelled) {
+        # Auto-run SOC 2 readiness when SOC2.Enabled = true in config. Browser
+        # open is suppressed in scripted modes (automation friendly); the
+        # interactive menu passes -OpenSoc2Browser to preserve its behaviour.
+        phaseStart 'SOC2'
+        Invoke-SOC2ReadinessIfEnabled -TenantName $TenantNameValue -OutputDirectory $OutputDirectory -OpenBrowser ([bool]$OpenSoc2Browser)
+        phaseDone 'SOC2'
+    }
 
-    if ($DoCompareWithLast) {
+    if (-not $cancelled -and (checkpoint)) { $cancelled = $true }
+    if (-not $cancelled -and $DoCompareWithLast) {
         phaseStart 'Snapshot'
         $deltaModule = Join-Path $script:ModulesPath "EntraChecks-DeltaReporting.psm1"
         Import-Module $deltaModule -Force

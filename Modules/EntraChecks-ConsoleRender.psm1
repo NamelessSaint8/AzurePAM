@@ -120,6 +120,12 @@ function Show-EcfRunStream {
                 }
             }
 
+            'run.cancelled' {
+                $reason = if ($Event.PSObject.Properties['reason']) { [string]$Event.reason } else { 'cancel requested' }
+                Write-Host ''
+                Write-Host ("[!] Cancelling - {0} (finishing the current step)" -f $reason) -ForegroundColor Yellow
+            }
+
             'run.result' {
                 $status = if ($Event.PSObject.Properties['status']) { [string]$Event.status } else { '' }
                 $startU = if ($Event.PSObject.Properties['startedUtc']) { [string]$Event.startedUtc } else { '' }

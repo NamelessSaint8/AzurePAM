@@ -137,6 +137,21 @@ Describe 'Show-EcfRunStream — §4 event → console mapping' {
             $Object -eq '    [!] E1: fatal thing' -and $ForegroundColor -eq 'Red'
         } -Times 1
     }
+
+    It 'run.cancelled → yellow cancelling notice with the reason' {
+        Show-EcfRunStream -Event (Evt @{ type = 'run.cancelled'; reason = 'user requested' })
+        Should -Invoke -ModuleName EntraChecks-ConsoleRender Write-Host -ParameterFilter {
+            $Object -eq '[!] Cancelling - user requested (finishing the current step)' -and $ForegroundColor -eq 'Yellow'
+        } -Times 1
+    }
+
+    It 'run.result Cancelled → dark-gray completion header' {
+        $evt = Evt @{ type = 'run.result'; status = 'Cancelled'; startedUtc = '2026-05-18T10:00:00Z'; endedUtc = '2026-05-18T10:00:30Z'; artifacts = @(); errors = @() }
+        Show-EcfRunStream -Event $evt
+        Should -Invoke -ModuleName EntraChecks-ConsoleRender Write-Host -ParameterFilter {
+            $Object -eq '[+] Assessment Complete - Cancelled' -and $ForegroundColor -eq 'DarkGray'
+        } -Times 1
+    }
 }
 
 Describe 'Show-EcfRunStream — robustness' {

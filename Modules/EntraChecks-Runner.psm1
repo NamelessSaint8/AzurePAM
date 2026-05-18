@@ -119,7 +119,15 @@ function New-EcfRunContext {
         # re-platformed TUI's Show-EcfRunStream) can react live without
         # parsing the runner's own stdout. Additive: the contract /
         # schema is unchanged; the sink only observes.
-        [scriptblock]$EventSink
+        [scriptblock]$EventSink,
+        # Native App Plan, Phase 3 (3a). Optional in-process cancel
+        # signal. The runner cancels if EITHER this ref is truthy OR the
+        # filesystem sentinel <OutputDirectory>/.runs/<runId>.cancel
+        # exists. The ref gives the in-process TUI zero-latency cancel;
+        # the sentinel gives the Phase 4 Tauri sidecar a process-boundary
+        # cancel. Cooperative + coarse (polled at phase boundaries).
+        [AllowNull()]
+        [ref]$CancelFlag
     )
 
     if (-not $RunId) { $RunId = [guid]::NewGuid().ToString() }
@@ -132,6 +140,8 @@ function New-EcfRunContext {
         OutputDirectory = $OutputDirectory
         EmitEvents = [bool]$EmitEvents
         EventSink = $EventSink
+        CancelFlag = $CancelFlag
+        Cancelled = $false
         SafeParams = (ConvertTo-EcfSafeParams -Params $Params)
         Events = (New-Object System.Collections.Generic.List[object])
         Artifacts = (New-Object System.Collections.Generic.List[object])
@@ -204,6 +214,9 @@ function Start-EcfRun {
     param([Parameter(Mandatory)][pscustomobject]$Context)
     if ($Context.RunStarted) { return }
     $Context.RunStarted = $true
+    # Clear any stale sentinel from a prior run so it can't cancel this
+    # one (Phase 3a stale-sentinel guard).
+    Clear-EcfCancelSentinel -Context $Context
     Write-EcfEvent -Context $Context -Type 'run.started' -Data @{
         params = $Context.SafeParams
     }
@@ -392,16 +405,91 @@ function Add-EcfArtifact {
 
 <#
 .SYNOPSIS
+    Path of this run's filesystem cancel sentinel:
+    <OutputDirectory>/.runs/<runId>.cancel  (mirrors the run-history
+    location so a sidecar that knows the run dir can cancel it).
+#>
+function Get-EcfCancelSentinelPath {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([Parameter(Mandatory)][pscustomobject]$Context)
+    $dir = $Context.OutputDirectory
+    if (-not $dir) { $dir = '.' }
+    return (Join-Path (Join-Path $dir '.runs') ("{0}.cancel" -f $Context.RunId))
+}
+
+<#
+.SYNOPSIS
+    Removes this run's cancel sentinel if present. Called at run start
+    (so a stale sentinel from a prior run can't cancel this one) and at
+    run completion (cleanup). Best-effort; never throws.
+#>
+function Clear-EcfCancelSentinel {
+    [CmdletBinding()]
+    [OutputType([void])]
+    param([Parameter(Mandatory)][pscustomobject]$Context)
+    $p = Get-EcfCancelSentinelPath -Context $Context
+    if (Test-Path -LiteralPath $p) {
+        Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue
+    }
+}
+
+<#
+.SYNOPSIS
+    Pure predicate — $true if cancellation has been requested: the run
+    is already marked cancelled, OR the in-process -CancelFlag ref is
+    truthy, OR the filesystem sentinel exists. No side effects (the
+    sequence polls this at every phase boundary).
+#>
+function Test-EcfCancelled {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param([Parameter(Mandatory)][pscustomobject]$Context)
+    if ($Context.PSObject.Properties['Cancelled'] -and $Context.Cancelled) { return $true }
+    if ($Context.PSObject.Properties['CancelFlag'] -and $Context.CancelFlag) {
+        try { if ($Context.CancelFlag.Value) { return $true } }
+        catch { Write-Verbose "CancelFlag deref failed (ignored): $_" }
+    }
+    return (Test-Path -LiteralPath (Get-EcfCancelSentinelPath -Context $Context))
+}
+
+<#
+.SYNOPSIS
+    Marks the run cancelled and emits run.cancelled exactly once. The
+    sequence calls this when a checkpoint observes cancellation; the
+    terminal status then derives to Cancelled (highest precedence).
+#>
+function Set-EcfCancelled {
+    [CmdletBinding()]
+    [OutputType([void])]
+    param(
+        [Parameter(Mandatory)][pscustomobject]$Context,
+        [string]$Reason = 'cancel requested'
+    )
+    if ($Context.Cancelled) { return }
+    $Context.Cancelled = $true
+    Write-EcfEvent -Context $Context -Type 'run.cancelled' -Data @{ reason = $Reason }
+}
+
+<#
+.SYNOPSIS
     Derives the terminal run status (§5 table).
+      Cancelled          — a cancel signal was honoured (Phase 3a).
+                           Highest precedence: a cancelled run reports
+                           Cancelled even if a fatal error also occurred,
+                           and even though partial artifacts are retained.
       Failed             — a fatal error and no artifact produced.
       PartiallySucceeded — ≥1 artifact but ≥1 phase/module failed.
       Succeeded          — all requested phases ok.
-      Cancelled          — reserved (not reachable in Phase 1).
 #>
 function Get-EcfRunStatus {
     [CmdletBinding()]
     [OutputType([string])]
     param([Parameter(Mandatory)][pscustomobject]$Context)
+
+    if ($Context.PSObject.Properties['Cancelled'] -and $Context.Cancelled) {
+        return 'Cancelled'
+    }
 
     $hasFatal = @($Context.Errors | Where-Object { $_.fatal }).Count -gt 0
     $hasArtifact = $Context.Artifacts.Count -gt 0
@@ -527,6 +615,10 @@ function Complete-EcfRun {
 
     $historyPath = Write-EcfRunHistory -Context $Context -Manifest $manifest -OutputDirectory $Context.OutputDirectory
     Add-Member -InputObject $manifest -MemberType NoteProperty -Name 'historyPath' -Value $historyPath -Force
+
+    # Cleanup: a consumed sentinel must not linger to cancel a later run
+    # that happens to reuse the run dir (Phase 3a).
+    Clear-EcfCancelSentinel -Context $Context
     return $manifest
 }
 
@@ -549,5 +641,10 @@ Export-ModuleMember -Function @(
     'Get-EcfRunStatus',
     'New-EcfRunManifest',
     'Write-EcfRunHistory',
-    'Complete-EcfRun'
+    'Complete-EcfRun',
+    # Phase 3a — cancellation primitives.
+    'Get-EcfCancelSentinelPath',
+    'Clear-EcfCancelSentinel',
+    'Test-EcfCancelled',
+    'Set-EcfCancelled'
 )

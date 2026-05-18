@@ -72,14 +72,17 @@ Describe 'Runner parity — sequence drives the v1.0 contract end-to-end' {
 
         # Mock the heavy orchestration. Export-AssessmentResult drops a
         # report file so the artifact-enumeration path is exercised.
-        $reportDir = Join-Path $script:Tmp 'report'
-        $null = New-Item -Path $reportDir -ItemType Directory -Force
-        Set-Content -LiteralPath (Join-Path $reportDir 'EntraChecks-cockpit.html') -Value '<html></html>' -Encoding UTF8
+        # Script-scoped (not a local named $reportDir): the sequence has
+        # its own $reportDir local, so a same-named mock var would be
+        # captured by dynamic scope instead of this one.
+        $script:ParityReportDir = Join-Path $script:Tmp 'report'
+        $null = New-Item -Path $script:ParityReportDir -ItemType Directory -Force
+        Set-Content -LiteralPath (Join-Path $script:ParityReportDir 'EntraChecks-cockpit.html') -Value '<html></html>' -Encoding UTF8
 
         Mock Invoke-ModuleAssessment {
             [pscustomobject]@{ Duration = [timespan]::FromMinutes(2); Errors = @(); Modules = @{ Core = 'ok' } }
         }
-        Mock Export-AssessmentResult { $reportDir }
+        Mock Export-AssessmentResult { $script:ParityReportDir }
         Mock Invoke-SOC2ReadinessIfEnabled { }
     }
 
@@ -187,5 +190,67 @@ Describe 'Invoke-EntraChecksRun.ps1 — headless wrapper guard' {
         $txt | Should -Match "Mode\s*=\s*'Quick'"
         $txt | Should -Match 'EmitEvents\s*=\s*\[bool\]\$EmitEvents'
         $txt | Should -Match '& \$startScript @forward'
+    }
+}
+
+Describe 'Runner parity — cooperative cancellation (Phase 3a)' {
+
+    BeforeEach {
+        $script:Tmp = Join-Path $env:TEMP "runner-cancel-$([guid]::NewGuid().ToString('N'))"
+        $null = New-Item -Path $script:Tmp -ItemType Directory -Force
+        $OutputDirectory = $script:Tmp
+        $null = $OutputDirectory
+        $script:Findings = @([pscustomobject]@{ Severity = 'High'; Description = 'h' })
+        $script:ReportDir = Join-Path $script:Tmp 'report'
+        $null = New-Item -Path $script:ReportDir -ItemType Directory -Force
+        Set-Content -LiteralPath (Join-Path $script:ReportDir 'EntraChecks-cockpit.html') -Value '<html></html>' -Encoding UTF8
+        Mock Export-AssessmentResult { $script:ReportDir }
+        Mock Invoke-SOC2ReadinessIfEnabled { }
+    }
+    AfterEach {
+        if (Test-Path $script:Tmp) { Remove-Item -LiteralPath $script:Tmp -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'pre-run cancel aborts before any module work; status Cancelled' {
+        Mock Invoke-ModuleAssessment { [pscustomobject]@{ Duration = [timespan]::Zero; Errors = @(); Modules = @{} } }
+        $flag = $true                                  # cancel requested before the run
+        $seq = Invoke-EcfAssessmentSequence -TenantNameValue 'Contoso' -ModuleSet @('Core') `
+            -InvocationParams @{ TenantName = 'Contoso'; OutputDirectory = $script:Tmp } -EmitEvents `
+            -CancelFlag ([ref]$flag)
+        $seq.Manifest.status | Should -BeExactly 'Cancelled'
+        Should -Invoke Invoke-ModuleAssessment -Times 0 -Exactly
+        Should -Invoke Export-AssessmentResult -Times 0 -Exactly
+    }
+
+    It 'mid-run cancel after Modules skips Report/SOC2; status Cancelled; run.cancelled emitted' {
+        $flag = $false
+        $ref = [ref]$flag
+        # The engine "runs", then a cancel arrives before the next checkpoint.
+        Mock Invoke-ModuleAssessment {
+            $ref.Value = $true
+            [pscustomobject]@{ Duration = [timespan]::FromMinutes(1); Errors = @(); Modules = @{ Core = 'ok' } }
+        }
+        $seen = New-Object System.Collections.Generic.List[object]
+        $sink = { param($e) $seen.Add($e) | Out-Null }
+        $seq = Invoke-EcfAssessmentSequence -TenantNameValue 'Contoso' -ModuleSet @('Core') `
+            -InvocationParams @{ TenantName = 'Contoso'; OutputDirectory = $script:Tmp } `
+            -EventSink $sink -CancelFlag $ref
+        $seq.Manifest.status | Should -BeExactly 'Cancelled'
+        Should -Invoke Invoke-ModuleAssessment -Times 1 -Exactly
+        Should -Invoke Export-AssessmentResult -Times 0 -Exactly       # Report skipped post-Modules checkpoint
+        @($seen | Where-Object { $_.type -eq 'run.cancelled' }).Count | Should -BeGreaterThan 0
+        # Phases stay balanced even on the cancel path.
+        $st = @($seen | Where-Object { $_.type -eq 'phase.started' } | ForEach-Object { $_.phase } | Sort-Object)
+        $cp = @($seen | Where-Object { $_.type -eq 'phase.completed' } | ForEach-Object { $_.phase } | Sort-Object)
+        $st | Should -Be $cp
+    }
+
+    It 'no cancel → unchanged: status Succeeded, Modules+Report invoked' {
+        Mock Invoke-ModuleAssessment { [pscustomobject]@{ Duration = [timespan]::FromMinutes(1); Errors = @(); Modules = @{ Core = 'ok' } } }
+        $seq = Invoke-EcfAssessmentSequence -TenantNameValue 'Contoso' -ModuleSet @('Core') `
+            -InvocationParams @{ TenantName = 'Contoso'; OutputDirectory = $script:Tmp } -EmitEvents
+        $seq.Manifest.status | Should -BeExactly 'Succeeded'
+        Should -Invoke Invoke-ModuleAssessment -Times 1 -Exactly
+        Should -Invoke Export-AssessmentResult -Times 1 -Exactly
     }
 }

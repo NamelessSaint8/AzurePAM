@@ -121,8 +121,9 @@ Describe 'Sequence param additions are additive (non-interactive unchanged)' {
 
     It 'snapshot gate defaults to the original behaviour (gated on $SaveSnapshot)' {
         # -SkipSequenceSnapshot defaults off, so non-interactive modes
-        # still snapshot exactly when $SaveSnapshot is set.
-        $script:Seq | Should -Match 'if \(-not \$SkipSequenceSnapshot -and \$SaveSnapshot\)'
+        # still snapshot exactly when $SaveSnapshot is set. Phase 3a
+        # additionally prefixes the cancel guard (-not $cancelled).
+        $script:Seq | Should -Match '-not \$SkipSequenceSnapshot -and \$SaveSnapshot'
     }
 
     It 'SOC 2 browser-open defaults to $false (scripted-mode behaviour)' {
@@ -130,7 +131,11 @@ Describe 'Sequence param additions are additive (non-interactive unchanged)' {
     }
 
     It 'forwards the sink to New-EcfRunContext' {
-        $script:Seq | Should -Match 'New-EcfRunContext .* -EventSink \$EventSink'
+        # Phase 3a switched the context creation to a splat
+        # (@ctxArgs) so the cancel ref can be conditionally included;
+        # the sink is still forwarded via that hashtable.
+        $script:Seq | Should -Match "EventSink\s*=\s*\`$EventSink"
+        $script:Seq | Should -Match 'New-EcfRunContext @ctxArgs'
     }
 
     It 'the three non-interactive modes do not pass the Phase 2 interactive switches' {
