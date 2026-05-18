@@ -1373,6 +1373,14 @@ table.remediation-plan a { color: inherit; }
 .prio-badge.prio-4 { background: #6a5fb3; }
 .prio-badge.prio-5 { background: #6c757d; }
 /* PR 3 — Evidence Matrix */
+.em-saved-views { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 12px 0 6px; }
+.em-saved-views-label { font-size: 0.78em; color: #6b7280; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+.em-saved-view { padding: 4px 12px; border: 1px solid #6a5fb3; background: #fff; color: #6a5fb3; border-radius: 14px; font-size: 0.82em; cursor: pointer; }
+.em-saved-view:hover { background: #f3f0fb; }
+.em-saved-view:focus-visible { outline: 3px solid #6a5fb3; outline-offset: 2px; }
+.em-saved-view.active { background: #6a5fb3; color: #fff; }
+.em-saved-view-clear { border-color: #9aa3af; color: #555; }
+.em-saved-view-clear:hover { background: #f0f1f3; }
 .em-filters { display: flex; flex-wrap: wrap; gap: 14px; margin: 12px 0 16px; font-size: 0.85em; }
 .em-filters label { display: flex; align-items: center; gap: 6px; color: #555; }
 .em-filters select { padding: 4px 8px; border: 1px solid #d0d5dc; border-radius: 4px; font-size: 0.95em; }
@@ -1411,7 +1419,7 @@ table.manual-attestation a { color: inherit; }
     .low-confidence-banner { break-inside: avoid; }
     * { -webkit-print-color-adjust: exact !important; color-adjust: exact !important; print-color-adjust: exact !important; }
     .exec-summary .nav-links { display: none; }
-    .em-filters { display: none; }
+    .em-filters, .em-saved-views { display: none; }
     a[href^="#"] { text-decoration: none; color: inherit; }
 }
 </style>
@@ -1698,6 +1706,14 @@ table.manual-attestation a { color: inherit; }
         [void]$sb.AppendLine('<h2>Evidence Matrix</h2>')
         [void]$sb.AppendLine('<p style="color:#555;font-size:0.9em;margin:8px 0 16px;">Every evidence artifact in the bundle, pivoted to its control. <strong>Freshness</strong> is artifact age at render time: Fresh&nbsp;&lt;&nbsp;30d, Aging&nbsp;30&ndash;90d, Stale&nbsp;&ge;&nbsp;90d. Each artifact is hash-verifiable via the manifest.</p>')
 
+        # Saved views (plan §11.5) — one-click preset over the existing
+        # freshness filter. "Stale evidence" is the audit-relevant one.
+        [void]$sb.AppendLine('<div class="em-saved-views" role="group" aria-label="Saved views">')
+        [void]$sb.AppendLine('<span class="em-saved-views-label">Saved views:</span>')
+        [void]$sb.AppendLine('<button type="button" class="em-saved-view" data-em-view="fresh=Stale">Stale evidence</button>')
+        [void]$sb.AppendLine('<button type="button" class="em-saved-view em-saved-view-clear" data-em-view="">Clear</button>')
+        [void]$sb.AppendLine('</div>')
+
         # Filter controls (plain selects + tiny scoped JS).
         [void]$sb.AppendLine('<div class="em-filters">')
         $famOpts = ($emFamilies | ForEach-Object { "<option value='$([System.Web.HttpUtility]::HtmlEncode($_))'>$([System.Web.HttpUtility]::HtmlEncode($_))</option>" }) -join ''
@@ -1751,6 +1767,24 @@ table.manual-attestation a { color: inherit; }
     });
   }
   selects.forEach(function (s) { s.addEventListener('change', apply); });
+  // Saved views (§11.5): clear every select, apply the data-em-view
+  // "key=value" pair (empty = just clear), re-run the same apply().
+  var views = sect.querySelectorAll('.em-saved-view');
+  views.forEach(function (b) {
+    b.addEventListener('click', function () {
+      selects.forEach(function (s) { s.value = ''; });
+      var spec = b.getAttribute('data-em-view') || '';
+      var eq = spec.indexOf('=');
+      if (eq > 0) {
+        var k = spec.substring(0, eq);
+        var v = spec.substring(eq + 1);
+        selects.forEach(function (s) { if (s.getAttribute('data-em-filter') === k) { s.value = v; } });
+      }
+      apply();
+      views.forEach(function (x) { x.classList.remove('active'); });
+      b.classList.add('active');
+    });
+  });
 })();
 </script>
 '@)

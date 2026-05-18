@@ -1291,6 +1291,13 @@ function Get-CockpitFullFindingsSection {
 <section class="cockpit-section cockpit-interactive" id="full-findings" data-max-initial-rows="$MaxInitialRows">
     <h2 class="cockpit-section-title">Full Findings (<span class="cockpit-total-count">$($sorted.Count)</span>)</h2>
     <p class="cockpit-section-lede">Every finding from this run &mdash; including accepted risks, false positives, out-of-scope, OK, and INFO. Use the filters to narrow down; click any row to expand.</p>
+    <div class="cockpit-saved-views" role="group" aria-label="Saved views">
+        <span class="cockpit-saved-views-label">Saved views:</span>
+        <button type="button" class="cockpit-saved-view" data-view-set="review-state=actionrequired">Owner queue</button>
+        <button type="button" class="cockpit-saved-view" data-view-set="exception-status=expired">Expired exceptions</button>
+        <button type="button" class="cockpit-saved-view" data-view-set="due-bucket=due-0-7">Due within 7 days</button>
+        <button type="button" class="cockpit-saved-view cockpit-saved-view-clear" data-view-set="">Clear filters</button>
+    </div>
     <div class="cockpit-filters">
         <input type="search" placeholder="Search description, object, owner..." data-filter-key="_search" aria-label="Search Full Findings" />
         <select data-filter-key="status" aria-label="Filter by status">
@@ -1521,6 +1528,39 @@ function Get-CockpitJavaScript {
           showMore(b.getAttribute('data-section-id'));
         });
       })(btns[k]);
+    }
+
+    // Saved views (plan §11.5). A saved-view button is a preset over the
+    // section's existing data-filter-key controls: clear them all, then
+    // apply the "key=value;key=value" pairs from data-view-set (empty =
+    // just clear), then run the same applyFilters the manual controls
+    // use. No new filter engine — purely drives the existing one.
+    var savedViews = document.querySelectorAll('.cockpit-saved-view');
+    for (var sv = 0; sv < savedViews.length; sv++) {
+      (function (b) {
+        b.addEventListener('click', function () {
+          var section = b.closest('.cockpit-section');
+          if (!section) return;
+          var fe = section.querySelectorAll('[data-filter-key]');
+          for (var x = 0; x < fe.length; x++) { fe[x].value = ''; }
+          var spec = b.getAttribute('data-view-set') || '';
+          if (spec) {
+            var pairs = spec.split(';');
+            for (var p = 0; p < pairs.length; p++) {
+              var eq = pairs[p].indexOf('=');
+              if (eq < 1) continue;
+              var fk = pairs[p].substring(0, eq);
+              var fv = pairs[p].substring(eq + 1);
+              var el = section.querySelector('[data-filter-key="' + fk + '"]');
+              if (el) { el.value = fv; }
+            }
+          }
+          applyFilters(section.id);
+          var all = section.querySelectorAll('.cockpit-saved-view');
+          for (var a = 0; a < all.length; a++) { all[a].classList.remove('active'); }
+          b.classList.add('active');
+        });
+      })(savedViews[sv]);
     }
 
     // Initial pass so counters and pagination are correct on first paint.
@@ -1925,6 +1965,14 @@ function Get-CockpitCss {
 .cockpit-queue-table th { background: #f0f3f7; font-weight: 600; }
 .cockpit-queue-table tr:hover { background: #fafbfc; }
 /* PR 3: interactive queue styles */
+.cockpit-saved-views { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 10px; }
+.cockpit-saved-views-label { font-size: 0.82em; color: #6b7280; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+.cockpit-saved-view { padding: 5px 12px; border: 1px solid #0078d4; background: #fff; color: #0078d4; border-radius: 14px; font-size: 0.85em; cursor: pointer; }
+.cockpit-saved-view:hover { background: #eaf3fb; }
+.cockpit-saved-view:focus-visible { outline: 3px solid #0078d4; outline-offset: 2px; }
+.cockpit-saved-view.active { background: #0078d4; color: #fff; }
+.cockpit-saved-view-clear { border-color: #9aa3af; color: #555; }
+.cockpit-saved-view-clear:hover { background: #f0f1f3; }
 .cockpit-filters { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; align-items: center; }
 .cockpit-filters input[type="search"], .cockpit-filters select { padding: 6px 10px; border: 1px solid #d0d5dc; border-radius: 4px; font-size: 0.9em; background: #fff; }
 .cockpit-filters input[type="search"] { flex: 1 1 240px; min-width: 200px; }
@@ -1967,7 +2015,7 @@ function Get-CockpitCss {
 .cockpit-show-more:hover { background: #0078d4; color: #fff; }
 .cockpit-show-more:focus { outline: 2px solid #0078d4; outline-offset: 2px; }
 @media print {
-    .cockpit-filters, .cockpit-show-more, .cockpit-caret { display: none !important; }
+    .cockpit-filters, .cockpit-saved-views, .cockpit-show-more, .cockpit-caret { display: none !important; }
     .cockpit-row { page-break-inside: avoid; }
     .cockpit-row-body { display: block !important; }
 }
