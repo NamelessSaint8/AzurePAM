@@ -1895,7 +1895,19 @@ function Start-InteractiveMode {
         Show-MainMenu
         
         $choice = Read-Host "  Select option"
-        
+
+        if ($null -eq $choice) {
+            # EOF on stdin (Ctrl+D, or a closed/redirected/exhausted
+            # input stream). Read-Host returns $null, and calling
+            # .ToUpper() on it throws -> [CRITICAL] Unhandled error;
+            # the while($true) loop would otherwise spin on the closed
+            # stream. Treat EOF as a clean Quit.
+            Write-Host ""
+            Disconnect-EntraCheck -Silent
+            Write-Host "`n  Input stream closed. Goodbye!" -ForegroundColor Cyan
+            return
+        }
+
         switch ($choice.ToUpper()) {
             "1" {
                 # Quick Assessment - All Modules
