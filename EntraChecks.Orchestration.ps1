@@ -964,9 +964,30 @@ function Invoke-ModuleAssessment {
         }
 
         if ($results.Errors.Count -gt 0) {
-            Write-Host "`n[!] Additional Errors:" -ForegroundColor Red
+            # $results.Errors is a mixed bag: most call sites append a
+            # string, but the module catch appends @{Module;Error}.
+            # "$err" on that hashtable rendered the useless literal
+            # "System.Collections.Hashtable". Normalise every shape to
+            # a readable line, and drop entries already shown under
+            # Module Failures so the same failure isn't printed twice.
+            $failedKeys = @($failedModules | ForEach-Object { $_.Key })
+            $extra = @()
             foreach ($err in $results.Errors) {
-                Write-Host "  - $err" -ForegroundColor Red
+                if ($err -is [System.Collections.IDictionary]) {
+                    $em = [string]$err['Module']
+                    $etext = [string]$err['Error']
+                    if ($em -and ($failedKeys -contains $em)) { continue }
+                    $extra += $(if ($em) { "${em}: $etext" } else { $etext })
+                }
+                else {
+                    $extra += [string]$err
+                }
+            }
+            if ($extra.Count -gt 0) {
+                Write-Host "`n[!] Additional Errors:" -ForegroundColor Red
+                foreach ($line in $extra) {
+                    Write-Host "  - $line" -ForegroundColor Red
+                }
             }
         }
 
