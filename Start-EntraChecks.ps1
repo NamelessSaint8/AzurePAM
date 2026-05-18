@@ -336,7 +336,10 @@ if (Test-Path $runnerModule) {
 # Initialize logging subsystem (from config or defaults)
 if ($script:Config -and $script:Config.Logging) {
     $logConfig = $script:Config.Logging
-    Initialize-LoggingSubsystem `
+    # $null = : Initialize-LoggingSubsystem returns $true; without this
+    # the bare boolean leaks to stdout (the stray "True" after the
+    # "Logging subsystem initialized" line on a real run).
+    $null = Initialize-LoggingSubsystem `
         -LogDirectory $logConfig.Directory `
         -MinimumLevel $logConfig.MinimumLevel `
         -RetentionDays $logConfig.RetentionDays `
@@ -347,7 +350,7 @@ if ($script:Config -and $script:Config.Logging) {
 } else {
     # Fallback to defaults
     $logLevel = if ($Mode -eq 'Scheduled') { 'INFO' } else { 'INFO' }
-    Initialize-LoggingSubsystem -LogDirectory $script:LogsPath -MinimumLevel $logLevel -RetentionDays 90 -StructuredLogging
+    $null = Initialize-LoggingSubsystem -LogDirectory $script:LogsPath -MinimumLevel $logLevel -RetentionDays 90 -StructuredLogging
 }
 
 Write-AuditLog -EventType "SessionStarted" -Description "EntraChecks session started" -Details @{
