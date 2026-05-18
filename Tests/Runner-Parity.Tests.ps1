@@ -327,3 +327,70 @@ Describe 'Runner parity — orchestration-layer error taxonomy (Phase 3b)' {
         @($seq.Manifest.errors).Count | Should -Be 0
     }
 }
+
+Describe 'Runner parity — auth as an observed phase (Phase 3c)' {
+
+    BeforeEach {
+        $script:Tmp = Join-Path $env:TEMP "runner-auth-$([guid]::NewGuid().ToString('N'))"
+        $null = New-Item -Path $script:Tmp -ItemType Directory -Force
+        $OutputDirectory = $script:Tmp
+        $null = $OutputDirectory
+        $script:Findings = @([pscustomobject]@{ Severity = 'High'; Description = 'h' })
+        $script:AuthReportDir = Join-Path $script:Tmp 'report'
+        $null = New-Item -Path $script:AuthReportDir -ItemType Directory -Force
+        Set-Content -LiteralPath (Join-Path $script:AuthReportDir 'EntraChecks-cockpit.html') -Value '<html></html>' -Encoding UTF8
+        Mock Invoke-ModuleAssessment { [pscustomobject]@{ Duration = [timespan]::FromMinutes(1); Errors = @(); Modules = @{ Core = 'ok' } } }
+        Mock Export-AssessmentResult { $script:AuthReportDir }
+        Mock Invoke-SOC2ReadinessIfEnabled { }
+    }
+    AfterEach {
+        if (Test-Path $script:Tmp) { Remove-Item -LiteralPath $script:Tmp -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'runs the injected auth action inside a balanced Auth phase and emits auth.browser + auth.succeeded' {
+        $script:authRan = $false
+        $action = { $script:authRan = $true }
+        $seen = New-Object System.Collections.Generic.List[object]
+        $sink = { param($e) $seen.Add($e) | Out-Null }
+        $seq = Invoke-EcfAssessmentSequence -TenantNameValue 'Contoso' -ModuleSet @('Core') `
+            -InvocationParams @{ TenantName = 'Contoso'; OutputDirectory = $script:Tmp } `
+            -EventSink $sink -AuthAction $action -AuthMethod 'Interactive'
+        $script:authRan | Should -BeTrue
+        $seq.Manifest.status | Should -BeExactly 'Succeeded'
+        @($seen | Where-Object { $_.type -eq 'auth.browser' }).Count | Should -Be 1
+        @($seen | Where-Object { $_.type -eq 'auth.succeeded' }).Count | Should -Be 1
+        # Auth phase opened + closed (balanced) and ran before Modules.
+        $authStart = ($seen | Where-Object { $_.type -eq 'phase.started' -and $_.phase -eq 'Auth' } | Select-Object -First 1)
+        $modStart = ($seen | Where-Object { $_.type -eq 'phase.started' -and $_.phase -eq 'Modules' } | Select-Object -First 1)
+        $authStart | Should -Not -BeNullOrEmpty
+        ($seen.IndexOf($authStart)) | Should -BeLessThan ($seen.IndexOf($modStart))
+        @($seen | Where-Object { $_.type -eq 'phase.completed' -and $_.phase -eq 'Auth' -and $_.status -eq 'ok' }).Count | Should -Be 1
+    }
+
+    It 'a thrown auth action → auth.failed + taxonomy auth.* error, fatal: Modules never runs, status Failed' {
+        $seen = New-Object System.Collections.Generic.List[object]
+        $sink = { param($e) $seen.Add($e) | Out-Null }
+        $seq = Invoke-EcfAssessmentSequence -TenantNameValue 'Contoso' -ModuleSet @('Core') `
+            -InvocationParams @{ TenantName = 'Contoso'; OutputDirectory = $script:Tmp } `
+            -EventSink $sink -AuthAction { throw 'AADSTS70016 device code expired' } -AuthMethod 'DeviceCode'
+        @($seen | Where-Object { $_.type -eq 'auth.devicecode' }).Count | Should -Be 1
+        $af = @($seen | Where-Object { $_.type -eq 'auth.failed' })
+        $af.Count | Should -Be 1
+        $af[0].code | Should -BeExactly 'auth.cancelled'   # "expired" -> cancelled
+        $seq.Manifest.status | Should -BeExactly 'Failed'
+        @($seq.Manifest.errors | Where-Object { $_.code -eq 'auth.cancelled' -and $_.fatal }).Count | Should -Be 1
+        Should -Invoke Invoke-ModuleAssessment -Times 0 -Exactly
+        # Auth phase still balanced (started + completed-failed).
+        @($seen | Where-Object { $_.type -eq 'phase.completed' -and $_.phase -eq 'Auth' -and $_.status -eq 'failed' }).Count | Should -Be 1
+    }
+
+    It '$null AuthAction => no Auth phase (pre-authenticated / -SkipAuthentication)' {
+        $seen = New-Object System.Collections.Generic.List[object]
+        $sink = { param($e) $seen.Add($e) | Out-Null }
+        $null = Invoke-EcfAssessmentSequence -TenantNameValue 'Contoso' -ModuleSet @('Core') `
+            -InvocationParams @{ TenantName = 'Contoso'; OutputDirectory = $script:Tmp } `
+            -EventSink $sink -AuthAction $null
+        @($seen | Where-Object { $_.type -eq 'phase.started' -and $_.phase -eq 'Auth' }).Count | Should -Be 0
+        @($seen | Where-Object { $_.type -like 'auth.*' }).Count | Should -Be 0
+    }
+}

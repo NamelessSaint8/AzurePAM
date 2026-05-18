@@ -1879,11 +1879,12 @@ function Start-InteractiveMode {
                 if (-not $tenantName) {
                     $tenantName = Read-Host "`n  Enter tenant name"
                 }
-                
-                if (-not $SkipAuthentication) {
-                    $null = Connect-EntraCheck
-                }
-                
+
+                # Phase 3c: auth runs inside the sequence's observed Auth
+                # phase (injected, not inline) so a GUI/TUI sees auth.* events.
+                $authAction = $null
+                if (-not $SkipAuthentication) { $authAction = { $null = Connect-EntraCheck } }
+
                 $allModules = @("Core", "IdentityProtection", "Devices", "SecureScore", "Defender", "AzurePolicy", "Purview")
 
                 # Phase 2 (2c): the run goes through the single runner seam;
@@ -1895,7 +1896,8 @@ function Start-InteractiveMode {
                 $renderSink = { param($e) Show-EcfRunStream -Event $e }
                 $null = Invoke-EcfAssessmentSequence -TenantNameValue $tenantName -ModuleSet $allModules `
                     -InvocationParams (Get-EcfInvocationParams -ResolvedTenant $tenantName) `
-                    -SkipSequenceSnapshot -OpenSoc2Browser -EventSink $renderSink
+                    -SkipSequenceSnapshot -OpenSoc2Browser -EventSink $renderSink `
+                    -AuthAction $authAction -AuthMethod 'Interactive'
 
                 if ($SaveSnapshot -or (Read-Host "`n  Save snapshot for future comparison? (Y/N)").ToUpper() -eq "Y") {
                     $deltaModule = Join-Path $script:ModulesPath "EntraChecks-DeltaReporting.psm1"
@@ -1942,9 +1944,9 @@ function Start-InteractiveMode {
                                     $tenantName = Read-Host "`n  Enter tenant name"
                                 }
 
-                                if (-not $SkipAuthentication) {
-                                    $null = Connect-EntraCheck
-                                }
+                                # Phase 3c: auth injected into the observed Auth phase.
+                                $authAction = $null
+                                if (-not $SkipAuthentication) { $authAction = { $null = Connect-EntraCheck } }
 
                                 # Phase 2 (2c): same single runner seam +
                                 # console renderer as Quick Assessment. No
@@ -1955,7 +1957,8 @@ function Start-InteractiveMode {
                                 $renderSink = { param($e) Show-EcfRunStream -Event $e }
                                 $null = Invoke-EcfAssessmentSequence -TenantNameValue $tenantName -ModuleSet $selectedModules `
                                     -InvocationParams (Get-EcfInvocationParams -ResolvedTenant $tenantName) `
-                                    -SkipSequenceSnapshot -OpenSoc2Browser -EventSink $renderSink
+                                    -SkipSequenceSnapshot -OpenSoc2Browser -EventSink $renderSink `
+                                    -AuthAction $authAction -AuthMethod 'Interactive'
 
                                 Read-Host "  Press Enter to continue"
                             }
@@ -2320,7 +2323,49 @@ function Invoke-EcfAssessmentSequence {
     $fatalAbort = $false
     $cancelled = [bool](checkpoint)   # pre-run cancel aborts before any work
 
-    if (-not $cancelled) {
+    # Phase 3c — auth inside the observed run. The caller injects its
+    # existing auth logic (e.g. { $null = Connect-EntraCheck }); no auth
+    # code lives here (the Phase 1 substrate rule). $AuthAction $null =>
+    # pre-authenticated / -SkipAuthentication, so no Auth phase. On the
+    # legacy/no-runner path the failure is rethrown to preserve pre-3c
+    # propagation (Connect-EntraCheck used to bubble up).
+    if (-not $cancelled -and $AuthAction) {
+        phaseStart 'Auth'
+        try {
+            if ($useEvents) {
+                switch ($AuthMethod) {
+                    'DeviceCode' { Write-EcfAuthDeviceCode -Context $RunContext }
+                    'Interactive' { Write-EcfAuthBrowser -Context $RunContext }
+                    default { Write-EcfAuthInfo -Context $RunContext -Method $AuthMethod -Message 'Using a pre-authenticated / non-interactive session' }
+                }
+            }
+            & $AuthAction
+            if ($useEvents) {
+                $acct = ''
+                $mgCtx = Get-EcfMgContextSafe
+                if ($mgCtx -and $mgCtx.Account) { $acct = [string]$mgCtx.Account }
+                Write-EcfAuthSucceeded -Context $RunContext -Account $acct -Method $AuthMethod
+            }
+            phaseDone 'Auth'
+        }
+        catch {
+            $authMsg = $_.Exception.Message
+            $authCode = if ($authMsg -match 'insufficient|privilege|consent|scope|forbidden') { 'auth.insufficientPrivileges' }
+            elseif ($authMsg -match 'cancel|timed out|timeout|expired|declined') { 'auth.cancelled' }
+            else { 'auth.failed' }
+            if ($useEvents) {
+                Write-EcfAuthFailed -Context $RunContext -Message $authMsg -Code $authCode
+                Complete-EcfPhase -Context $RunContext -Phase 'Auth' -Status 'failed'
+                $fatalAbort = $true   # auth.* codes are catalog-fatal
+            }
+            else {
+                throw
+            }
+        }
+    }
+
+    if (-not $cancelled -and -not $fatalAbort -and (checkpoint)) { $cancelled = $true }
+    if (-not $cancelled -and -not $fatalAbort) {
         phaseStart 'Modules'
         try {
             $results = Invoke-ModuleAssessment -SelectedModules $ModuleSet -TenantName $TenantNameValue -OutputDir $OutputDirectory
@@ -2508,9 +2553,9 @@ function Start-QuickMode {
         $TenantName = Read-Host "Enter tenant name"
     }
 
-    if (-not $SkipAuthentication) {
-        $null = Connect-EntraCheck
-    }
+    # Phase 3c: auth runs inside the sequence's observed Auth phase.
+    $authAction = $null
+    if (-not $SkipAuthentication) { $authAction = { $null = Connect-EntraCheck } }
 
     $modulesToRun = if ($Modules -contains "All" -or -not $Modules) {
         @("Core", "IdentityProtection", "Devices", "SecureScore", "Defender", "AzurePolicy", "Purview")
@@ -2519,7 +2564,7 @@ function Start-QuickMode {
         $Modules
     }
 
-    $seq = Invoke-EcfAssessmentSequence -TenantNameValue $TenantName -ModuleSet $modulesToRun -DoCompareWithLast:$CompareWithLast -InvocationParams (Get-EcfInvocationParams -ResolvedTenant $TenantName) -EmitEvents:$EmitEvents
+    $seq = Invoke-EcfAssessmentSequence -TenantNameValue $TenantName -ModuleSet $modulesToRun -DoCompareWithLast:$CompareWithLast -InvocationParams (Get-EcfInvocationParams -ResolvedTenant $TenantName) -EmitEvents:$EmitEvents -AuthAction $authAction -AuthMethod 'Interactive'
 
     Write-Host "`n[+] Assessment Complete" -ForegroundColor Green
     Write-Host "    Duration: $($seq.Results.Duration.TotalMinutes.ToString('0.0')) minutes" -ForegroundColor Cyan
@@ -2543,14 +2588,14 @@ function Start-HybridMode {
         $TenantName = Read-Host "Enter tenant name"
     }
 
-    if (-not $SkipAuthentication) {
-        $null = Connect-EntraCheck
-    }
+    # Phase 3c: auth runs inside the sequence's observed Auth phase.
+    $authAction = $null
+    if (-not $SkipAuthentication) { $authAction = { $null = Connect-EntraCheck } }
 
     # Core cloud set + Hybrid (AD Connect health) + on-prem AD.
     $hybridModules = @('Core', 'IdentityProtection', 'Devices', 'SecureScore', 'Defender', 'AzurePolicy', 'Purview', 'ActiveDirectory')
 
-    $seq = Invoke-EcfAssessmentSequence -TenantNameValue $TenantName -ModuleSet $hybridModules -RunHybridCorrelation -InvocationParams (Get-EcfInvocationParams -ResolvedTenant $TenantName) -EmitEvents:$EmitEvents
+    $seq = Invoke-EcfAssessmentSequence -TenantNameValue $TenantName -ModuleSet $hybridModules -RunHybridCorrelation -InvocationParams (Get-EcfInvocationParams -ResolvedTenant $TenantName) -EmitEvents:$EmitEvents -AuthAction $authAction -AuthMethod 'Interactive'
 
     Write-Host "`n[+] Hybrid Analysis Complete" -ForegroundColor Green
     Write-Host "    Duration: $($seq.Results.Duration.TotalMinutes.ToString('0.0')) minutes" -ForegroundColor Cyan

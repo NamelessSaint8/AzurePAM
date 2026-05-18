@@ -74,10 +74,13 @@ Describe 'Menu run actions route through the runner seam' {
 
     It 'preserves the interactive UX: tenant prompt, Connect preamble, press-enter' {
         $script:Menu | Should -Match 'Enter tenant name'
-        # Connect preamble preserved. The real-run hardening fix
-        # suppresses the return ($null = Connect-EntraCheck) so the
-        # function's success bool can't leak to stdout — allow that.
-        $script:Menu | Should -Match 'if \(-not \$SkipAuthentication\) \{\s*(\$null = )?Connect-EntraCheck'
+        # Phase 3c relocated auth into the sequence's observed Auth
+        # phase: the run actions no longer call Connect-EntraCheck
+        # inline; they build an injected auth action gated by
+        # -SkipAuthentication and pass it as -AuthAction. The Connect
+        # preamble is preserved, now as that injected scriptblock.
+        $script:Menu | Should -Match 'if \(-not \$SkipAuthentication\) \{ \$authAction = \{ \$null = Connect-EntraCheck \} \}'
+        $script:Menu | Should -Match '-AuthAction \$authAction -AuthMethod ''Interactive'''
         $script:Menu | Should -Match 'Press Enter to continue'
     }
 

@@ -154,6 +154,52 @@ Describe 'Show-EcfRunStream — §4 event → console mapping' {
     }
 }
 
+Describe 'Show-EcfRunStream — auth.* events (Phase 3c)' {
+
+    BeforeEach { Mock -ModuleName EntraChecks-ConsoleRender Write-Host {} }
+
+    It 'auth.browser → cyan opening-browser line' {
+        Show-EcfRunStream -Event (Evt @{ type = 'auth.browser'; message = 'Opening the system browser to sign in...' })
+        Should -Invoke -ModuleName EntraChecks-ConsoleRender Write-Host -ParameterFilter {
+            $Object -eq '    [i] Opening the system browser to sign in...' -and $ForegroundColor -eq 'Cyan'
+        } -Times 1
+    }
+
+    It 'auth.devicecode (Path-3 fallback: no code) points at the SDK console line + URL' {
+        Show-EcfRunStream -Event (Evt @{ type = 'auth.devicecode'; userCode = $null; verificationUri = 'https://microsoft.com/devicelogin'; capture = 'sdk-console' })
+        Should -Invoke -ModuleName EntraChecks-ConsoleRender Write-Host -ParameterFilter {
+            $Object -eq '        Code: see the device-code line below (printed by the sign-in SDK)' -and $ForegroundColor -eq 'Yellow'
+        } -Times 1
+        Should -Invoke -ModuleName EntraChecks-ConsoleRender Write-Host -ParameterFilter {
+            $Object -eq '        Open:  https://microsoft.com/devicelogin' -and $ForegroundColor -eq 'Yellow'
+        } -Times 1
+    }
+
+    It 'auth.devicecode with a real code shows the code (future DeviceCodeCredential path)' {
+        Show-EcfRunStream -Event (Evt @{ type = 'auth.devicecode'; userCode = 'ABCD-EFGH'; verificationUri = 'https://microsoft.com/devicelogin'; capture = 'captured' })
+        Should -Invoke -ModuleName EntraChecks-ConsoleRender Write-Host -ParameterFilter {
+            $Object -eq '        Code: ABCD-EFGH' -and $ForegroundColor -eq 'Yellow'
+        } -Times 1
+    }
+
+    It 'auth.succeeded → green signed-in line with account' {
+        Show-EcfRunStream -Event (Evt @{ type = 'auth.succeeded'; account = 'admin@contoso.com'; method = 'Interactive' })
+        Should -Invoke -ModuleName EntraChecks-ConsoleRender Write-Host -ParameterFilter {
+            $Object -eq '    [OK] Signed in as admin@contoso.com' -and $ForegroundColor -eq 'Green'
+        } -Times 1
+    }
+
+    It 'auth.failed → red failure + yellow remediation' {
+        Show-EcfRunStream -Event (Evt @{ type = 'auth.failed'; code = 'auth.cancelled'; message = 'AADSTS50058'; remediation = 'Re-run and complete the prompt.' })
+        Should -Invoke -ModuleName EntraChecks-ConsoleRender Write-Host -ParameterFilter {
+            $Object -eq '    [!] Sign-in failed: AADSTS50058' -and $ForegroundColor -eq 'Red'
+        } -Times 1
+        Should -Invoke -ModuleName EntraChecks-ConsoleRender Write-Host -ParameterFilter {
+            $Object -eq '        -> Re-run and complete the prompt.' -and $ForegroundColor -eq 'Yellow'
+        } -Times 1
+    }
+}
+
 Describe 'Show-EcfRunStream — robustness' {
 
     It 'an unknown/future event type is ignored (forward-compat)' {

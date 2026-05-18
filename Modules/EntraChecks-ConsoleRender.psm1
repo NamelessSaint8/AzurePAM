@@ -110,6 +110,40 @@ function Show-EcfRunStream {
                 Write-Host ("    [i] {0}" -f $text) -ForegroundColor Gray
             }
 
+            'auth.browser' {
+                $msg = if ($Event.PSObject.Properties['message']) { [string]$Event.message } else { 'Opening the system browser to sign in...' }
+                Write-Host ("    [i] {0}" -f $msg) -ForegroundColor Cyan
+            }
+
+            'auth.devicecode' {
+                $uri = if ($Event.PSObject.Properties['verificationUri']) { [string]$Event.verificationUri } else { 'https://microsoft.com/devicelogin' }
+                $code = if ($Event.PSObject.Properties['userCode'] -and $Event.userCode) { [string]$Event.userCode } else { '' }
+                Write-Host ''
+                Write-Host '    [i] Device-code sign-in:' -ForegroundColor Yellow
+                if ($code) {
+                    Write-Host ("        Code: {0}" -f $code) -ForegroundColor Yellow
+                }
+                else {
+                    # Path-3 fallback (the SDK owns the code value) — point
+                    # the user at the console line the Graph SDK prints.
+                    Write-Host '        Code: see the device-code line below (printed by the sign-in SDK)' -ForegroundColor Yellow
+                }
+                Write-Host ("        Open:  {0}" -f $uri) -ForegroundColor Yellow
+            }
+
+            'auth.succeeded' {
+                $acct = if ($Event.PSObject.Properties['account']) { [string]$Event.account } else { '' }
+                $suffix = if ($acct) { " as $acct" } else { '' }
+                Write-Host ("    [OK] Signed in{0}" -f $suffix) -ForegroundColor Green
+            }
+
+            'auth.failed' {
+                $msg = if ($Event.PSObject.Properties['message']) { [string]$Event.message } else { 'authentication failed' }
+                $rem = if ($Event.PSObject.Properties['remediation']) { [string]$Event.remediation } else { '' }
+                Write-Host ("    [!] Sign-in failed: {0}" -f $msg) -ForegroundColor Red
+                if ($rem) { Write-Host ("        -> {0}" -f $rem) -ForegroundColor Yellow }
+            }
+
             'phase.completed' {
                 $status = if ($Event.PSObject.Properties['status']) { [string]$Event.status } else { 'ok' }
                 $phase = [string]$Event.phase
