@@ -118,7 +118,11 @@
 
 [CmdletBinding()]
 param(
-    [string]$ReportDir = "C:\temp\EntraChecks",
+    # Cross-platform default: the hardcoded "C:\temp\EntraChecks"
+    # threw "Cannot find drive 'C'" on macOS/Linux (PS 7), failing the
+    # Core module. GetTempPath() resolves per-OS (Windows %TEMP%,
+    # *nix /tmp or $TMPDIR) and is 5.1-safe.
+    [string]$ReportDir = (Join-Path ([System.IO.Path]::GetTempPath()) 'EntraChecks'),
     [int]$UserInactivityDays = 90,
     [int]$PasswordAgeDays = 180,
     [int]$RecentDays = 30,

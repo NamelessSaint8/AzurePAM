@@ -546,8 +546,13 @@ function Invoke-ModuleAssessment {
                 "Core" {
                     $scriptPath = Join-Path (Join-Path $script:ScriptRoot "Scripts") "Invoke-EntraChecks.ps1"
                     if (Test-Path $scriptPath) {
-                        # Capture findings from Core assessment
-                        $rawOutput = & $scriptPath -NonInteractive
+                        # Capture findings from Core assessment. Pass the
+                        # run's OutputDir as -ReportDir when we have one so
+                        # Core's file exports land with the rest of the run
+                        # (and never fall back to the temp default).
+                        $coreArgs = @{ NonInteractive = $true }
+                        if ($OutputDir) { $coreArgs['ReportDir'] = $OutputDir }
+                        $rawOutput = & $scriptPath @coreArgs
                         # Filter to only actual finding objects (PSCustomObjects with CheckName property)
                         # The script output stream may contain non-finding objects (booleans, strings, hashtables)
                         $coreFindings = @($rawOutput | Where-Object {
