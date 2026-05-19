@@ -233,19 +233,47 @@ pub fn find_upwards(start: &Path, filename: &str) -> Option<PathBuf> {
     None
 }
 
-/// Locate `Invoke-EntraChecksRun.ps1` (the Phase-1 headless contract
-/// entry). `ENTRACHECKS_CORE` overrides; otherwise walk up from the
-/// working dir and the executable's dir (covers `cargo tauri dev`
-/// running from `app/src-tauri`). Bundled-app path resolution is a
-/// Phase-5 packaging concern, recorded there.
-pub fn resolve_core_script() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("ENTRACHECKS_CORE") {
+/// The headless contract entry's filename, and its sub-path inside a
+/// packaged app's resource dir (Phase 5.1 bundles the PS core under
+/// `core/`, mirroring the repo layout `Start-EntraChecks.ps1` expects
+/// as siblings via `$PSScriptRoot`).
+pub const CORE_MARKER: &str = "Invoke-EntraChecksRun.ps1";
+pub const BUNDLED_CORE_SUBPATH: &str = "core/Invoke-EntraChecksRun.ps1";
+
+/// Pure resolve. Order = the Phase-5 §3 contract: (1) the
+/// `ENTRACHECKS_CORE` override (dev / power-user escape hatch), then
+/// (2) the bundled copy under the app resource dir (packaged app),
+/// then (3) a walk up from cwd / exe dir for the repo marker (dev
+/// checkout). Injectable so the order is unit-tested with simulated
+/// dirs.
+pub fn resolve_core_in(
+    env_override: Option<&str>,
+    resource_dir: Option<&Path>,
+    walk_starts: &[PathBuf],
+) -> Option<PathBuf> {
+    if let Some(p) = env_override {
         let pb = PathBuf::from(p);
         if pb.is_file() {
             return Some(pb);
         }
     }
-    const MARKER: &str = "Invoke-EntraChecksRun.ps1";
+    if let Some(rd) = resource_dir {
+        let bundled = rd.join(BUNDLED_CORE_SUBPATH);
+        if bundled.is_file() {
+            return Some(bundled);
+        }
+    }
+    walk_starts
+        .iter()
+        .find_map(|s| find_upwards(s, CORE_MARKER))
+}
+
+/// Locate `Invoke-EntraChecksRun.ps1`. `resource_dir` is the packaged
+/// app's resource directory (from the Tauri path resolver) or `None`
+/// in a dev run; everything else (env override, cwd, exe dir) is read
+/// here and handed to the pure `resolve_core_in`.
+pub fn resolve_core_script(resource_dir: Option<&Path>) -> Option<PathBuf> {
+    let env_override = std::env::var("ENTRACHECKS_CORE").ok();
     let mut starts: Vec<PathBuf> = Vec::new();
     if let Ok(cwd) = std::env::current_dir() {
         starts.push(cwd);
@@ -255,9 +283,7 @@ pub fn resolve_core_script() -> Option<PathBuf> {
             starts.push(p.to_path_buf());
         }
     }
-    starts
-        .iter()
-        .find_map(|s| find_upwards(s, MARKER))
+    resolve_core_in(env_override.as_deref(), resource_dir, &starts)
 }
 
 /// Build the `pwsh` argument vector for a headless run. Owned
@@ -440,6 +466,85 @@ mod tests {
         assert!(!without.iter().any(|x| x == "-SkipAuthentication"));
         // -EmitEvents is non-negotiable: it is how the GUI sees anything.
         assert!(without.iter().any(|x| x == "-EmitEvents"));
+    }
+
+    #[test]
+    fn resolve_order_env_then_bundled_then_walkup() {
+        let base = std::env::temp_dir()
+            .join(format!("ecf_resolve_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+
+        // A fake repo checkout (walk-up target).
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let repo_marker = repo.join(CORE_MARKER);
+        std::fs::write(&repo_marker, "# repo").unwrap();
+
+        // A fake packaged resource dir with the bundled core.
+        let res = base.join("res");
+        std::fs::create_dir_all(res.join("core")).unwrap();
+        let bundled = res.join(BUNDLED_CORE_SUBPATH);
+        std::fs::write(&bundled, "# bundled").unwrap();
+
+        // A fake explicit override.
+        let ovr = base.join("override.ps1");
+        std::fs::write(&ovr, "# override").unwrap();
+
+        let starts = vec![repo.clone()];
+
+        // 1. Override wins over everything.
+        assert_eq!(
+            resolve_core_in(
+                Some(ovr.to_str().unwrap()),
+                Some(&res),
+                &starts
+            ),
+            Some(ovr.clone())
+        );
+        // 2. No override -> bundled resource dir beats walk-up.
+        assert_eq!(
+            resolve_core_in(None, Some(&res), &starts),
+            Some(bundled.clone())
+        );
+        // 3. No override, no bundled -> walk-up (dev checkout).
+        assert_eq!(
+            resolve_core_in(None, None, &starts),
+            Some(repo_marker.clone())
+        );
+        // A non-existent override is ignored, not fatal -> falls through.
+        assert_eq!(
+            resolve_core_in(Some("/no/such/file.ps1"), None, &starts),
+            Some(repo_marker)
+        );
+        // Nothing anywhere -> None (the UI surfaces the actionable error).
+        assert_eq!(resolve_core_in(None, None, &[]), None);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn bundled_resource_manifest_matches_real_source_files() {
+        // Guard: every path the tauri.conf.json `bundle.resources`
+        // manifest references must exist in the repo, so packaging
+        // can't silently ship a broken core. Resolve the repo root via
+        // the marker, then assert each bundled source is present.
+        let cwd = std::env::current_dir().unwrap();
+        let entry = match find_upwards(&cwd, CORE_MARKER) {
+            Some(p) => p,
+            None => return, // not in a checkout (e.g. packaged CI) — skip
+        };
+        let root = entry.parent().unwrap();
+        for rel in [
+            "Invoke-EntraChecksRun.ps1",
+            "Start-EntraChecks.ps1",
+            "EntraChecks.Orchestration.ps1",
+            "Install-Prerequisites.ps1",
+        ] {
+            assert!(root.join(rel).is_file(), "bundled source missing: {rel}");
+        }
+        for dir in ["Scripts", "Modules", "config"] {
+            assert!(root.join(dir).is_dir(), "bundled source dir missing: {dir}");
+        }
     }
 
     #[test]

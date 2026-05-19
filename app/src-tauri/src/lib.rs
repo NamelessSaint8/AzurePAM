@@ -1,16 +1,15 @@
 //! EntraChecks desktop shell — Native App Phase 4 (MVP).
 //!
-//! Step 4.6 (this commit): the **Result screen + Open report** — the
-//! final MVP build step. `run.result` parsing gained the full
-//! severity breakdown (medium/low), `modulesRun`, and the `soc2`
-//! summary block; `open_report` opens an artifact (cockpit HTML) in
-//! the OS default app. The webview turns the terminal line into a
-//! proper result card (status badge, summary grid, taxonomy'd errors,
-//! a per-artifact Open button), completing the
-//! configure→run→watch→open-report loop. Whole-phase discipline
-//! holds: Rust only discovers / spawns / streams / parses / opens —
-//! it never re-implements the engine. Remaining: the step-7 Windows
-//! manual UX pass (the only un-CI-able acceptance).
+//! Phase 5.1 (this commit): packaging groundwork. The EntraChecks PS
+//! core/modules are declared as Tauri bundle resources (under
+//! `core/`, mirroring the repo layout `Start-EntraChecks.ps1` expects
+//! via `$PSScriptRoot`), and `resolve_core_script` is now
+//! resource-aware: `ENTRACHECKS_CORE` override → bundled resource dir
+//! (packaged app) → walk-up (dev checkout). A packaged app has no
+//! repo, so without this it could never find the engine. Earlier
+//! steps (4.1–4.6) delivered the MVP run loop. Whole-phase discipline
+//! holds: Rust discovers / spawns / streams / parses / opens /
+//! packages — it never re-implements the engine.
 //!
 //! `tauri-plugin-opener` is wired now because step 6 ("Open report")
 //! needs it; it is otherwise inert at this stage.
@@ -125,9 +124,10 @@ fn record_run_id(app: &AppHandle, rid: String) {
 #[tauri::command]
 fn run_assessment(app: AppHandle, tenant: String, skip_auth: bool) -> Result<(), String> {
     let pwsh = sidecar::discover_pwsh().map_err(|e| e.to_string())?;
-    let core = sidecar::resolve_core_script().ok_or_else(|| {
-        "Invoke-EntraChecksRun.ps1 was not found. Set ENTRACHECKS_CORE \
-         to its full path, or run from inside the repository."
+    let res_dir = app.path().resource_dir().ok();
+    let core = sidecar::resolve_core_script(res_dir.as_deref()).ok_or_else(|| {
+        "Invoke-EntraChecksRun.ps1 was not found (not bundled, no \
+         ENTRACHECKS_CORE override, and not inside the repository)."
             .to_string()
     })?;
     let tenant = if tenant.trim().is_empty() {
@@ -268,7 +268,7 @@ mod tests {
             Ok(p) => p,
             Err(_) => return,
         };
-        let core = match sidecar::resolve_core_script() {
+        let core = match sidecar::resolve_core_script(None) {
             Some(c) => c,
             None => return,
         };

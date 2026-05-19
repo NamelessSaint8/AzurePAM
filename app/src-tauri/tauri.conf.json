@@ -30,6 +30,15 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "resources": {
+      "../../Invoke-EntraChecksRun.ps1": "core/Invoke-EntraChecksRun.ps1",
+      "../../Start-EntraChecks.ps1": "core/Start-EntraChecks.ps1",
+      "../../EntraChecks.Orchestration.ps1": "core/EntraChecks.Orchestration.ps1",
+      "../../Install-Prerequisites.ps1": "core/Install-Prerequisites.ps1",
+      "../../Scripts/*": "core/Scripts/",
+      "../../Modules/*": "core/Modules/",
+      "../../config/*": "core/config/"
+    }
   }
 }
