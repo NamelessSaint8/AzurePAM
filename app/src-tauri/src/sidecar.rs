@@ -288,6 +288,30 @@ pub fn core_args(
     a
 }
 
+// ---- step 4.5: cooperative cancel (Phase-3a sentinel) ---------------
+
+/// `<output_dir>/.runs/<run_id>.cancel` — the exact path the engine's
+/// `Get-EcfCancelSentinelPath` polls. Pure; unit-tested.
+pub fn cancel_sentinel_path(output_dir: &Path, run_id: &str) -> PathBuf {
+    output_dir
+        .join(".runs")
+        .join(format!("{run_id}.cancel"))
+}
+
+/// Request cancellation by creating the sentinel (its mere existence
+/// is the signal — see `Test-EcfCancelled`). Creates `.runs` if
+/// needed. The engine stops at the next safe checkpoint and emits
+/// `run.cancelled` + a `Cancelled` `run.result`; the shell does not
+/// kill the child (cooperative, artifact-preserving by design).
+pub fn request_cancel(output_dir: &Path, run_id: &str) -> std::io::Result<PathBuf> {
+    let path = cancel_sentinel_path(output_dir, run_id);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, b"cancel requested by EntraChecks desktop\n")?;
+    Ok(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,6 +440,23 @@ mod tests {
         assert!(!without.iter().any(|x| x == "-SkipAuthentication"));
         // -EmitEvents is non-negotiable: it is how the GUI sees anything.
         assert!(without.iter().any(|x| x == "-EmitEvents"));
+    }
+
+    #[test]
+    fn cancel_sentinel_path_matches_engine_convention() {
+        let p = cancel_sentinel_path(Path::new("/out/dir"), "abc-123");
+        assert_eq!(p, Path::new("/out/dir/.runs/abc-123.cancel"));
+    }
+
+    #[test]
+    fn request_cancel_creates_runs_dir_and_file() {
+        let base = std::env::temp_dir()
+            .join(format!("ecf_cancel_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let p = request_cancel(&base, "run-77").expect("write sentinel");
+        assert!(p.is_file(), "sentinel must exist (presence is the signal)");
+        assert_eq!(p, base.join(".runs").join("run-77.cancel"));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

@@ -154,6 +154,11 @@ pub enum ParsedLine {
         /// means the engine is newer than this app; the caller warns
         /// but still renders the known `event`.
         schema_major: u32,
+        /// The envelope `runId` (present on every event). The shell
+        /// captures this to build the Phase-3a cancel sentinel path
+        /// `<outputDir>/.runs/<runId>.cancel`. `None` only if a line
+        /// somehow omits it.
+        run_id: Option<String>,
         event: AppEvent,
     },
 }
@@ -296,6 +301,7 @@ pub fn parse_line(line: &str) -> ParsedLine {
     };
     ParsedLine::Event {
         schema_major: major,
+        run_id: s(&env.rest, "runId"),
         event: map_event(kind, &env.rest),
     }
 }
@@ -374,11 +380,30 @@ mod tests {
             r#"{"schemaVersion":"2.0","type":"phase.started","phase":"Core"}"#,
         );
         match p {
-            ParsedLine::Event { schema_major, event } => {
+            ParsedLine::Event { schema_major, event, .. } => {
                 assert_eq!(schema_major, 2);
                 assert!(schema_major > SUPPORTED_SCHEMA_MAJOR);
                 assert_eq!(event, AppEvent::PhaseStarted { phase: "Core".into() });
             }
+            _ => panic!("expected Event"),
+        }
+    }
+
+    #[test]
+    fn run_id_is_captured_from_the_envelope() {
+        // The shell needs this to build the Phase-3a cancel sentinel
+        // path; it is present on every event, not just run.started.
+        match parse_line(
+            r#"{"schemaVersion":"1.0","type":"phase.started","runId":"abc-123","phase":"Core"}"#,
+        ) {
+            ParsedLine::Event { run_id, .. } => {
+                assert_eq!(run_id.as_deref(), Some("abc-123"))
+            }
+            _ => panic!("expected Event"),
+        }
+        // A line that omits runId still parses; run_id is just None.
+        match parse_line(r#"{"schemaVersion":"1.0","type":"run.started"}"#) {
+            ParsedLine::Event { run_id, .. } => assert_eq!(run_id, None),
             _ => panic!("expected Event"),
         }
     }

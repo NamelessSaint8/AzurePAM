@@ -144,6 +144,33 @@ button.secondary {
   opacity: 0.7;
 }
 
+.auth {
+  border-left: 3px solid #3b82f6;
+}
+
+.dc-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 1.8rem;
+  font-weight: 700;
+  letter-spacing: 3px;
+  padding: 10px 14px;
+  margin: 8px 0;
+  background: #1e1e1e;
+  color: #fff;
+  border-radius: 8px;
+  display: inline-block;
+}
+
+button.link {
+  border: none;
+  background: transparent;
+  color: #2563eb;
+  padding: 0;
+  text-decoration: underline;
+  cursor: pointer;
+  font: inherit;
+}
+
 .logln {
   display: block;
 }
@@ -296,5 +323,8 @@ button:active {
   }
   button.secondary {
     background: transparent;
+  }
+  button.link {
+    color: #6ea8fe;
   }
 }

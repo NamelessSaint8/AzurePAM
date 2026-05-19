@@ -10,6 +10,20 @@ let els = {};
 let supportedMajor = 1;
 const phaseRows = new Map(); // phase name -> <li>
 
+function escapeHtml(s) {
+  return String(s == null ? "" : s).replace(
+    /[&<>"']/g,
+    (c) =>
+      ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;",
+      })[c]
+  );
+}
+
 function logLine(text, cls) {
   const span = document.createElement("span");
   span.className = "logln" + (cls ? " " + cls : "");
@@ -45,6 +59,33 @@ function setPhase(name, state, info) {
   if (info !== undefined) li.querySelector(".ph-info").textContent = info;
 }
 
+function showAuth(html) {
+  els.authBody.innerHTML = html;
+  els.authPanel.classList.remove("hidden");
+}
+function hideAuth() {
+  els.authPanel.classList.add("hidden");
+  els.authBody.innerHTML = "";
+}
+
+function setRunning(on) {
+  els.run.disabled = on;
+  els.cancel.classList.toggle("hidden", !on);
+  els.cancel.disabled = false;
+}
+
+async function cancelRun() {
+  els.cancel.disabled = true;
+  try {
+    await invoke("cancel_run");
+    els.runStatus.textContent = "Cancelling… (finishing the current step)";
+    els.runStatus.className = "run-status st-Cancelled";
+  } catch (e) {
+    logLine(`[cancel] could not request cancel: ${e}`, "warn");
+    els.cancel.disabled = false;
+  }
+}
+
 function onEvent(payload) {
   const { schemaMajor, event } = payload;
   if (schemaMajor > supportedMajor) els.banner.classList.remove("hidden");
@@ -52,7 +93,9 @@ function onEvent(payload) {
   switch (event.type) {
     case "runStarted":
       resetView();
+      hideAuth();
       els.runStatus.textContent = "Running…";
+      setRunning(true);
       break;
     case "phaseStarted":
       setPhase(event.phase, "running", "…");
@@ -78,25 +121,60 @@ function onEvent(payload) {
       logLine(`[warn] ${event.message}  (${event.code})`, "warn");
       break;
     case "authInfo":
-    case "authBrowser":
-      logLine(`[auth] ${event.message || event.type}`);
+      logLine(`[auth] ${event.message || ""}`);
       break;
-    case "authDeviceCode":
+    case "authBrowser":
+      showAuth(
+        `<p>${escapeHtml(
+          event.message || "Opening the system browser to sign in…"
+        )}</p>`
+      );
+      logLine(`[auth] ${event.message || "browser sign-in"}`);
+      break;
+    case "authDeviceCode": {
+      const codeBlock = event.userCode
+        ? `<div class="dc-code">${escapeHtml(event.userCode)}</div>`
+        : `<p class="muted">The sign-in code is printed on the console
+           output below (the Graph SDK owns it).</p>`;
+      showAuth(
+        `<p>To sign in, open the verification page and enter the code:</p>
+         ${codeBlock}
+         <p><button id="dc-open" class="link">Open ${escapeHtml(
+           event.verificationUri
+         )}</button></p>`
+      );
+      const b = document.querySelector("#dc-open");
+      if (b)
+        b.addEventListener("click", () =>
+          invoke("open_external", { target: event.verificationUri }).catch(
+            (e) => logLine(`[auth] could not open browser: ${e}`, "warn")
+          )
+        );
+      logLine(`[auth] device-code sign-in → ${event.verificationUri}`, "warn");
+      break;
+    }
+    case "authSucceeded":
+      hideAuth();
       logLine(
-        `[auth] device code — open ${event.verificationUri}` +
-          (event.userCode ? `, code ${event.userCode}` : " (code on console)"),
-        "warn"
+        `[auth] signed in${event.account ? " as " + event.account : ""}`,
+        "ok"
       );
       break;
-    case "authSucceeded":
-      logLine(`[auth] signed in${event.account ? " as " + event.account : ""}`, "ok");
-      break;
     case "authFailed":
+      showAuth(
+        `<p class="logln error">Sign-in failed: ${escapeHtml(
+          event.message
+        )}</p>` +
+          (event.remediation
+            ? `<p class="muted">→ ${escapeHtml(event.remediation)}</p>`
+            : "")
+      );
       logLine(`[auth] sign-in failed: ${event.message}`, "error");
-      if (event.remediation) logLine("   → " + event.remediation, "hint");
       break;
     case "runCancelled":
       logLine(`[cancel] ${event.reason}`, "warn");
+      els.runStatus.textContent = "Cancelling… (finishing the current step)";
+      els.runStatus.className = "run-status st-Cancelled";
       break;
     case "runResult": {
       const s = event.status;
@@ -112,6 +190,7 @@ function onEvent(payload) {
         event.errors.forEach((e) =>
           logLine(`[error] ${e.code}: ${e.message}`, "error")
         );
+      setRunning(false);
       break;
     }
     case "unknown":
@@ -134,8 +213,9 @@ async function discover() {
 }
 
 async function runAssessment() {
-  els.run.disabled = true;
   resetView();
+  hideAuth();
+  setRunning(true);
   els.runStatus.textContent = "Starting…";
   try {
     await invoke("run_assessment", {
@@ -145,7 +225,7 @@ async function runAssessment() {
   } catch (e) {
     els.runStatus.textContent = `Could not start: ${e}`;
     els.runStatus.classList.add("st-Failed");
-    els.run.disabled = false;
+    setRunning(false);
   }
 }
 
@@ -159,8 +239,12 @@ window.addEventListener("DOMContentLoaded", async () => {
     phases: document.querySelector("#phases"),
     log: document.querySelector("#log-pane"),
     banner: document.querySelector("#schema-banner"),
+    cancel: document.querySelector("#btn-cancel"),
+    authPanel: document.querySelector("#auth-panel"),
+    authBody: document.querySelector("#auth-body"),
   };
   document.querySelector("#btn-run").addEventListener("click", runAssessment);
+  document.querySelector("#btn-cancel").addEventListener("click", cancelRun);
   document.querySelector("#btn-discover").addEventListener("click", discover);
 
   try {
@@ -170,13 +254,17 @@ window.addEventListener("DOMContentLoaded", async () => {
   }
 
   listen("run:event", (e) => onEvent(e.payload));
+  listen("run:cancelling", () => {
+    els.runStatus.textContent = "Cancelling… (finishing the current step)";
+    els.runStatus.className = "run-status st-Cancelled";
+  });
   listen("run:exit", (e) => {
     logLine(`[process exited ${e.payload}]`);
-    els.run.disabled = false;
+    setRunning(false);
   });
   listen("run:error", (e) => {
     logLine(`[process error] ${e.payload}`, "error");
-    els.run.disabled = false;
+    setRunning(false);
   });
 
   discover();

@@ -1,14 +1,16 @@
 //! EntraChecks desktop shell — Native App Phase 4 (MVP).
 //!
-//! Step 4.4 (this commit): the **Live Run** path is joined. A real
-//! `Invoke-EntraChecksRun.ps1 -EmitEvents` assessment is launched
-//! (reusing the 4.2 `spawn_streaming` boundary), every stdout line
-//! is run through the 4.3 `contract` parser, and parsed events are
-//! emitted to the webview which renders phases / progress / log live
-//! plus the "engine newer than app" banner. Auth device-code panel +
-//! Cancel are step 4.5; the rich Result screen + Open report is 4.6.
-//! Whole-phase discipline holds: Rust only discovers / spawns /
-//! streams / parses / opens — it never re-implements the engine.
+//! Step 4.5 (this commit): the **auth panel + Cancel**. The parser
+//! now also surfaces the envelope `runId`; the shell records it (with
+//! the run's output dir) in `RunState` so `cancel_run` can drop the
+//! Phase-3a sentinel `<outputDir>/.runs/<runId>.cancel` — cooperative,
+//! the child is never killed. `open_external` opens the device-code
+//! verification URL via the opener plugin. The webview gets a proper
+//! device-code / browser / signed-in / failed panel and a Cancel
+//! button with a cancelling→cancelled transition. The rich Result
+//! screen + Open-report is 4.6. Whole-phase discipline holds: Rust
+//! only discovers / spawns / streams / parses / opens — it never
+//! re-implements the engine.
 //!
 //! `tauri-plugin-opener` is wired now because step 6 ("Open report")
 //! needs it; it is otherwise inert at this stage.
@@ -16,7 +18,19 @@
 pub mod contract;
 mod sidecar;
 
-use tauri::{AppHandle, Emitter};
+use std::path::PathBuf;
+use std::sync::Mutex;
+use tauri::{AppHandle, Emitter, Manager};
+use tauri_plugin_opener::OpenerExt;
+
+/// The in-flight run, so `cancel_run` can build the Phase-3a sentinel
+/// path. `output_dir` is known when the run starts; `run_id` is
+/// filled from the first streamed event that carries it.
+#[derive(Default)]
+struct RunState {
+    output_dir: Option<PathBuf>,
+    run_id: Option<String>,
+}
 
 /// The desktop shell's own version (the Cargo package version).
 ///
@@ -84,16 +98,30 @@ fn supported_schema_major() -> u32 {
 /// Launch a real headless assessment and stream **parsed** contract
 /// events to the webview. Reuses `spawn_streaming` verbatim (the 4.2
 /// boundary) and `contract::parse_line` (the 4.3 parser) — this step
-/// only joins them. Per parsed line:
-///   - `run:event`  → `{ schemaMajor, event }` (event = the 4.3
-///                     internally-tagged `AppEvent`)
-///   - non-contract / decorative stdout is silently dropped
-/// then a terminal `run:exit` (code) or `run:error` (message).
+/// only joins them. Per parsed line a `run:event`
+/// `{ schemaMajor, event }` is emitted (event = the 4.3
+/// internally-tagged `AppEvent`); non-contract / decorative stdout is
+/// silently dropped; then a terminal `run:exit` (code) or `run:error`
+/// (message).
 ///
-/// Auth (device-code panel) and Cancel are deliberately *not* here —
-/// they are step 4.5; the dedicated Result screen + Open report is
-/// 4.6. This step renders phases/progress/log live and the
-/// schema-newer banner.
+/// Record the run's id the first time the stream reveals it. A free
+/// fn (not an inline block) so the `State` guard's drop order is
+/// unambiguous.
+fn record_run_id(app: &AppHandle, rid: String) {
+    let st = app.state::<Mutex<RunState>>();
+    let mut g = match st.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    if g.run_id.is_none() {
+        g.run_id = Some(rid);
+    }
+}
+
+/// The dedicated Result screen + Open report is 4.6. This step adds
+/// the auth panel + Cancel: the run's `runId` (envelope) and
+/// `output_dir` are recorded in `RunState` so `cancel_run` can drop
+/// the Phase-3a sentinel.
 #[tauri::command]
 fn run_assessment(app: AppHandle, tenant: String, skip_auth: bool) -> Result<(), String> {
     let pwsh = sidecar::discover_pwsh().map_err(|e| e.to_string())?;
@@ -111,13 +139,28 @@ fn run_assessment(app: AppHandle, tenant: String, skip_auth: bool) -> Result<(),
     let core_s = core.to_string_lossy().into_owned();
     let out_s = out_dir.to_string_lossy().into_owned();
 
+    // Arm cancellation state for this run (output dir known now;
+    // run_id arrives with the first event).
+    {
+        let st = app.state::<Mutex<RunState>>();
+        let mut g = st.lock().map_err(|_| "run state poisoned".to_string())?;
+        g.output_dir = Some(out_dir.clone());
+        g.run_id = None;
+    }
+
     std::thread::spawn(move || {
         let args = sidecar::core_args(&core_s, &tenant, &out_s, skip_auth);
         let argrefs: Vec<&str> = args.iter().map(String::as_str).collect();
         let result = sidecar::spawn_streaming(&pwsh.path, &argrefs, |line| {
-            if let contract::ParsedLine::Event { schema_major, event } =
-                contract::parse_line(line)
+            if let contract::ParsedLine::Event {
+                schema_major,
+                run_id,
+                event,
+            } = contract::parse_line(line)
             {
+                if let Some(rid) = run_id {
+                    record_run_id(&app, rid);
+                }
                 let _ = app.emit(
                     "run:event",
                     serde_json::json!({ "schemaMajor": schema_major, "event": event }),
@@ -136,15 +179,52 @@ fn run_assessment(app: AppHandle, tenant: String, skip_auth: bool) -> Result<(),
     Ok(())
 }
 
+/// Cooperatively cancel the in-flight run by writing the Phase-3a
+/// sentinel `<outputDir>/.runs/<runId>.cancel`. The child is *not*
+/// killed — the engine stops at its next safe checkpoint and emits a
+/// `Cancelled` `run.result` with whatever artifacts exist. Fails
+/// cleanly if no run is active or its id hasn't been seen yet.
+#[tauri::command]
+fn cancel_run(app: AppHandle) -> Result<(), String> {
+    let (out_dir, run_id) = {
+        let st = app.state::<Mutex<RunState>>();
+        let g = st.lock().map_err(|_| "run state poisoned".to_string())?;
+        match (g.output_dir.clone(), g.run_id.clone()) {
+            (Some(o), Some(r)) => (o, r),
+            _ => {
+                return Err(
+                    "No cancellable run yet (waiting for the run to report its id)."
+                        .to_string(),
+                )
+            }
+        }
+    };
+    sidecar::request_cancel(&out_dir, &run_id).map_err(|e| e.to_string())?;
+    let _ = app.emit("run:cancelling", run_id);
+    Ok(())
+}
+
+/// Open a URL (device-code verification link now; report artifacts in
+/// 4.6) in the OS default handler via the opener plugin.
+#[tauri::command]
+fn open_external(app: AppHandle, target: String) -> Result<(), String> {
+    app.opener()
+        .open_url(target, None::<&str>)
+        .map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .manage(Mutex::new(RunState::default()))
         .invoke_handler(tauri::generate_handler![
             discover_pwsh_cmd,
             run_sidecar_probe,
             run_assessment,
-            supported_schema_major
+            supported_schema_major,
+            cancel_run,
+            open_external
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
