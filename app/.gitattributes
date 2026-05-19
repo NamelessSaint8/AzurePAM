@@ -1,0 +1,14 @@
+# Contract test fixtures: keep exact bytes (LF) on every platform so
+# the parser tests assert against the same input on Windows CI as on
+# the dev box. The parser is CRLF-tolerant anyway (trim + str::lines),
+# but byte-stable fixtures remove a class of cross-platform surprise.
+*.ndjson -text eol=lf
+
+# Rust/JS sources in app/: normalize to LF (the parent repo's
+# .gitattributes targets the PowerShell tree's CRLF needs).
+*.rs    text eol=lf
+*.toml  text eol=lf
+*.js    text eol=lf
+*.html  text eol=lf
+*.css   text eol=lf
+*.json  text eol=lf
