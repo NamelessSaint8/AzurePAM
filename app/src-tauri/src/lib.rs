@@ -1,18 +1,18 @@
 //! EntraChecks desktop shell — Native App Phase 4 (MVP).
 //!
-//! Step 4.2 (this commit): the **sidecar boundary** is wired. The
-//! shell can discover an installed PowerShell 7 and spawn a child,
-//! streaming its stdout line-by-line to the webview as events. It is
-//! still **raw passthrough** — there is no NDJSON parsing (step 4.3)
-//! and no real assessment is launched yet (the fixed probe is
-//! tenant-free; the real `Invoke-EntraChecksRun.ps1 -EmitEvents`
-//! invocation arrives in step 4.4). Whole-phase discipline holds:
-//! Rust only discovers/spawns/streams/parses/opens — it never
-//! re-implements the engine.
+//! Step 4.3 (this commit): the **contract parser** lands
+//! (`contract` module) — pure, fully unit-tested against synthetic
+//! lines *and* a real `Invoke-EntraChecksRun.ps1 -EmitEvents`
+//! capture. It is not yet wired into the live stream: `sidecar` is
+//! still raw passthrough and no real assessment is launched (that is
+//! step 4.4, which feeds `sidecar` lines through `contract` into the
+//! UI). Whole-phase discipline holds: Rust only discovers / spawns /
+//! streams / parses / opens — it never re-implements the engine.
 //!
 //! `tauri-plugin-opener` is wired now because step 6 ("Open report")
 //! needs it; it is otherwise inert at this stage.
 
+pub mod contract;
 mod sidecar;
 
 use tauri::{AppHandle, Emitter};

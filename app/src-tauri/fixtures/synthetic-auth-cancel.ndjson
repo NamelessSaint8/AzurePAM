@@ -1,0 +1,13 @@
+{"schemaVersion":"1.0","type":"run.started","runId":"syn-0001","utc":"2026-05-19T20:00:00Z","params":{"TenantName":"Synthetic"}}
+{"schemaVersion":"1.0","type":"phase.started","runId":"syn-0001","utc":"2026-05-19T20:00:01Z","phase":"Auth"}
+{"schemaVersion":"1.0","type":"auth.devicecode","runId":"syn-0001","utc":"2026-05-19T20:00:02Z","userCode":null,"verificationUri":"https://microsoft.com/devicelogin","capture":"sdk-console"}
+{"schemaVersion":"1.0","type":"auth.succeeded","runId":"syn-0001","utc":"2026-05-19T20:00:30Z","account":"svc@contoso.com","method":"DeviceCode"}
+{"schemaVersion":"1.0","type":"phase.completed","runId":"syn-0001","utc":"2026-05-19T20:00:30Z","phase":"Auth","status":"ok"}
+{"schemaVersion":"1.0","type":"phase.started","runId":"syn-0001","utc":"2026-05-19T20:00:31Z","phase":"Core"}
+{"schemaVersion":"1.0","type":"phase.progress","runId":"syn-0001","utc":"2026-05-19T20:00:35Z","phase":"Core","current":12,"total":25,"message":"Conditional Access"}
+{"schemaVersion":"1.0","type":"warning","runId":"syn-0001","utc":"2026-05-19T20:00:36Z","code":"licensing.p2Missing","message":"Identity Protection checks need Entra ID P2"}
+this line is decorative console noise, not JSON, and must be ignored
+{"schemaVersion":"1.0","type":"run.cancelled","runId":"syn-0001","utc":"2026-05-19T20:00:40Z","reason":"user requested"}
+{"schemaVersion":"1.0","type":"run.result","runId":"syn-0001","utc":"2026-05-19T20:00:41Z","status":"Cancelled","startedUtc":"2026-05-19T20:00:00Z","endedUtc":"2026-05-19T20:00:41Z","summary":{"findings":7,"critical":1,"high":2,"medium":3,"low":1,"modulesRun":["Core"],"soc2":{"ran":false,"verdict":null}},"artifacts":[{"kind":"cockpit-html","path":"/tmp/out/UnifiedCompliance-Report.html"}],"errors":[],"warnings":[{"code":"licensing.p2Missing","message":"Identity Protection checks need Entra ID P2"}]}
+{"schemaVersion":"2.0","type":"phase.started","runId":"syn-0001","utc":"2026-05-19T20:00:42Z","phase":"FutureThing"}
+{"schemaVersion":"1.0","type":"some.future.event","runId":"syn-0001","utc":"2026-05-19T20:00:43Z","payload":{"x":1}}
