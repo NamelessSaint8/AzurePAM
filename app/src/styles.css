@@ -22,6 +22,144 @@ body {
   text-align: center;
 }
 
+.container.wide {
+  max-width: 820px;
+  padding-top: 5vh;
+  text-align: left;
+}
+
+.container.wide h1,
+.container.wide .subtitle {
+  text-align: center;
+}
+
+.hidden {
+  display: none;
+}
+
+.banner {
+  background-color: #fff4d6;
+  border: 1px solid #e6c34d;
+  color: #6b4e00;
+  border-radius: 8px;
+  padding: 10px 14px;
+  font-size: 0.85rem;
+  margin-bottom: 16px;
+}
+
+.form-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 12px 0;
+  flex-wrap: wrap;
+}
+
+.form-row label {
+  font-size: 0.9rem;
+  font-weight: 500;
+}
+
+.form-row input[type="text"],
+.form-row input:not([type]) {
+  padding: 0.45em 0.7em;
+  border: 1px solid #d0d0d0;
+  border-radius: 6px;
+  font: inherit;
+  background: #fff;
+  color: #0f0f0f;
+}
+
+.form-row .check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 400;
+  color: #5a5a5a;
+}
+
+button.secondary {
+  background: transparent;
+}
+
+.run-status {
+  font-size: 0.95rem;
+  font-weight: 600;
+  margin: 8px 0 0;
+}
+
+.run-status.st-Succeeded {
+  color: #1e8e3e;
+}
+.run-status.st-PartiallySucceeded {
+  color: #b8860b;
+}
+.run-status.st-Failed {
+  color: #c0392b;
+}
+.run-status.st-Cancelled {
+  color: #777;
+}
+
+.phases {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.phase {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 7px 10px;
+  border-radius: 6px;
+  font-size: 0.9rem;
+  border-left: 3px solid #cfcfcf;
+  background: #fafafa;
+  margin-bottom: 4px;
+}
+
+.phase .ph-name {
+  font-weight: 600;
+}
+
+.phase .ph-info {
+  color: #6a6a6a;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.82rem;
+  text-align: right;
+}
+
+.phase[data-state="running"] {
+  border-left-color: #3b82f6;
+}
+.phase[data-state="ok"] {
+  border-left-color: #1e8e3e;
+}
+.phase[data-state="failed"] {
+  border-left-color: #c0392b;
+}
+.phase[data-state="skipped"] {
+  border-left-color: #b0b0b0;
+  opacity: 0.7;
+}
+
+.logln {
+  display: block;
+}
+.logln.warn {
+  color: #e0b341;
+}
+.logln.error {
+  color: #ff6b5e;
+}
+.logln.ok {
+  color: #5ad17a;
+}
+.logln.hint {
+  color: #9ab8e0;
+}
+
 h1 {
   margin: 0;
   font-size: 2.2rem;
@@ -135,5 +273,28 @@ button:active {
   }
   .status.err {
     color: #ff6b5e;
+  }
+  .banner {
+    background-color: #3a3320;
+    border-color: #6b5e2e;
+    color: #e6cf8a;
+  }
+  .form-row input:not([type]),
+  .form-row input[type="text"] {
+    background: #1f1f1f;
+    color: #f6f6f6;
+    border-color: #4a4a4a;
+  }
+  .form-row .check {
+    color: #aaa;
+  }
+  .phase {
+    background: #242424;
+  }
+  .phase .ph-info {
+    color: #999;
+  }
+  button.secondary {
+    background: transparent;
   }
 }

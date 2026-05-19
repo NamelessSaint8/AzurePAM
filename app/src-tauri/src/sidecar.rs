@@ -217,6 +217,77 @@ pub fn probe_args() -> Vec<&'static str> {
     ]
 }
 
+// ---- step 4.4: locating + invoking the headless core ----------------
+
+/// Walk `start` and its ancestors looking for `filename`; return the
+/// first hit. Pure (no env), so it is unit-testable with a tempdir.
+pub fn find_upwards(start: &Path, filename: &str) -> Option<PathBuf> {
+    let mut dir = Some(start);
+    while let Some(d) = dir {
+        let cand = d.join(filename);
+        if cand.is_file() {
+            return Some(cand);
+        }
+        dir = d.parent();
+    }
+    None
+}
+
+/// Locate `Invoke-EntraChecksRun.ps1` (the Phase-1 headless contract
+/// entry). `ENTRACHECKS_CORE` overrides; otherwise walk up from the
+/// working dir and the executable's dir (covers `cargo tauri dev`
+/// running from `app/src-tauri`). Bundled-app path resolution is a
+/// Phase-5 packaging concern, recorded there.
+pub fn resolve_core_script() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("ENTRACHECKS_CORE") {
+        let pb = PathBuf::from(p);
+        if pb.is_file() {
+            return Some(pb);
+        }
+    }
+    const MARKER: &str = "Invoke-EntraChecksRun.ps1";
+    let mut starts: Vec<PathBuf> = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        starts.push(cwd);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(p) = exe.parent() {
+            starts.push(p.to_path_buf());
+        }
+    }
+    starts
+        .iter()
+        .find_map(|s| find_upwards(s, MARKER))
+}
+
+/// Build the `pwsh` argument vector for a headless run. Owned
+/// `String`s (paths/tenant are runtime values); the caller maps to
+/// `&str` for `spawn_streaming`. Pure + unit-tested.
+pub fn core_args(
+    core_script: &str,
+    tenant: &str,
+    output_dir: &str,
+    skip_auth: bool,
+) -> Vec<String> {
+    let mut a = vec![
+        "-NoProfile".to_string(),
+        "-NonInteractive".to_string(),
+        "-File".to_string(),
+        core_script.to_string(),
+        "-TenantName".to_string(),
+        tenant.to_string(),
+        "-OutputDirectory".to_string(),
+        output_dir.to_string(),
+        "-Modules".to_string(),
+        "Core".to_string(),
+        "-EmitEvents".to_string(),
+    ];
+    if skip_auth {
+        a.push("-SkipAuthentication".to_string());
+    }
+    a
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,6 +384,38 @@ mod tests {
             lines.iter().any(|l| l == "line 3"),
             "later lines stream through in order too"
         );
+    }
+
+    #[test]
+    fn find_upwards_locates_a_marker_in_an_ancestor() {
+        let base = std::env::temp_dir()
+            .join(format!("ecf_fu_{}", std::process::id()));
+        let deep = base.join("a").join("b").join("c");
+        std::fs::create_dir_all(&deep).unwrap();
+        let marker = base.join("a").join("Invoke-EntraChecksRun.ps1");
+        std::fs::write(&marker, "# marker").unwrap();
+
+        let hit = find_upwards(&deep, "Invoke-EntraChecksRun.ps1");
+        assert_eq!(hit.as_deref(), Some(marker.as_path()));
+        assert!(find_upwards(&deep, "does-not-exist.ps1").is_none());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn core_args_shape_and_skip_auth_toggle() {
+        let with = core_args("/r/Invoke-EntraChecksRun.ps1", "Contoso", "/o", true);
+        assert_eq!(with[2], "-File");
+        assert_eq!(with[3], "/r/Invoke-EntraChecksRun.ps1");
+        assert!(with.iter().any(|x| x == "-TenantName"));
+        assert!(with.iter().any(|x| x == "Contoso"));
+        assert!(with.iter().any(|x| x == "-EmitEvents"));
+        assert!(with.iter().any(|x| x == "-SkipAuthentication"));
+
+        let without = core_args("/r/c.ps1", "T", "/o", false);
+        assert!(!without.iter().any(|x| x == "-SkipAuthentication"));
+        // -EmitEvents is non-negotiable: it is how the GUI sees anything.
+        assert!(without.iter().any(|x| x == "-EmitEvents"));
     }
 
     #[test]

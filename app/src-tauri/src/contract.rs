@@ -15,7 +15,7 @@
 //!     (so the UI can warn "app older than engine") but known event
 //!     types still parse — additive-only guarantees that is safe.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// The contract major this build understands.
@@ -26,7 +26,8 @@ pub fn schema_major(schema_version: &str) -> Option<u32> {
     schema_version.split('.').next()?.parse().ok()
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum PhaseStatus {
     Ok,
     Skipped,
@@ -43,7 +44,8 @@ impl PhaseStatus {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum LogLevel {
     Info,
     Warn,
@@ -63,7 +65,7 @@ impl LogLevel {
 /// Terminal run status. Ordered by *severity precedence* — Cancelled
 /// outranks everything (mirrors the engine's `Get-EcfRunStatus`
 /// Cancelled-first guarantee), then Failed, Partial, Succeeded.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub enum RunStatus {
     Succeeded,
     PartiallySucceeded,
@@ -82,13 +84,13 @@ impl RunStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Artifact {
     pub kind: String,
     pub path: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RunError {
     pub code: String,
     pub message: String,
@@ -96,7 +98,8 @@ pub struct RunError {
     pub remediation: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RunResult {
     pub status: RunStatus,
     pub started_utc: String,
@@ -109,7 +112,12 @@ pub struct RunResult {
 }
 
 /// One understood (or explicitly unknown) contract event.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serializes internally-tagged on `type` (camelCase variant names)
+/// so the webview can `switch (event.type)` directly — e.g.
+/// `{"type":"phaseProgress","phase":"Core","current":12,...}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
 pub enum AppEvent {
     RunStarted,
     PhaseStarted { phase: String },
@@ -119,7 +127,13 @@ pub enum AppEvent {
     Warning { code: String, message: String },
     AuthInfo { method: String, message: String },
     AuthBrowser { message: String },
-    AuthDeviceCode { user_code: Option<String>, verification_uri: String, capture: String },
+    AuthDeviceCode {
+        #[serde(rename = "userCode")]
+        user_code: Option<String>,
+        #[serde(rename = "verificationUri")]
+        verification_uri: String,
+        capture: String,
+    },
     AuthSucceeded { account: String, method: String },
     AuthFailed { code: String, message: String, remediation: Option<String> },
     RunCancelled { reason: String },

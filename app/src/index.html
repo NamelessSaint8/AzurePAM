@@ -9,25 +9,51 @@
   </head>
 
   <body>
-    <main class="container">
+    <main class="container wide">
       <h1>EntraChecks</h1>
       <p class="subtitle">Microsoft Cloud Compliance Assessment</p>
 
+      <div id="schema-banner" class="banner hidden">
+        This app is older than the assessment engine (a newer contract
+        version was seen). Known steps still render; some detail may be
+        missing — update the app.
+      </div>
+
       <section class="card">
-        <h2>Sidecar boundary — Phase 4.2</h2>
+        <h2>Run an assessment</h2>
         <p class="muted">
-          Raw passthrough. Discovers PowerShell 7 and streams a fixed,
-          tenant-free probe's stdout. No NDJSON parsing yet (4.3); the
-          real assessment is wired in 4.4.
+          Phase 4.4 — live run. Streams a real
+          <code>Invoke-EntraChecksRun.ps1 -EmitEvents</code> through
+          the contract parser. Auth device-code panel and Cancel are
+          4.5; the rich result screen is 4.6.
         </p>
 
-        <div class="row">
-          <button id="btn-discover">Discover pwsh</button>
-          <button id="btn-probe">Run probe</button>
+        <div class="form-row">
+          <label for="tenant">Tenant</label>
+          <input id="tenant" placeholder="Contoso" />
+          <label class="check">
+            <input type="checkbox" id="skip-auth" checked />
+            Skip auth (dev)
+          </label>
         </div>
-
+        <div class="form-row">
+          <button id="btn-run">Run assessment</button>
+          <button id="btn-discover" class="secondary">Re-check pwsh</button>
+        </div>
         <p id="pwsh-status" class="status">pwsh: not checked</p>
-        <pre id="debug-pane" class="debug" aria-live="polite"></pre>
+        <p id="run-status" class="run-status"></p>
+      </section>
+
+      <section class="card">
+        <h2>Phases</h2>
+        <ul id="phases" class="phases">
+          <li class="muted">No run yet.</li>
+        </ul>
+      </section>
+
+      <section class="card">
+        <h2>Log</h2>
+        <pre id="log-pane" class="debug" aria-live="polite"></pre>
       </section>
     </main>
   </body>
