@@ -5,6 +5,7 @@
     <link rel="stylesheet" href="styles.css" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>EntraChecks</title>
+    <script type="module" src="/main.js" defer></script>
   </head>
 
   <body>
@@ -13,15 +14,20 @@
       <p class="subtitle">Microsoft Cloud Compliance Assessment</p>
 
       <section class="card">
-        <h2>Native App — Phase 4 (MVP)</h2>
-        <p>
-          Desktop shell scaffold. The window opens and serves this
-          static frontend. The PowerShell sidecar, live NDJSON
-          progress, auth panel, and report viewer are wired in the
-          next steps — nothing is connected to the assessment engine
-          yet.
+        <h2>Sidecar boundary — Phase 4.2</h2>
+        <p class="muted">
+          Raw passthrough. Discovers PowerShell 7 and streams a fixed,
+          tenant-free probe's stdout. No NDJSON parsing yet (4.3); the
+          real assessment is wired in 4.4.
         </p>
-        <p class="muted">Step 4.1 · scaffold only · no engine wired</p>
+
+        <div class="row">
+          <button id="btn-discover">Discover pwsh</button>
+          <button id="btn-probe">Run probe</button>
+        </div>
+
+        <p id="pwsh-status" class="status">pwsh: not checked</p>
+        <pre id="debug-pane" class="debug" aria-live="polite"></pre>
       </section>
     </main>
   </body>
