@@ -38,6 +38,82 @@ function resetView() {
   els.log.textContent = "";
   els.runStatus.textContent = "";
   els.runStatus.className = "run-status";
+  els.resultCard.classList.add("hidden");
+  els.resultSummary.innerHTML = "";
+  els.resultSoc2.innerHTML = "";
+  els.resultArtifacts.innerHTML = "";
+  els.resultErrors.innerHTML = "";
+}
+
+function metric(label, value, cls) {
+  return `<div class="metric ${cls || ""}">
+    <span class="m-val">${value}</span>
+    <span class="m-lbl">${label}</span></div>`;
+}
+
+function renderResult(ev) {
+  els.resultBadge.textContent = ev.status;
+  els.resultBadge.className = "badge st-" + ev.status;
+
+  const mods = ev.modulesRun && ev.modulesRun.length
+    ? ev.modulesRun.join(", ")
+    : "—";
+  els.resultSummary.innerHTML =
+    metric("Findings", ev.findings) +
+    metric("Critical", ev.critical, ev.critical > 0 ? "sev-crit" : "") +
+    metric("High", ev.high, ev.high > 0 ? "sev-high" : "") +
+    metric("Medium", ev.medium) +
+    metric("Low", ev.low) +
+    metric("Modules", mods);
+
+  // SOC 2 verdict is an analyst-attention flag — shown verbatim,
+  // never re-interpreted as a formal audit determination.
+  if (ev.soc2 && ev.soc2.ran) {
+    els.resultSoc2.innerHTML = `<strong>SOC 2:</strong> ${escapeHtml(
+      ev.soc2.verdict || "(no verdict reported)"
+    )}`;
+  } else {
+    els.resultSoc2.innerHTML = "";
+  }
+
+  els.resultArtifacts.innerHTML = "";
+  (ev.artifacts || []).forEach((a) => {
+    const btn = document.createElement("button");
+    btn.className = "secondary";
+    btn.textContent = `Open ${a.kind}`;
+    btn.addEventListener("click", () =>
+      invoke("open_report", { path: a.path }).catch((e) =>
+        logLine(`[report] could not open: ${e}`, "warn")
+      )
+    );
+    const row = document.createElement("div");
+    row.className = "artifact-row";
+    row.appendChild(btn);
+    const p = document.createElement("span");
+    p.className = "art-path";
+    p.textContent = a.path;
+    row.appendChild(p);
+    els.resultArtifacts.appendChild(row);
+  });
+  if (!(ev.artifacts || []).length)
+    els.resultArtifacts.innerHTML =
+      `<p class="muted">No report artifacts were produced.</p>`;
+
+  els.resultErrors.innerHTML = "";
+  (ev.errors || []).forEach((e) => {
+    const d = document.createElement("div");
+    d.className = "result-err";
+    d.innerHTML =
+      `<span class="logln error">${escapeHtml(e.code)}: ${escapeHtml(
+        e.message
+      )}</span>` +
+      (e.remediation
+        ? `<span class="muted"> → ${escapeHtml(e.remediation)}</span>`
+        : "");
+    els.resultErrors.appendChild(d);
+  });
+
+  els.resultCard.classList.remove("hidden");
 }
 
 function phaseRow(name) {
@@ -177,19 +253,9 @@ function onEvent(payload) {
       els.runStatus.className = "run-status st-Cancelled";
       break;
     case "runResult": {
-      const s = event.status;
-      els.runStatus.textContent =
-        `${s} — ${event.findings} findings ` +
-        `(critical ${event.critical}, high ${event.high})`;
-      els.runStatus.classList.add("st-" + s);
-      if (event.artifacts && event.artifacts.length)
-        event.artifacts.forEach((a) =>
-          logLine(`[report] ${a.kind}: ${a.path}`, "ok")
-        );
-      if (event.errors && event.errors.length)
-        event.errors.forEach((e) =>
-          logLine(`[error] ${e.code}: ${e.message}`, "error")
-        );
+      els.runStatus.textContent = `${event.status} — see Result`;
+      els.runStatus.className = "run-status st-" + event.status;
+      renderResult(event);
       setRunning(false);
       break;
     }
@@ -242,6 +308,12 @@ window.addEventListener("DOMContentLoaded", async () => {
     cancel: document.querySelector("#btn-cancel"),
     authPanel: document.querySelector("#auth-panel"),
     authBody: document.querySelector("#auth-body"),
+    resultCard: document.querySelector("#result-card"),
+    resultBadge: document.querySelector("#result-badge"),
+    resultSummary: document.querySelector("#result-summary"),
+    resultSoc2: document.querySelector("#result-soc2"),
+    resultArtifacts: document.querySelector("#result-artifacts"),
+    resultErrors: document.querySelector("#result-errors"),
   };
   document.querySelector("#btn-run").addEventListener("click", runAssessment);
   document.querySelector("#btn-cancel").addEventListener("click", cancelRun);

@@ -144,6 +144,91 @@ button.secondary {
   opacity: 0.7;
 }
 
+.badge {
+  display: inline-block;
+  padding: 4px 12px;
+  border-radius: 999px;
+  font-weight: 700;
+  font-size: 0.85rem;
+  color: #fff;
+  background: #777;
+}
+.badge.st-Succeeded {
+  background: #1e8e3e;
+}
+.badge.st-PartiallySucceeded {
+  background: #b8860b;
+}
+.badge.st-Failed {
+  background: #c0392b;
+}
+.badge.st-Cancelled {
+  background: #777;
+}
+
+.summary-grid {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 8px;
+  margin: 8px 0;
+}
+@media (max-width: 640px) {
+  .summary-grid {
+    grid-template-columns: repeat(3, 1fr);
+  }
+}
+
+.metric {
+  background: #f4f4f4;
+  border-radius: 8px;
+  padding: 10px 6px;
+  text-align: center;
+}
+.metric .m-val {
+  display: block;
+  font-size: 1.3rem;
+  font-weight: 700;
+}
+.metric .m-lbl {
+  display: block;
+  font-size: 0.72rem;
+  color: #777;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.metric.sev-crit .m-val {
+  color: #c0392b;
+}
+.metric.sev-high .m-val {
+  color: #b8860b;
+}
+
+.soc2-line {
+  font-size: 0.9rem;
+  margin: 6px 0;
+}
+
+.artifacts {
+  margin: 10px 0;
+}
+.artifact-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 6px 0;
+}
+.art-path {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.78rem;
+  color: #6a6a6a;
+  word-break: break-all;
+}
+
+.result-errors .result-err {
+  margin: 6px 0;
+  font-size: 0.85rem;
+}
+
 .auth {
   border-left: 3px solid #3b82f6;
 }
@@ -326,5 +411,11 @@ button:active {
   }
   button.link {
     color: #6ea8fe;
+  }
+  .metric {
+    background: #242424;
+  }
+  .metric .m-lbl {
+    color: #999;
   }
 }

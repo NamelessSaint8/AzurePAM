@@ -1,16 +1,16 @@
 //! EntraChecks desktop shell — Native App Phase 4 (MVP).
 //!
-//! Step 4.5 (this commit): the **auth panel + Cancel**. The parser
-//! now also surfaces the envelope `runId`; the shell records it (with
-//! the run's output dir) in `RunState` so `cancel_run` can drop the
-//! Phase-3a sentinel `<outputDir>/.runs/<runId>.cancel` — cooperative,
-//! the child is never killed. `open_external` opens the device-code
-//! verification URL via the opener plugin. The webview gets a proper
-//! device-code / browser / signed-in / failed panel and a Cancel
-//! button with a cancelling→cancelled transition. The rich Result
-//! screen + Open-report is 4.6. Whole-phase discipline holds: Rust
-//! only discovers / spawns / streams / parses / opens — it never
-//! re-implements the engine.
+//! Step 4.6 (this commit): the **Result screen + Open report** — the
+//! final MVP build step. `run.result` parsing gained the full
+//! severity breakdown (medium/low), `modulesRun`, and the `soc2`
+//! summary block; `open_report` opens an artifact (cockpit HTML) in
+//! the OS default app. The webview turns the terminal line into a
+//! proper result card (status badge, summary grid, taxonomy'd errors,
+//! a per-artifact Open button), completing the
+//! configure→run→watch→open-report loop. Whole-phase discipline
+//! holds: Rust only discovers / spawns / streams / parses / opens —
+//! it never re-implements the engine. Remaining: the step-7 Windows
+//! manual UX pass (the only un-CI-able acceptance).
 //!
 //! `tauri-plugin-opener` is wired now because step 6 ("Open report")
 //! needs it; it is otherwise inert at this stage.
@@ -204,12 +204,25 @@ fn cancel_run(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// Open a URL (device-code verification link now; report artifacts in
-/// 4.6) in the OS default handler via the opener plugin.
+/// Open a URL (the device-code verification link) in the OS default
+/// handler via the opener plugin.
 #[tauri::command]
 fn open_external(app: AppHandle, target: String) -> Result<(), String> {
     app.opener()
         .open_url(target, None::<&str>)
+        .map_err(|e| e.to_string())
+}
+
+/// Open a `run.result` artifact (the cockpit HTML etc.) in the OS
+/// default app via the opener plugin. The MVP uses OS-open for
+/// reliability; an in-app webview window for the cockpit HTML is a
+/// recorded post-MVP polish (plan §10 / step-6 deviation), not a
+/// blocker — the configure→run→watch→open-report loop is complete
+/// with OS-open.
+#[tauri::command]
+fn open_report(app: AppHandle, path: String) -> Result<(), String> {
+    app.opener()
+        .open_path(path, None::<&str>)
         .map_err(|e| e.to_string())
 }
 
@@ -224,7 +237,8 @@ pub fn run() {
             run_assessment,
             supported_schema_major,
             cancel_run,
-            open_external
+            open_external,
+            open_report
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -98,6 +98,15 @@ pub struct RunError {
     pub remediation: Option<String>,
 }
 
+/// The `summary.soc2` block (present when the SOC 2 pass ran). The
+/// verdict is the analyst-attention flag string the engine emits — it
+/// is rendered verbatim, never re-interpreted as an audit verdict.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Soc2Summary {
+    pub ran: bool,
+    pub verdict: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunResult {
@@ -107,6 +116,10 @@ pub struct RunResult {
     pub findings: i64,
     pub critical: i64,
     pub high: i64,
+    pub medium: i64,
+    pub low: i64,
+    pub modules_run: Vec<String>,
+    pub soc2: Option<Soc2Summary>,
     pub artifacts: Vec<Artifact>,
     pub errors: Vec<RunError>,
 }
@@ -137,7 +150,10 @@ pub enum AppEvent {
     AuthSucceeded { account: String, method: String },
     AuthFailed { code: String, message: String, remediation: Option<String> },
     RunCancelled { reason: String },
-    RunResult(RunResult),
+    // Boxed: `RunResult` is much larger than the other variants
+    // (clippy::large_enum_variant). `Box<T>` is serde-transparent, so
+    // the emitted JSON shape is unchanged.
+    RunResult(Box<RunResult>),
     /// A `type` this build doesn't model — ignored by the UI, never
     /// fatal (additive-only forward-compat).
     Unknown { kind: String },
@@ -235,7 +251,7 @@ fn map_event(kind: &str, d: &Value) -> AppEvent {
         "run.cancelled" => AppEvent::RunCancelled {
             reason: s(d, "reason").unwrap_or_else(|| "cancel requested".to_string()),
         },
-        "run.result" => AppEvent::RunResult(map_run_result(d)),
+        "run.result" => AppEvent::RunResult(Box::new(map_run_result(d))),
         other => AppEvent::Unknown { kind: other.to_string() },
     }
 }
@@ -268,6 +284,25 @@ fn map_run_result(d: &Value) -> RunResult {
                 .collect()
         })
         .unwrap_or_default();
+    let modules_run = summary
+        .get("modulesRun")
+        .and_then(|m| m.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let soc2 = summary.get("soc2").and_then(|s2| {
+        if s2.is_object() {
+            Some(Soc2Summary {
+                ran: b(s2, "ran"),
+                verdict: s(s2, "verdict"),
+            })
+        } else {
+            None
+        }
+    });
     RunResult {
         status: RunStatus::parse(&s_or(d, "status")),
         started_utc: s_or(d, "startedUtc"),
@@ -275,6 +310,10 @@ fn map_run_result(d: &Value) -> RunResult {
         findings: i(&summary, "findings"),
         critical: i(&summary, "critical"),
         high: i(&summary, "high"),
+        medium: i(&summary, "medium"),
+        low: i(&summary, "low"),
+        modules_run,
+        soc2,
         artifacts,
         errors,
     }
@@ -469,16 +508,20 @@ mod tests {
         // terminal status must be Cancelled (truncation-safe).
         let evs = vec![
             AppEvent::RunCancelled { reason: "user".into() },
-            AppEvent::RunResult(RunResult {
+            AppEvent::RunResult(Box::new(RunResult {
                 status: RunStatus::Failed,
                 started_utc: "a".into(),
                 ended_utc: "b".into(),
                 findings: 0,
                 critical: 0,
                 high: 0,
+                medium: 0,
+                low: 0,
+                modules_run: vec![],
+                soc2: None,
                 artifacts: vec![],
                 errors: vec![],
-            }),
+            })),
         ];
         assert_eq!(terminal_status(&evs), Some(RunStatus::Cancelled));
         assert_eq!(terminal_status(&[]), None);
@@ -504,6 +547,11 @@ mod tests {
                 assert_eq!(r.errors[0].code, "report.writeFailed");
                 assert!(r.errors[0].fatal);
                 assert!(r.artifacts.is_empty());
+                // 4.6 summary extraction off the real bytes.
+                assert_eq!(r.modules_run, vec!["Core".to_string()]);
+                let soc2 = r.soc2.as_ref().expect("real summary has soc2");
+                assert!(!soc2.ran);
+                assert_eq!(soc2.verdict, None);
             }
             e => panic!("last event should be RunResult, got {e:?}"),
         }
@@ -530,11 +578,20 @@ mod tests {
         assert_eq!(terminal_status(&evs), Some(RunStatus::Cancelled));
         // The cancelled run still carried an artifact (Phase 3a:
         // whatever exists is reported).
-        let rr = evs.iter().find_map(|e| match e {
-            AppEvent::RunResult(r) => Some(r),
-            _ => None,
-        });
-        assert_eq!(rr.unwrap().artifacts.len(), 1);
+        let rr = evs
+            .iter()
+            .find_map(|e| match e {
+                AppEvent::RunResult(r) => Some(r),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(rr.artifacts.len(), 1);
+        assert_eq!(rr.artifacts[0].kind, "cockpit-html");
+        // Full severity breakdown extracted for the 4.6 result screen.
+        assert_eq!(
+            (rr.findings, rr.critical, rr.high, rr.medium, rr.low),
+            (7, 1, 2, 3, 1)
+        );
     }
 
     #[test]
