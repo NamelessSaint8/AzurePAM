@@ -229,6 +229,63 @@ button.secondary {
   font-size: 0.85rem;
 }
 
+.readiness-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.readiness {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0;
+}
+
+.ready-row {
+  display: grid;
+  grid-template-columns: 140px 70px 1fr 1fr;
+  gap: 10px;
+  align-items: center;
+  padding: 6px 10px;
+  border-radius: 6px;
+  font-size: 0.85rem;
+  border-left: 3px solid #cfcfcf;
+  background: #fafafa;
+  margin-bottom: 4px;
+}
+
+.ready-row[data-state="ok"] {
+  border-left-color: #1e8e3e;
+}
+.ready-row[data-state="missing"] {
+  border-left-color: #c0392b;
+}
+.ready-row[data-state="optional"] {
+  border-left-color: #b0b0b0;
+  opacity: 0.85;
+}
+
+.rd-name {
+  font-weight: 600;
+}
+.rd-req {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: #777;
+}
+.rd-ver {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.78rem;
+  color: #4a4a4a;
+}
+.rd-path {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.72rem;
+  color: #888;
+  word-break: break-all;
+}
+
 .auth {
   border-left: 3px solid #3b82f6;
 }
@@ -417,5 +474,17 @@ button:active {
   }
   .metric .m-lbl {
     color: #999;
+  }
+  .ready-row {
+    background: #242424;
+  }
+  .rd-req {
+    color: #999;
+  }
+  .rd-ver {
+    color: #ccc;
+  }
+  .rd-path {
+    color: #888;
   }
 }

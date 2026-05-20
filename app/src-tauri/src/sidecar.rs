@@ -314,6 +314,113 @@ pub fn core_args(
     a
 }
 
+// ---- step 5.2: readiness model (PS modules detect-only) -------------
+
+/// The dependency surface the Readiness panel reports on. Mirrors
+/// `Install-Prerequisites.ps1`: Microsoft.Graph is required, the
+/// Az.* set is "optional but recommended" (Defender/AzurePolicy/
+/// Recovery rely on it), ImportExcel is purely optional.
+/// `(name, required)` — required modules gate Run; optional modules
+/// degrade gracefully (a soft warning in the UI).
+pub const READINESS_MODULES: &[(&str, bool)] = &[
+    ("Microsoft.Graph", true),
+    ("Az.Accounts", false),
+    ("Az.PolicyInsights", false),
+    ("Az.Resources", false),
+    ("Az.Security", false),
+    ("Az.RecoveryServices", false),
+    ("ImportExcel", false),
+];
+
+/// One row in the readiness report — Serialize so the webview can
+/// switch on it directly. The `required` flag is set by the const
+/// list above (the source of truth, never duplicated in JS).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ModuleStatus {
+    pub name: String,
+    pub required: bool,
+    pub present: bool,
+    pub version: Option<String>,
+}
+
+/// Build a single pwsh -Command that probes every requested module in
+/// one invocation (process startup matters on Windows). Emits one
+/// `name|version-or-blank` line per module. Pure + tested.
+pub fn build_modules_probe_command(names: &[&str]) -> String {
+    // Quoted, comma-joined PS array literal — module names are static
+    // identifiers (no quote-injection risk by construction).
+    let arr = names
+        .iter()
+        .map(|n| format!("'{n}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "$names = @({arr}); \
+         foreach ($n in $names) {{ \
+           $m = Get-Module -ListAvailable -Name $n 2>$null | \
+             Sort-Object Version -Descending | Select-Object -First 1; \
+           if ($m) {{ ('{{0}}|{{1}}' -f $n, $m.Version.ToString()) }} \
+           else {{ ('{{0}}|' -f $n) }} \
+         }}"
+    )
+}
+
+/// Parse `name|version` lines into `(name, Option<version>)` pairs in
+/// the order they were emitted. Blank lines and lines without `|` are
+/// ignored. CRLF is already stripped by `BufRead::lines`. Pure +
+/// tested against synthetic + realistic fixtures.
+pub fn parse_modules_probe_output(stdout: &str) -> Vec<(String, Option<String>)> {
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let Some((name, ver)) = t.split_once('|') else {
+            continue;
+        };
+        let v = ver.trim();
+        out.push((
+            name.trim().to_string(),
+            if v.is_empty() { None } else { Some(v.to_string()) },
+        ));
+    }
+    out
+}
+
+/// Run the probe against the discovered `pwsh` and return one
+/// `ModuleStatus` per name in `READINESS_MODULES`, preserving order.
+/// Modules not reported by the probe (shouldn't happen, but
+/// defence-in-depth) come back as `present: false`.
+pub fn collect_readiness(pwsh: &Path) -> std::io::Result<Vec<ModuleStatus>> {
+    let names: Vec<&str> = READINESS_MODULES.iter().map(|(n, _)| *n).collect();
+    let cmd = build_modules_probe_command(&names);
+    let args: Vec<&str> = vec!["-NoProfile", "-NonInteractive", "-Command", &cmd];
+    let mut buf = String::new();
+    let _ = spawn_streaming(pwsh, &args, |line| {
+        buf.push_str(line);
+        buf.push('\n');
+    })?;
+    let parsed = parse_modules_probe_output(&buf);
+    let map: std::collections::HashMap<&str, Option<String>> = parsed
+        .iter()
+        .map(|(n, v)| (n.as_str(), v.clone()))
+        .collect();
+    let report = READINESS_MODULES
+        .iter()
+        .map(|(name, required)| {
+            let version = map.get(*name).cloned().unwrap_or(None);
+            ModuleStatus {
+                name: (*name).to_string(),
+                required: *required,
+                present: version.is_some(),
+                version,
+            }
+        })
+        .collect();
+    Ok(report)
+}
+
 // ---- step 4.5: cooperative cancel (Phase-3a sentinel) ---------------
 
 /// `<output_dir>/.runs/<run_id>.cancel` — the exact path the engine's
@@ -466,6 +573,64 @@ mod tests {
         assert!(!without.iter().any(|x| x == "-SkipAuthentication"));
         // -EmitEvents is non-negotiable: it is how the GUI sees anything.
         assert!(without.iter().any(|x| x == "-EmitEvents"));
+    }
+
+    #[test]
+    fn modules_probe_command_contains_every_requested_name() {
+        let cmd = build_modules_probe_command(&[
+            "Microsoft.Graph",
+            "Az.Accounts",
+            "ImportExcel",
+        ]);
+        for n in ["Microsoft.Graph", "Az.Accounts", "ImportExcel"] {
+            assert!(cmd.contains(n), "probe command must mention {n}");
+        }
+        // The output template is what `parse_modules_probe_output`
+        // assumes — a regression here would split the contract.
+        assert!(cmd.contains("|"));
+    }
+
+    #[test]
+    fn parses_modules_probe_output() {
+        let raw = "\
+Microsoft.Graph|2.20.0
+Az.Accounts|3.5.0
+Az.PolicyInsights|
+
+ImportExcel|7.8.10
+garbage line without a pipe
+";
+        let parsed = parse_modules_probe_output(raw);
+        assert_eq!(
+            parsed,
+            vec![
+                ("Microsoft.Graph".to_string(), Some("2.20.0".to_string())),
+                ("Az.Accounts".to_string(), Some("3.5.0".to_string())),
+                ("Az.PolicyInsights".to_string(), None),
+                ("ImportExcel".to_string(), Some("7.8.10".to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    fn collect_readiness_e2e_when_pwsh_present() {
+        // Automated proof of the 5.2 probe: where pwsh is installed
+        // we actually run it and assert each requested module name
+        // comes back exactly once (present or not — depends on the
+        // machine). Skips cleanly where pwsh is absent.
+        let loc = match discover_pwsh() {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        let report = collect_readiness(&loc.path).expect("probe should run");
+        assert_eq!(report.len(), READINESS_MODULES.len());
+        for ((expected, required), got) in
+            READINESS_MODULES.iter().zip(report.iter())
+        {
+            assert_eq!(&got.name, expected);
+            assert_eq!(got.required, *required);
+            assert_eq!(got.present, got.version.is_some());
+        }
     }
 
     #[test]

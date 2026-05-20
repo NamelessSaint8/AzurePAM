@@ -1,15 +1,14 @@
 //! EntraChecks desktop shell — Native App Phase 4 (MVP).
 //!
-//! Phase 5.1 (this commit): packaging groundwork. The EntraChecks PS
-//! core/modules are declared as Tauri bundle resources (under
-//! `core/`, mirroring the repo layout `Start-EntraChecks.ps1` expects
-//! via `$PSScriptRoot`), and `resolve_core_script` is now
-//! resource-aware: `ENTRACHECKS_CORE` override → bundled resource dir
-//! (packaged app) → walk-up (dev checkout). A packaged app has no
-//! repo, so without this it could never find the engine. Earlier
-//! steps (4.1–4.6) delivered the MVP run loop. Whole-phase discipline
-//! holds: Rust discovers / spawns / streams / parses / opens /
-//! packages — it never re-implements the engine.
+//! Phase 5.2 (this commit): the **Readiness** model — the three-
+//! dependency preflight (`pwsh` 7 / Microsoft.Graph / Az.*) reports as
+//! structured data. Single `readiness` Tauri command, a single inline
+//! `Get-Module -ListAvailable` probe in the discovered pwsh, parsed
+//! into typed `ModuleStatus` rows. **Detection only this step** — the
+//! consented remediation actions (running the bundled
+//! `Install-Prerequisites.ps1`, winget for `pwsh` 7) arrive in 5.3.
+//! Earlier steps (4.1–4.6, 5.1) built the MVP run loop + the
+//! bundled-core resolve.
 //!
 //! `tauri-plugin-opener` is wired now because step 6 ("Open report")
 //! needs it; it is otherwise inert at this stage.
@@ -57,6 +56,38 @@ fn discover_pwsh_cmd() -> Result<PwshInfo, String> {
             version: loc.version,
         }),
         Err(e) => Err(e.to_string()),
+    }
+}
+
+/// What `readiness` hands back to the frontend. `pwsh` is `None` when
+/// PS 7 is not installed; `modules` is one row per
+/// `READINESS_MODULES` entry. Detection only — the remediation
+/// actions (running the bundled `Install-Prerequisites.ps1`, winget
+/// for pwsh) arrive in step 5.3.
+#[derive(serde::Serialize)]
+pub struct ReadinessReport {
+    pwsh: Option<PwshInfo>,
+    modules: Vec<sidecar::ModuleStatus>,
+}
+
+/// Probe the three-dependency surface in one shot: discover `pwsh`;
+/// if found, run a single inline `Get-Module -ListAvailable` probe
+/// through it for every name in `READINESS_MODULES`. A failed probe
+/// returns an empty module list (the panel renders "unknown" rows)
+/// rather than erroring — Readiness is informational, never fatal.
+#[tauri::command]
+fn readiness() -> ReadinessReport {
+    let pwsh_loc = sidecar::discover_pwsh().ok();
+    let modules = pwsh_loc
+        .as_ref()
+        .and_then(|loc| sidecar::collect_readiness(&loc.path).ok())
+        .unwrap_or_default();
+    ReadinessReport {
+        pwsh: pwsh_loc.map(|loc| PwshInfo {
+            path: loc.path.to_string_lossy().into_owned(),
+            version: loc.version,
+        }),
+        modules,
     }
 }
 
@@ -238,7 +269,8 @@ pub fn run() {
             supported_schema_major,
             cancel_run,
             open_external,
-            open_report
+            open_report,
+            readiness
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

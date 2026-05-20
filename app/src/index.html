@@ -19,6 +19,21 @@
         missing — update the app.
       </div>
 
+      <section id="readiness-card" class="card">
+        <div class="readiness-head">
+          <h2>Readiness</h2>
+          <button id="btn-readiness" class="secondary">Re-check</button>
+        </div>
+        <p class="muted">
+          Detection only — the engine needs PowerShell&nbsp;7 + the
+          Microsoft.Graph module to run an assessment. The Az.* set is
+          optional; without it Defender / Azure Policy degrade
+          gracefully. Guided install lands in the next step.
+        </p>
+        <ul id="readiness-list" class="readiness"></ul>
+        <p id="readiness-hint" class="muted"></p>
+      </section>
+
       <section class="card">
         <h2>Run an assessment</h2>
         <p class="muted">
@@ -37,11 +52,9 @@
           </label>
         </div>
         <div class="form-row">
-          <button id="btn-run">Run assessment</button>
+          <button id="btn-run" disabled>Run assessment</button>
           <button id="btn-cancel" class="secondary hidden">Cancel</button>
-          <button id="btn-discover" class="secondary">Re-check pwsh</button>
         </div>
-        <p id="pwsh-status" class="status">pwsh: not checked</p>
         <p id="run-status" class="run-status"></p>
       </section>
 

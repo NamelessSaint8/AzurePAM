@@ -144,10 +144,78 @@ function hideAuth() {
   els.authBody.innerHTML = "";
 }
 
+let appReady = false;
+
 function setRunning(on) {
-  els.run.disabled = on;
+  // Run is disabled either because we're already running OR because
+  // Readiness says the engine can't run (pwsh / Microsoft.Graph
+  // missing). The latter wins until the user fixes it (5.3).
+  els.run.disabled = on || !appReady;
   els.cancel.classList.toggle("hidden", !on);
   els.cancel.disabled = false;
+}
+
+function renderReadiness(r) {
+  const list = els.readinessList;
+  list.innerHTML = "";
+
+  // pwsh row first — its own "module" with a different label format.
+  const pwshRow = document.createElement("li");
+  pwshRow.className = "ready-row";
+  if (r.pwsh) {
+    pwshRow.dataset.state = "ok";
+    pwshRow.innerHTML =
+      `<span class="rd-name">PowerShell 7</span>` +
+      `<span class="rd-req">required</span>` +
+      `<span class="rd-ver">${escapeHtml(r.pwsh.version)}</span>` +
+      `<span class="rd-path" title="${escapeHtml(r.pwsh.path)}">${escapeHtml(
+        r.pwsh.path
+      )}</span>`;
+  } else {
+    pwshRow.dataset.state = "missing";
+    pwshRow.innerHTML =
+      `<span class="rd-name">PowerShell 7</span>` +
+      `<span class="rd-req">required</span>` +
+      `<span class="rd-ver">not installed</span>` +
+      `<span class="rd-path">https://aka.ms/powershell</span>`;
+  }
+  list.appendChild(pwshRow);
+
+  let missingRequired = !r.pwsh;
+  (r.modules || []).forEach((m) => {
+    const row = document.createElement("li");
+    row.className = "ready-row";
+    row.dataset.state = m.present ? "ok" : m.required ? "missing" : "optional";
+    if (m.required && !m.present) missingRequired = true;
+    row.innerHTML =
+      `<span class="rd-name">${escapeHtml(m.name)}</span>` +
+      `<span class="rd-req">${m.required ? "required" : "optional"}</span>` +
+      `<span class="rd-ver">${
+        m.present ? escapeHtml(m.version || "installed") : "not installed"
+      }</span>` +
+      `<span class="rd-path"></span>`;
+    list.appendChild(row);
+  });
+
+  appReady = !missingRequired;
+  els.readinessHint.textContent = appReady
+    ? "All required dependencies present — Run is enabled."
+    : "Run is disabled until the required items above are installed. " +
+      "Guided install lands in the next step (5.3).";
+  // Re-apply Run's enabled/disabled state without flipping cancel.
+  els.run.disabled = !appReady || !els.cancel.classList.contains("hidden");
+}
+
+async function loadReadiness() {
+  els.readinessHint.textContent = "Checking…";
+  try {
+    const r = await invoke("readiness");
+    renderReadiness(r);
+  } catch (e) {
+    els.readinessHint.textContent = `Readiness check failed: ${e}`;
+    appReady = false;
+    els.run.disabled = true;
+  }
 }
 
 async function cancelRun() {
@@ -266,18 +334,6 @@ function onEvent(payload) {
   }
 }
 
-async function discover() {
-  els.pwsh.textContent = "pwsh: checking…";
-  try {
-    const info = await invoke("discover_pwsh_cmd");
-    els.pwsh.textContent = `pwsh: ${info.version} — ${info.path}`;
-    els.pwsh.classList.remove("err");
-  } catch (e) {
-    els.pwsh.textContent = `pwsh: ${e}`;
-    els.pwsh.classList.add("err");
-  }
-}
-
 async function runAssessment() {
   resetView();
   hideAuth();
@@ -300,7 +356,6 @@ window.addEventListener("DOMContentLoaded", async () => {
     tenant: document.querySelector("#tenant"),
     skipAuth: document.querySelector("#skip-auth"),
     run: document.querySelector("#btn-run"),
-    pwsh: document.querySelector("#pwsh-status"),
     runStatus: document.querySelector("#run-status"),
     phases: document.querySelector("#phases"),
     log: document.querySelector("#log-pane"),
@@ -314,10 +369,13 @@ window.addEventListener("DOMContentLoaded", async () => {
     resultSoc2: document.querySelector("#result-soc2"),
     resultArtifacts: document.querySelector("#result-artifacts"),
     resultErrors: document.querySelector("#result-errors"),
+    readinessList: document.querySelector("#readiness-list"),
+    readinessHint: document.querySelector("#readiness-hint"),
+    readinessBtn: document.querySelector("#btn-readiness"),
   };
   document.querySelector("#btn-run").addEventListener("click", runAssessment);
   document.querySelector("#btn-cancel").addEventListener("click", cancelRun);
-  document.querySelector("#btn-discover").addEventListener("click", discover);
+  document.querySelector("#btn-readiness").addEventListener("click", loadReadiness);
 
   try {
     supportedMajor = await invoke("supported_schema_major");
@@ -339,5 +397,5 @@ window.addEventListener("DOMContentLoaded", async () => {
     setRunning(false);
   });
 
-  discover();
+  loadReadiness();
 });
