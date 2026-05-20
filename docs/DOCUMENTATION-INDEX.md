@@ -21,6 +21,7 @@ We've created **6 comprehensive guides** totaling over **1,000 pages** of docume
 | **[Reporting-Guide.md](Reporting-Guide.md)** | All users | 20-40 min | Excel / HTML / CSV / JSON report formats, v2 schema surfacing |
 | **[Cockpit-Report-Guide.md](Cockpit-Report-Guide.md)** | Analysts / Auditors | 15-25 min | Analyst Cockpit HTML (the default since PR 4) — modes, sections, deep-dive routing, migration from pre-PR-4 layout |
 | **[REPORTING-STATUS.md](REPORTING-STATUS.md)** | All users | 5-10 min | Current status |
+| **[Release-Signing-Guide.md](Release-Signing-Guide.md)** | Maintainers | 10-15 min | Authenticode signing for the desktop NSIS build — cert classes (OV/EV), three ways to flip on signing (local / CI overlay / post-build `signtool`), verification + SmartScreen reputation. |
 
 ---
 
