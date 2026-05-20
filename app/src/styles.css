@@ -286,6 +286,22 @@ button.secondary {
   word-break: break-all;
 }
 
+.rd-actions {
+  font-family: inherit;
+  font-size: 0.8rem;
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.ready-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 10px;
+  flex-wrap: wrap;
+}
+
 .auth {
   border-left: 3px solid #3b82f6;
 }

@@ -421,6 +421,75 @@ pub fn collect_readiness(pwsh: &Path) -> std::io::Result<Vec<ModuleStatus>> {
     Ok(report)
 }
 
+// ---- step 5.3: consented guided remediation -------------------------
+
+/// Sibling of `Invoke-EntraChecksRun.ps1` in both the bundled `core/`
+/// resource subtree and the dev checkout, so the same resolve order
+/// (env override → bundled → walk-up) puts the prereqs script next
+/// to wherever the core is.
+pub const PREREQS_FILENAME: &str = "Install-Prerequisites.ps1";
+
+/// Resolve the bundled `Install-Prerequisites.ps1`. Anchored to the
+/// already-resolved core script: a packaged app keeps both under
+/// `core/`, a dev checkout keeps both at the repo root.
+pub fn resolve_install_prereqs_script(core_script: &Path) -> Option<PathBuf> {
+    let cand = core_script.parent()?.join(PREREQS_FILENAME);
+    if cand.is_file() {
+        Some(cand)
+    } else {
+        None
+    }
+}
+
+/// Build `pwsh` args to run `Install-Prerequisites.ps1`. `-GraphOnly`
+/// is the script's existing switch (skip the Az.* set). Pure + tested.
+pub fn install_prereqs_args(script: &Path, include_azure: bool) -> Vec<String> {
+    let mut a = vec![
+        "-NoProfile".to_string(),
+        "-NonInteractive".to_string(),
+        "-File".to_string(),
+        script.to_string_lossy().into_owned(),
+    ];
+    if !include_azure {
+        a.push("-GraphOnly".to_string());
+    }
+    a
+}
+
+/// Whether `winget` is on PATH. The Phase-5 §4 decision is to *use
+/// winget if present*, never silently download an MSI ourselves — so
+/// the absence of winget hands the user to the official page, not to
+/// a self-elevating installer.
+pub fn winget_available() -> bool {
+    let exe = if cfg!(target_os = "windows") {
+        "winget.exe"
+    } else {
+        "winget"
+    };
+    let sep = if cfg!(target_os = "windows") { ';' } else { ':' };
+    let Ok(path) = std::env::var("PATH") else {
+        return false;
+    };
+    path.split(sep)
+        .filter(|s| !s.is_empty())
+        .any(|d| Path::new(d).join(exe).is_file())
+}
+
+/// Args for `winget install --id Microsoft.PowerShell -e`. The
+/// accept-* flags keep the install non-interactive on the *winget*
+/// side; winget itself owns its UAC prompt (the app does not
+/// self-elevate). Pure + tested.
+pub fn winget_install_pwsh_args() -> Vec<&'static str> {
+    vec![
+        "install",
+        "--id",
+        "Microsoft.PowerShell",
+        "-e",
+        "--accept-source-agreements",
+        "--accept-package-agreements",
+    ]
+}
+
 // ---- step 4.5: cooperative cancel (Phase-3a sentinel) ---------------
 
 /// `<output_dir>/.runs/<run_id>.cancel` — the exact path the engine's
@@ -631,6 +700,56 @@ garbage line without a pipe
             assert_eq!(got.required, *required);
             assert_eq!(got.present, got.version.is_some());
         }
+    }
+
+    #[test]
+    fn install_prereqs_args_shape_and_graph_only_toggle() {
+        let full = install_prereqs_args(
+            Path::new("/r/Install-Prerequisites.ps1"),
+            true,
+        );
+        assert_eq!(full[2], "-File");
+        assert_eq!(full[3], "/r/Install-Prerequisites.ps1");
+        assert!(!full.iter().any(|x| x == "-GraphOnly"));
+
+        let graph_only = install_prereqs_args(
+            Path::new("/r/Install-Prerequisites.ps1"),
+            false,
+        );
+        assert!(graph_only.iter().any(|x| x == "-GraphOnly"));
+    }
+
+    #[test]
+    fn winget_install_pwsh_args_carry_accept_flags() {
+        let a = winget_install_pwsh_args();
+        assert_eq!(a[0], "install");
+        assert!(a.contains(&"Microsoft.PowerShell"));
+        // Non-interactive on winget's side, BUT winget still owns its
+        // own UAC prompt — the app must not silently elevate.
+        assert!(a.contains(&"--accept-source-agreements"));
+        assert!(a.contains(&"--accept-package-agreements"));
+    }
+
+    #[test]
+    fn resolve_install_prereqs_anchors_to_core_dir() {
+        let base = std::env::temp_dir()
+            .join(format!("ecf_prereqs_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let core_dir = base.join("core");
+        std::fs::create_dir_all(&core_dir).unwrap();
+        let core = core_dir.join("Invoke-EntraChecksRun.ps1");
+        std::fs::write(&core, "# core").unwrap();
+
+        // Missing sibling -> None (not fatal; UI surfaces it).
+        assert_eq!(resolve_install_prereqs_script(&core), None);
+
+        let prereqs = core_dir.join(PREREQS_FILENAME);
+        std::fs::write(&prereqs, "# prereqs").unwrap();
+        assert_eq!(
+            resolve_install_prereqs_script(&core),
+            Some(prereqs)
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

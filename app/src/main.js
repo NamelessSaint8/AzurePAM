@@ -155,6 +155,62 @@ function setRunning(on) {
   els.cancel.disabled = false;
 }
 
+let installing = false;
+let wingetOk = false;
+
+async function refreshWingetAvailability() {
+  try {
+    wingetOk = !!(await invoke("winget_available"));
+  } catch (_) {
+    wingetOk = false;
+  }
+}
+
+async function installPwshClick() {
+  if (installing) return;
+  if (
+    !confirm(
+      "Install PowerShell 7 via winget?\n\nwinget will display its own " +
+        "UAC prompt; this app does not self-elevate. Output streams to " +
+        "the Log below."
+    )
+  )
+    return;
+  installing = true;
+  logLine("[install] starting pwsh 7 via winget…");
+  try {
+    await invoke("install_pwsh_via_winget");
+  } catch (e) {
+    logLine(`[install] could not start: ${e}`, "error");
+    installing = false;
+  }
+}
+
+async function installPrereqsClick(includeAzure) {
+  if (installing) return;
+  if (
+    !confirm(
+      "Install Microsoft.Graph" +
+        (includeAzure ? " and the Az.* module set" : "") +
+        " via Install-Prerequisites.ps1?\n\nScope: CurrentUser (no " +
+        "elevation). Output streams to the Log below."
+    )
+  )
+    return;
+  installing = true;
+  logLine(
+    `[install] starting Install-Prerequisites.ps1 (${
+      includeAzure ? "Graph + Az" : "Graph only"
+    })…`
+  );
+  try {
+    await invoke("install_prereqs", { includeAzure });
+  } catch (e) {
+    logLine(`[install] could not start: ${e}`, "error");
+    installing = false;
+  }
+}
+
 function renderReadiness(r) {
   const list = els.readinessList;
   list.innerHTML = "";
@@ -177,16 +233,27 @@ function renderReadiness(r) {
       `<span class="rd-name">PowerShell 7</span>` +
       `<span class="rd-req">required</span>` +
       `<span class="rd-ver">not installed</span>` +
-      `<span class="rd-path">https://aka.ms/powershell</span>`;
+      `<span class="rd-path rd-actions">` +
+      (wingetOk
+        ? `<button class="link" data-act="winget">Install via winget</button>`
+        : "") +
+      `<button class="link" data-act="open">Open download page</button>` +
+      `</span>`;
   }
   list.appendChild(pwshRow);
 
   let missingRequired = !r.pwsh;
+  let missingRequiredModule = false;
+  let anyAzMissing = false;
   (r.modules || []).forEach((m) => {
     const row = document.createElement("li");
     row.className = "ready-row";
     row.dataset.state = m.present ? "ok" : m.required ? "missing" : "optional";
-    if (m.required && !m.present) missingRequired = true;
+    if (m.required && !m.present) {
+      missingRequired = true;
+      missingRequiredModule = true;
+    }
+    if (m.name.startsWith("Az.") && !m.present) anyAzMissing = true;
     row.innerHTML =
       `<span class="rd-name">${escapeHtml(m.name)}</span>` +
       `<span class="rd-req">${m.required ? "required" : "optional"}</span>` +
@@ -197,13 +264,49 @@ function renderReadiness(r) {
     list.appendChild(row);
   });
 
+  // Per-row actions for the pwsh row (event delegation kept tiny).
+  if (!r.pwsh) {
+    pwshRow.querySelectorAll("button[data-act]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        if (btn.dataset.act === "winget") {
+          installPwshClick();
+        } else {
+          invoke("open_external", { target: "https://aka.ms/powershell" });
+        }
+      });
+    });
+  }
+
+  // Bottom action: a single "Install dependencies" button when any
+  // required module is missing (pwsh has its own row actions). Mirrors
+  // Install-Prerequisites.ps1's surface (Graph + optional Az.*).
+  const actionBar = document.createElement("div");
+  actionBar.className = "ready-actions";
+  if (missingRequiredModule && r.pwsh) {
+    const includeAzDefault = anyAzMissing;
+    actionBar.innerHTML =
+      `<button id="btn-install-prereqs">Install dependencies</button>` +
+      `<label class="check"><input type="checkbox" id="chk-az"` +
+      (includeAzDefault ? " checked" : "") +
+      `/> Include Az.* (Defender / Policy / Recovery)</label>`;
+    list.appendChild(actionBar);
+    actionBar
+      .querySelector("#btn-install-prereqs")
+      .addEventListener("click", () =>
+        installPrereqsClick(
+          actionBar.querySelector("#chk-az").checked
+        )
+      );
+  }
+
   appReady = !missingRequired;
-  els.readinessHint.textContent = appReady
+  els.readinessHint.textContent = installing
+    ? "Installing… Run will re-enable when Readiness re-checks."
+    : appReady
     ? "All required dependencies present — Run is enabled."
-    : "Run is disabled until the required items above are installed. " +
-      "Guided install lands in the next step (5.3).";
-  // Re-apply Run's enabled/disabled state without flipping cancel.
-  els.run.disabled = !appReady || !els.cancel.classList.contains("hidden");
+    : "Run is disabled until the required items above are installed.";
+  els.run.disabled =
+    !appReady || installing || !els.cancel.classList.contains("hidden");
 }
 
 async function loadReadiness() {
@@ -396,6 +499,18 @@ window.addEventListener("DOMContentLoaded", async () => {
     logLine(`[process error] ${e.payload}`, "error");
     setRunning(false);
   });
+  listen("install:line", (e) => logLine(`[install] ${e.payload}`));
+  listen("install:exit", async (e) => {
+    logLine(`[install] exited ${e.payload}`, e.payload === 0 ? "ok" : "warn");
+    installing = false;
+    await refreshWingetAvailability();
+    await loadReadiness();
+  });
+  listen("install:error", (e) => {
+    logLine(`[install] error: ${e.payload}`, "error");
+    installing = false;
+  });
 
-  loadReadiness();
+  await refreshWingetAvailability();
+  await loadReadiness();
 });

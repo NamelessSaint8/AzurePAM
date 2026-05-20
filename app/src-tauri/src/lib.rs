@@ -1,14 +1,14 @@
 //! EntraChecks desktop shell — Native App Phase 4 (MVP).
 //!
-//! Phase 5.2 (this commit): the **Readiness** model — the three-
-//! dependency preflight (`pwsh` 7 / Microsoft.Graph / Az.*) reports as
-//! structured data. Single `readiness` Tauri command, a single inline
-//! `Get-Module -ListAvailable` probe in the discovered pwsh, parsed
-//! into typed `ModuleStatus` rows. **Detection only this step** — the
-//! consented remediation actions (running the bundled
-//! `Install-Prerequisites.ps1`, winget for `pwsh` 7) arrive in 5.3.
-//! Earlier steps (4.1–4.6, 5.1) built the MVP run loop + the
-//! bundled-core resolve.
+//! Phase 5.3 (this commit): **consented guided remediation**.
+//! `install_prereqs` runs the bundled `Install-Prerequisites.ps1`
+//! through the detected `pwsh` (`-Scope CurrentUser`, no elevation),
+//! streamed as `install:line/exit/error` via the same boundary as a
+//! run. `install_pwsh_via_winget` hands `pwsh 7` install to winget
+//! (which owns its UAC prompt); when winget is absent the command
+//! errors and the frontend opens the official download page via
+//! `open_external` — the app never silently downloads an MSI or
+//! self-elevates.
 //!
 //! `tauri-plugin-opener` is wired now because step 6 ("Open report")
 //! needs it; it is otherwise inert at this stage.
@@ -16,7 +16,7 @@
 pub mod contract;
 mod sidecar;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_opener::OpenerExt;
@@ -244,6 +244,82 @@ fn open_external(app: AppHandle, target: String) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// Phase 5.3: is `winget` on PATH? The frontend decides whether to
+/// offer "Install via winget" vs. "Open download page" for `pwsh` 7.
+#[tauri::command]
+fn winget_available() -> bool {
+    sidecar::winget_available()
+}
+
+/// Run the bundled `Install-Prerequisites.ps1` through the detected
+/// `pwsh`, streaming its stdout to the webview (`install:line` /
+/// `install:exit` / `install:error`). `-Scope CurrentUser` is the
+/// script's posture — no elevation requested by the app. The 5.2
+/// boundary (`spawn_streaming`) is reused verbatim; this command
+/// only composes it.
+#[tauri::command]
+fn install_prereqs(app: AppHandle, include_azure: bool) -> Result<(), String> {
+    let pwsh = sidecar::discover_pwsh().map_err(|e| e.to_string())?;
+    let res_dir = app.path().resource_dir().ok();
+    let core =
+        sidecar::resolve_core_script(res_dir.as_deref()).ok_or_else(|| {
+            "The PS core could not be located (bundled or in repo).".to_string()
+        })?;
+    let script = sidecar::resolve_install_prereqs_script(&core)
+        .ok_or_else(|| "Install-Prerequisites.ps1 not found next to the core."
+            .to_string())?;
+    let args = sidecar::install_prereqs_args(&script, include_azure);
+
+    std::thread::spawn(move || {
+        let argrefs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let result =
+            sidecar::spawn_streaming(&pwsh.path, &argrefs, |line| {
+                let _ = app.emit("install:line", line.to_string());
+            });
+        match result {
+            Ok(code) => {
+                let _ = app.emit("install:exit", code);
+            }
+            Err(e) => {
+                let _ = app.emit("install:error", e.to_string());
+            }
+        }
+    });
+    Ok(())
+}
+
+/// Install `pwsh` 7 via winget. `winget` owns its own UAC prompt;
+/// the app never self-elevates. If `winget` isn't on PATH the
+/// command errors and the frontend offers the official download page
+/// instead (via `open_external`).
+#[tauri::command]
+fn install_pwsh_via_winget(app: AppHandle) -> Result<(), String> {
+    if !sidecar::winget_available() {
+        return Err(
+            "winget is not available on PATH. Install PowerShell 7 from \
+             https://aka.ms/powershell instead."
+                .to_string(),
+        );
+    }
+    let args = sidecar::winget_install_pwsh_args();
+    std::thread::spawn(move || {
+        // `Path::new("winget")` lets the OS resolve via PATH.
+        let result =
+            sidecar::spawn_streaming(Path::new("winget"), &args, |line| {
+                let _ = app.emit("install:line", line.to_string());
+            });
+        match result {
+            Ok(code) => {
+                let _ = app.emit("install:exit", code);
+            }
+            Err(e) => {
+                let _ = app.emit("install:error", e.to_string());
+            }
+        }
+    });
+    Ok(())
+}
+
 /// Open a `run.result` artifact (the cockpit HTML etc.) in the OS
 /// default app via the opener plugin. The MVP uses OS-open for
 /// reliability; an in-app webview window for the cockpit HTML is a
@@ -270,7 +346,10 @@ pub fn run() {
             cancel_run,
             open_external,
             open_report,
-            readiness
+            readiness,
+            winget_available,
+            install_prereqs,
+            install_pwsh_via_winget
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
