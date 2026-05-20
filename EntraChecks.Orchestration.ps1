@@ -397,6 +397,32 @@ function Connect-EcfMgGraphDeviceCode {
 
     $claims = ConvertFrom-EcfJwtPayload -Token ([string]$token.id_token)
     if (-not $claims) { $claims = ConvertFrom-EcfJwtPayload -Token ([string]$token.access_token) }
+    # Parse the access token's claims separately so we can show the
+    # user EXACTLY which Graph scopes the consented session has.
+    # If the token's `scp` claim only contains a subset of what we
+    # asked for (admin consent didn't cover everything), every
+    # subsequent `Get-Mg*` call silently returns empty — and the
+    # run "Succeeds" with 0 findings even though the TUI on the same
+    # tenant produces 100+. Surfacing the granted scopes makes the
+    # mismatch immediately obvious in the GUI Log pane.
+    $accessClaims = ConvertFrom-EcfJwtPayload -Token ([string]$token.access_token)
+    $grantedScopes = ''
+    if ($accessClaims -and $accessClaims.PSObject.Properties['scp']) {
+        $grantedScopes = [string]$accessClaims.scp
+    }
+    $requestedScopes = ($Scopes -join ' ')
+    $missingScopes = @()
+    if ($grantedScopes) {
+        $granted = @($grantedScopes -split '\s+' | Where-Object { $_ })
+        $missingScopes = @($Scopes | Where-Object { $granted -notcontains $_ })
+    }
+    Write-Host ("    Granted Graph scopes: " + ($(if ($grantedScopes) { $grantedScopes } else { '(none — token has no `scp` claim)' }))) -ForegroundColor Cyan
+    if ($missingScopes.Count -gt 0) {
+        Write-Host ("    [!] Missing scopes (modules using these will return empty): " + ($missingScopes -join ', ')) -ForegroundColor Yellow
+        Write-Host  "    [!] An admin must consent for the 'Microsoft Graph PowerShell' app (id 14d82eec-204b-4c2f-b7e8-296a70dab67e) in this tenant before these scopes are issued." -ForegroundColor Yellow
+    }
+    [Console]::Out.Flush()
+
     $account = ''
     foreach ($name in @('preferred_username', 'upn', 'unique_name', 'email', 'name')) {
         if ($claims -and $claims.PSObject.Properties[$name] -and $claims.$name) {
