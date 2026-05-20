@@ -15,8 +15,11 @@ plans/
 .openwolf/
 /CLAUDE.md
 node_modules/
-package.json
-package-lock.json
+# Root-level package.json / lockfile is for openwolf tooling and not
+# checked in. Phase-5 desktop app under app/ ships its own real
+# lockfile — anchored rules so app/package-lock.json is tracked.
+/package.json
+/package-lock.json
 
 # Claude Code project context
 .claude/*
