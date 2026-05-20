@@ -12,6 +12,11 @@ dist
 dist-ssr
 *.local
 
+# Phase 5.4/5.6: signing overlay (carries the cert thumbprint). The
+# CI workflow writes this from a repo secret; locally generated ones
+# never get committed.
+src-tauri/tauri.signed.conf.json
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

@@ -105,10 +105,14 @@ Build with the overlay:
 npm run tauri build -- --config src-tauri/tauri.signed.conf.json
 ```
 
-In GitHub Actions, write the overlay from a secret (`SIGN_CERT_THUMBPRINT`)
-just before build, and skip the overlay when the secret is absent — that
-gives a clean signed-when-possible / unsigned-otherwise CI behaviour
-(the actual workflow lands in step 5.5).
+This is the model the `.github/workflows/desktop.yml` job
+(Phase 5.6) uses: the `Stage signing overlay (if secret is set)` step
+writes `app/src-tauri/tauri.signed.conf.json` *iff* the
+`SIGN_CERT_THUMBPRINT` repo secret is non-empty, then the build runs
+under either the *signed* or *unsigned* conditional step. The overlay
+filename is gitignored, so a locally-generated one never accidentally
+commits. To flip CI to signed: add the secret to the repository's
+Settings → Secrets and variables → Actions; no code change needed.
 
 ### Option C — post-build `signtool` (manual fallback)
 

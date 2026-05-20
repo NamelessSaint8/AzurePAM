@@ -1,0 +1,139 @@
+# Desktop app CI (Native App Phase 5.6).
+#
+# - rust-suite: cargo test + clippy across linux / macos / windows.
+#   This is the first time the Phase-4/5 parser, sidecar, and
+#   elevation stubs are asserted on the actual Windows target — until
+#   now those tests only ran on the dev macOS box.
+# - windows-build: produces the NSIS installer. Signing is wired but
+#   conditional on a `SIGN_CERT_THUMBPRINT` repo secret that does not
+#   exist today; the build is therefore unsigned by design (see
+#   docs/Release-Signing-Guide.md). Adding that one secret flips the
+#   workflow to signed with zero code change.
+
+name: Desktop
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - "app/**"
+      - ".github/workflows/desktop.yml"
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - "app/**"
+      - ".github/workflows/desktop.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: desktop-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust-suite:
+    name: cargo test + clippy (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux webview deps
+        # Tauri 2 links against WebKitGTK / libsoup on Linux even for
+        # `cargo test` (the generate_context! macro pulls them in).
+        # Windows + macOS hosts have their webviews built in.
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libsoup-3.0-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri
+
+      - name: cargo test
+        working-directory: app/src-tauri
+        run: cargo test --all-targets --verbose
+
+      - name: cargo clippy -D warnings
+        working-directory: app/src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+
+  windows-build:
+    name: NSIS installer (windows-latest)
+    needs: rust-suite
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri
+
+      - name: Install npm deps
+        working-directory: app
+        run: npm ci
+
+      # Signing overlay (Phase 5.4 plan §5.B). Emitted only when the
+      # SIGN_CERT_THUMBPRINT repo secret exists; absent today by
+      # design — the build still ships, unsigned. SmartScreen will
+      # warn until the secret is wired (docs/Release-Signing-Guide.md).
+      - name: Stage signing overlay (if secret is set)
+        id: sign
+        shell: pwsh
+        env:
+          THUMB: ${{ secrets.SIGN_CERT_THUMBPRINT }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:THUMB)) {
+            Write-Host "SIGN_CERT_THUMBPRINT not set; producing UNSIGNED build." -ForegroundColor Yellow
+            "signed=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          } else {
+            $overlay = @{
+              bundle = @{
+                windows = @{ certificateThumbprint = $env:THUMB }
+              }
+            } | ConvertTo-Json -Depth 5 -Compress
+            $overlay | Out-File -FilePath "app/src-tauri/tauri.signed.conf.json" -Encoding utf8 -NoNewline
+            Write-Host "Signing overlay written; build will be signed." -ForegroundColor Green
+            "signed=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
+
+      - name: Build NSIS bundle (signed)
+        if: steps.sign.outputs.signed == 'true'
+        working-directory: app
+        run: npm run tauri build -- --config src-tauri/tauri.signed.conf.json
+
+      - name: Build NSIS bundle (unsigned)
+        if: steps.sign.outputs.signed != 'true'
+        working-directory: app
+        run: npm run tauri build
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: EntraChecks-windows-nsis
+          path: app/src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+          retention-days: 30
