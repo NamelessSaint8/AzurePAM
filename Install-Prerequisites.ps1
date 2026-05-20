@@ -145,6 +145,16 @@ function Install-RequiredModule {
     }
 }
 
+# -- Plan marker (machine-parseable, additive; the TUI ignores) -----------
+#
+# The EntraChecks desktop GUI reads this line up front to render a real
+# determinate progress bar: total=N matches the number of
+# Install-RequiredModule calls below. Backward-compatible — anything
+# that doesn't parse the [plan] prefix just sees an info line.
+
+$planTotal = if ($GraphOnly) { 1 } else { 8 }
+Write-Host "[plan] total=$planTotal"
+
 # -- Microsoft Graph SDK (required) ----------------------------------------
 
 Write-Host ""

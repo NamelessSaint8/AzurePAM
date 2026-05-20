@@ -20,6 +20,21 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+/// Suppress the console-window that Windows otherwise allocates when
+/// a GUI-subsystem parent (Tauri) spawns a console-subsystem child
+/// (pwsh, winget). Without this flag the user sees a blinking-cursor
+/// `cmd`-like window flash up, and AllocConsole interactions can
+/// even hang the child mid-launch under Mark-of-the-Web. No-op
+/// off-Windows — `CommandExt::creation_flags` is Windows-only.
+#[cfg(windows)]
+fn apply_no_console_window(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+#[cfg(not(windows))]
+fn apply_no_console_window(_cmd: &mut Command) {}
+
 /// Which OS family we are building discovery candidates for. Kept
 /// explicit (rather than reading `cfg!` inline) so the candidate
 /// builder is a pure function unit-testable on any host.
@@ -155,7 +170,13 @@ pub fn discover_pwsh() -> Result<PwshLocation, PwshError> {
         if !cand.is_file() {
             continue;
         }
-        let out = Command::new(&cand).arg("--version").output();
+        // Even the brief `--version` probe pops a console window on
+        // Windows without this — and `discover_pwsh` runs on every
+        // Readiness re-check.
+        let mut probe = Command::new(&cand);
+        probe.arg("--version");
+        apply_no_console_window(&mut probe);
+        let out = probe.output();
         if let Ok(out) = out {
             let text = String::from_utf8_lossy(&out.stdout);
             if let Some((major, full)) = parse_pwsh_version(&text) {
@@ -182,11 +203,12 @@ pub fn spawn_streaming<F: FnMut(&str)>(
     args: &[&str],
     mut on_line: F,
 ) -> std::io::Result<i32> {
-    let mut child = Command::new(program)
-        .args(args)
+    let mut cmd = Command::new(program);
+    cmd.args(args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::null()) // 4.2: stdout only; stderr handling is later
-        .spawn()?;
+        .stderr(Stdio::null()); // 4.2: stdout only; stderr handling is later
+    apply_no_console_window(&mut cmd);
+    let mut child = cmd.spawn()?;
 
     if let Some(stdout) = child.stdout.take() {
         let reader = BufReader::new(stdout);

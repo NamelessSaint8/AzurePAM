@@ -158,6 +158,76 @@ function setRunning(on) {
 let installing = false;
 let wingetOk = false;
 
+// --- op-banner: determinate progress for long-running operations -----
+//
+// A spinner-only "busy" indicator looks frozen after ~10s of no
+// movement; a real progress bar shows the user the run isn't stuck.
+// Use determinate where total is known (install, with [plan] total=N
+// from the bundled script); indeterminate elsewhere — but ALWAYS
+// pair with a live elapsed-time tick so even an indeterminate state
+// proves it's alive.
+let opTimer = null;
+let opStart = 0;
+
+function fmtElapsed(ms) {
+  const s = Math.round(ms / 1000);
+  const m = Math.floor(s / 60);
+  const sec = s % 60;
+  return m > 0 ? `${m}m ${sec}s` : `${sec}s`;
+}
+
+function startOp(label, { determinate = false, total = null, sub = "" } = {}) {
+  const banner = document.querySelector("#op-banner");
+  const pb = document.querySelector("#op-progress");
+  document.querySelector("#op-label").textContent = label;
+  document.querySelector("#op-sub").textContent = sub;
+  document.querySelector("#op-elapsed").textContent = "0s";
+  if (determinate && total) {
+    pb.max = total;
+    pb.value = 0;
+  } else {
+    // Indeterminate: clear `value` so the browser animates the bar.
+    pb.removeAttribute("value");
+  }
+  banner.classList.remove("hidden");
+  opStart = Date.now();
+  if (opTimer) clearInterval(opTimer);
+  opTimer = setInterval(() => {
+    document.querySelector("#op-elapsed").textContent = fmtElapsed(
+      Date.now() - opStart
+    );
+  }, 1000);
+}
+
+function setOpProgress(value, sub) {
+  const pb = document.querySelector("#op-progress");
+  if (value != null) pb.value = value;
+  if (sub != null) document.querySelector("#op-sub").textContent = sub;
+}
+
+function setOpTotal(total) {
+  const pb = document.querySelector("#op-progress");
+  pb.max = total;
+  if (!pb.hasAttribute("value")) pb.value = 0;
+}
+
+function setOpSub(sub) {
+  document.querySelector("#op-sub").textContent = sub;
+}
+
+function endOp() {
+  if (opTimer) {
+    clearInterval(opTimer);
+    opTimer = null;
+  }
+  document.querySelector("#op-banner").classList.add("hidden");
+}
+
+// Install-stream parser state — reset on every install start.
+let installTotal = null;
+let installDone = 0;
+let installCurrent = null;
+
 async function refreshWingetAvailability() {
   try {
     wingetOk = !!(await invoke("winget_available"));
@@ -188,16 +258,32 @@ async function installPwshClick() {
 
 async function installPrereqsClick(includeAzure) {
   if (installing) return;
+  // Module counts mirror Install-Prerequisites.ps1 / the [plan] line.
+  const totalModules = includeAzure ? 8 : 1;
+  const set = includeAzure
+    ? "Microsoft.Graph + the Az.* set (8 modules)"
+    : "Microsoft.Graph (1 module)";
   if (
     !confirm(
-      "Install Microsoft.Graph" +
-        (includeAzure ? " and the Az.* module set" : "") +
-        " via Install-Prerequisites.ps1?\n\nScope: CurrentUser (no " +
-        "elevation). Output streams to the Log below."
+      `Install ${set}?\n\n` +
+        "Scope: CurrentUser (no elevation needed). " +
+        "Typically takes 3–10 minutes depending on network speed; " +
+        "single-module downloads can stretch 30–90 seconds with no " +
+        "new log output (it's not frozen — the progress bar above " +
+        "ticks elapsed time and advances per module).\n\n" +
+        "Output streams to the Log pane below as each step runs."
     )
   )
     return;
   installing = true;
+  installTotal = null;
+  installDone = 0;
+  installCurrent = null;
+  startOp("Installing dependencies", {
+    determinate: true,
+    total: totalModules,
+    sub: `0 of ${totalModules} modules complete · preparing…`,
+  });
   logLine(
     `[install] starting Install-Prerequisites.ps1 (${
       includeAzure ? "Graph + Az" : "Graph only"
@@ -208,6 +294,7 @@ async function installPrereqsClick(includeAzure) {
   } catch (e) {
     logLine(`[install] could not start: ${e}`, "error");
     installing = false;
+    endOp();
   }
 }
 
@@ -354,6 +441,11 @@ function renderReadiness(r) {
 }
 
 async function loadReadiness() {
+  // Up-top, animated, with elapsed time — so users don't think the
+  // app launched empty while pwsh is being probed (typically 2–5s).
+  startOp("Checking PowerShell 7 and required modules", {
+    sub: "Probing the local install…",
+  });
   els.readinessHint.textContent = "Checking…";
   try {
     const r = await invoke("readiness");
@@ -362,6 +454,8 @@ async function loadReadiness() {
     els.readinessHint.textContent = `Readiness check failed: ${e}`;
     appReady = false;
     els.run.disabled = true;
+  } finally {
+    endOp();
   }
 }
 
@@ -390,6 +484,7 @@ function onEvent(payload) {
       break;
     case "phaseStarted":
       setPhase(event.phase, "running", "…");
+      setOpSub(`Phase: ${event.phase}`);
       break;
     case "phaseProgress": {
       const counter =
@@ -472,6 +567,7 @@ function onEvent(payload) {
       els.runStatus.className = "run-status st-" + event.status;
       renderResult(event);
       setRunning(false);
+      endOp();
       break;
     }
     case "unknown":
@@ -486,6 +582,12 @@ async function runAssessment() {
   hideAuth();
   setRunning(true);
   els.runStatus.textContent = "Starting…";
+  // Indeterminate banner with live elapsed time. The Phases card
+  // below still shows real per-phase ok/running/failed state — the
+  // banner just promises "still alive" at the top.
+  startOp("Assessment running", {
+    sub: "Waiting for the first phase…",
+  });
   try {
     await invoke("run_assessment", {
       tenant: els.tenant.value,
@@ -495,6 +597,7 @@ async function runAssessment() {
     els.runStatus.textContent = `Could not start: ${e}`;
     els.runStatus.classList.add("st-Failed");
     setRunning(false);
+    endOp();
   }
 }
 
@@ -538,10 +641,12 @@ window.addEventListener("DOMContentLoaded", async () => {
   listen("run:exit", (e) => {
     logLine(`[process exited ${e.payload}]`);
     setRunning(false);
+    endOp();
   });
   listen("run:error", (e) => {
     logLine(`[process error] ${e.payload}`, "error");
     setRunning(false);
+    endOp();
   });
   listen("update:available", (e) => {
     const m = e.payload || {};
@@ -564,27 +669,70 @@ window.addEventListener("DOMContentLoaded", async () => {
   });
 
   listen("install:line", (e) => {
-    // Install-Prerequisites.ps1 emits lines prefixed [X] / [!] / [+]
-    // / [*]; surface the failure / warning ones in colour so the
-    // user can actually see when an install silently goes sideways.
+    // Install-Prerequisites.ps1 emits:
+    //   [plan] total=N       — once, up front (drives the bar).
+    //   [*] Installing X     — per module, when it starts.
+    //   [*] Upgrading X      — same, on upgrade path.
+    //   [+] X v... installed successfully   — per module, on done.
+    //   [+] X v... already installed - ...  — same, on skip-because-present.
+    //   [X] Failed to install X : message   — per module, on fail.
+    // Colour-code; advance the progress bar; keep the Log pane as
+    // the source of truth.
     const raw = String(e.payload || "");
+
+    // Bar-driving markers (process first so the bar updates promptly).
+    const planMatch = raw.match(/^\s*\[plan\]\s+total=(\d+)/);
+    if (planMatch) {
+      installTotal = parseInt(planMatch[1], 10);
+      installDone = 0;
+      setOpTotal(installTotal);
+      setOpSub(`0 of ${installTotal} modules complete · preparing…`);
+    }
+    const startMatch = raw.match(
+      /^\s*\[\*\]\s+(?:Installing|Upgrading)\s+(\S+)/
+    );
+    if (startMatch) {
+      installCurrent = startMatch[1];
+      const total = installTotal ?? "?";
+      setOpSub(
+        `Installing ${installCurrent} · ${installDone} of ${total} complete`
+      );
+    }
+    const doneMatch = raw.match(
+      /^\s*\[\+\]\s+(\S+)\s+v\S+\s+(?:installed successfully|already installed)/
+    );
+    if (doneMatch) {
+      installDone += 1;
+      const total = installTotal ?? "?";
+      setOpProgress(
+        installTotal ? installDone : null,
+        `${installDone} of ${total} modules complete · last: ${doneMatch[1]}`
+      );
+    }
+
+    // Colour-coded log line.
     let cls;
     if (/^\s*\[X\]/.test(raw)) cls = "error";
     else if (/^\s*\[!\]/.test(raw)) cls = "warn";
     else if (/^\s*\[\+\]/.test(raw)) cls = "ok";
-    else if (raw.toLowerCase().includes("error") ||
-             raw.toLowerCase().includes("exception")) cls = "error";
+    else if (
+      raw.toLowerCase().includes("error") ||
+      raw.toLowerCase().includes("exception")
+    )
+      cls = "error";
     logLine(`[install] ${raw}`, cls);
   });
   listen("install:exit", async (e) => {
     logLine(`[install] exited ${e.payload}`, e.payload === 0 ? "ok" : "warn");
     installing = false;
+    endOp();
     await refreshWingetAvailability();
     await loadReadiness();
   });
   listen("install:error", (e) => {
     logLine(`[install] error: ${e.payload}`, "error");
     installing = false;
+    endOp();
   });
 
   await refreshWingetAvailability();
