@@ -41,12 +41,53 @@
 # execution", killing the script at the auth-status banner. Every
 # status-read site already treats a null context as "not connected",
 # so a missing module must degrade to $null, not crash.
+function Add-EcfMgContextFallback {
+    [CmdletBinding()]
+    param([AllowNull()][object]$Context)
+
+    if (-not (Get-Variable -Name EcfLastDeviceCodeAuth -Scope Script -ErrorAction SilentlyContinue)) {
+        return $Context
+    }
+    $fallback = $script:EcfLastDeviceCodeAuth
+    if (-not $fallback) { return $Context }
+
+    $hasAccount = $false
+    if ($Context -and $Context.PSObject.Properties['Account']) {
+        $hasAccount = -not [string]::IsNullOrWhiteSpace([string]$Context.Account)
+    }
+    $hasScopes = $false
+    if ($Context -and $Context.PSObject.Properties['Scopes'] -and $Context.Scopes) {
+        $hasScopes = @($Context.Scopes).Count -gt 0
+    }
+    if ($hasAccount -and $hasScopes) { return $Context }
+
+    $tenantId = if ($Context -and $Context.PSObject.Properties['TenantId'] -and $Context.TenantId) {
+        [string]$Context.TenantId
+    }
+    else {
+        [string]$fallback.TenantId
+    }
+    $scopes = if ($Context -and $Context.PSObject.Properties['Scopes'] -and $Context.Scopes) {
+        @($Context.Scopes)
+    }
+    else {
+        @($fallback.Scopes)
+    }
+
+    return [pscustomobject]@{
+        Account = if ($hasAccount) { [string]$Context.Account } else { [string]$fallback.Account }
+        TenantId = $tenantId
+        Scopes = $scopes
+        OriginalContext = $Context
+    }
+}
+
 function Get-EcfMgContextSafe {
     [CmdletBinding()]
     param()
     $cmd = Get-Command -Name 'Get-MgContext' -ErrorAction SilentlyContinue
     if (-not $cmd) { return $null }
-    try { return (& $cmd -ErrorAction SilentlyContinue) }
+    try { return Add-EcfMgContextFallback -Context (& $cmd -ErrorAction SilentlyContinue) }
     catch { Write-Verbose "Get-MgContext failed (ignored): $_"; return $null }
 }
 
@@ -216,11 +257,171 @@ function Show-Progress {
 
 #region ==================== AUTHENTICATION ====================
 
+function ConvertFrom-EcfJwtPayload {
+    [CmdletBinding()]
+    param([string]$Token)
+
+    if ([string]::IsNullOrWhiteSpace($Token)) { return $null }
+    $parts = $Token.Split('.')
+    if ($parts.Count -lt 2) { return $null }
+    $payload = $parts[1].Replace('-', '+').Replace('_', '/')
+    switch ($payload.Length % 4) {
+        2 { $payload += '==' }
+        3 { $payload += '=' }
+        1 { return $null }
+    }
+    try {
+        $json = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payload))
+        return $json | ConvertFrom-Json -ErrorAction Stop
+    }
+    catch {
+        return $null
+    }
+}
+
+function Get-EcfOAuthErrorPayload {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][System.Management.Automation.ErrorRecord]$ErrorRecord)
+
+    $message = [string]$ErrorRecord.ErrorDetails.Message
+    if (-not [string]::IsNullOrWhiteSpace($message)) {
+        try { return $message | ConvertFrom-Json -ErrorAction Stop } catch {}
+    }
+    return [pscustomobject]@{
+        error = ''
+        error_description = $ErrorRecord.Exception.Message
+    }
+}
+
+function Invoke-EcfGraphDeviceCodeToken {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string[]]$Scopes,
+        [scriptblock]$DeviceCodeCallback
+    )
+
+    # Microsoft Graph PowerShell's public-client app id. We use the
+    # standard OAuth device-code endpoints directly so the runner can
+    # emit the actual user_code through the GUI contract instead of
+    # hoping the SDK's host prompt is visible through a Tauri sidecar.
+    $clientId = '14d82eec-204b-4c2f-b7e8-296a70dab67e'
+    $tenant = 'organizations'
+    $baseUri = "https://login.microsoftonline.com/$tenant/oauth2/v2.0"
+    $scopeText = (@($Scopes) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique) -join ' '
+    if ([string]::IsNullOrWhiteSpace($scopeText)) {
+        throw "No Microsoft Graph scopes were supplied for device-code authentication."
+    }
+
+    # Diagnostic: surfaces a visible line BEFORE the network call so a
+    # hung POST (firewall, proxy, captive portal) is distinguishable
+    # from "the SDK silently ate the code."
+    Write-Host "    Requesting device code from Microsoft identity platform..." -ForegroundColor Cyan
+    $device = Invoke-RestMethod -Method Post -Uri "$baseUri/devicecode" `
+        -ContentType 'application/x-www-form-urlencoded' `
+        -Body @{ client_id = $clientId; scope = $scopeText } `
+        -ErrorAction Stop
+
+    $verificationUri = if ($device.verification_uri) { [string]$device.verification_uri } else { [string]$device.verification_url }
+    if ([string]::IsNullOrWhiteSpace($verificationUri)) { $verificationUri = 'https://microsoft.com/devicelogin' }
+    $userCode = [string]$device.user_code
+    $deviceCode = [string]$device.device_code
+    if ([string]::IsNullOrWhiteSpace($userCode) -or [string]::IsNullOrWhiteSpace($deviceCode)) {
+        throw "Microsoft identity platform did not return a usable device code."
+    }
+
+    $codeInfo = [pscustomobject]@{
+        UserCode = $userCode
+        VerificationUri = $verificationUri
+        Message = [string]$device.message
+        ExpiresIn = [int]$device.expires_in
+        Interval = [int]$device.interval
+    }
+    # Belt + braces: ALWAYS emit a visible "...enter the code <CODE>..."
+    # line so the desktop's stdout scraper catches it even when the
+    # structured callback path is unavailable (legacy callers, missing
+    # runner module, etc.). The phrasing mirrors the SDK's exactly so
+    # the same scraper regex hits.
+    Write-Host ("    To sign in, open {0} and enter the code {1} to authenticate." -f $verificationUri, $userCode) -ForegroundColor Yellow
+    if ($DeviceCodeCallback) {
+        & $DeviceCodeCallback $codeInfo
+    }
+    Write-Host "    Waiting for sign-in to complete..." -ForegroundColor Cyan
+
+    $interval = [Math]::Max(1, [int]$device.interval)
+    $expires = if ([int]$device.expires_in -gt 0) { [int]$device.expires_in } else { 900 }
+    $deadline = (Get-Date).AddSeconds($expires)
+    $tokenBody = @{
+        grant_type = 'urn:ietf:params:oauth:grant-type:device_code'
+        client_id = $clientId
+        device_code = $deviceCode
+    }
+
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Seconds $interval
+        try {
+            return Invoke-RestMethod -Method Post -Uri "$baseUri/token" `
+                -ContentType 'application/x-www-form-urlencoded' `
+                -Body $tokenBody `
+                -ErrorAction Stop
+        }
+        catch {
+            $err = Get-EcfOAuthErrorPayload -ErrorRecord $_
+            switch ([string]$err.error) {
+                'authorization_pending' { continue }
+                'slow_down' { $interval += 5; continue }
+                'authorization_declined' { throw "Device-code sign-in was declined." }
+                'access_denied' { throw "Device-code sign-in was denied." }
+                'expired_token' { throw "Device-code sign-in expired before it was completed." }
+                default {
+                    $desc = if ($err.error_description) { [string]$err.error_description } else { $_.Exception.Message }
+                    throw "Device-code token request failed: $desc"
+                }
+            }
+        }
+    }
+
+    throw "Device-code sign-in expired before it was completed."
+}
+
+function Connect-EcfMgGraphDeviceCode {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string[]]$Scopes,
+        [scriptblock]$DeviceCodeCallback
+    )
+
+    $token = Invoke-EcfGraphDeviceCodeToken -Scopes $Scopes -DeviceCodeCallback $DeviceCodeCallback
+    if (-not $token -or [string]::IsNullOrWhiteSpace([string]$token.access_token)) {
+        throw "Device-code sign-in completed but no access token was returned."
+    }
+
+    $claims = ConvertFrom-EcfJwtPayload -Token ([string]$token.id_token)
+    if (-not $claims) { $claims = ConvertFrom-EcfJwtPayload -Token ([string]$token.access_token) }
+    $account = ''
+    foreach ($name in @('preferred_username', 'upn', 'unique_name', 'email', 'name')) {
+        if ($claims -and $claims.PSObject.Properties[$name] -and $claims.$name) {
+            $account = [string]$claims.$name
+            break
+        }
+    }
+    $tenantId = if ($claims -and $claims.PSObject.Properties['tid']) { [string]$claims.tid } else { '' }
+    $script:EcfLastDeviceCodeAuth = [pscustomobject]@{
+        Account = $account
+        TenantId = $tenantId
+        Scopes = @($Scopes)
+    }
+
+    $secureToken = ConvertTo-SecureString -String ([string]$token.access_token) -AsPlainText -Force
+    Connect-MgGraph -AccessToken $secureToken -NoWelcome -ErrorAction Stop | Out-Null
+    return Add-EcfMgContextFallback -Context (Get-MgContext -ErrorAction SilentlyContinue)
+}
+
 function Connect-EntraCheck {
     param(
         [switch]$GraphOnly,
         [switch]$AzureOnly,
-        [switch]$UseDeviceCode
+        [switch]$UseDeviceCode,
+        [scriptblock]$DeviceCodeCallback
     )
 
     Write-Host "`n[+] Authenticating..." -ForegroundColor Cyan
@@ -265,26 +466,26 @@ function Connect-EntraCheck {
                     Write-Host "    [i] Connected but missing scopes: $($missingCritical -join ', ')" -ForegroundColor Yellow
                     Write-Host "    [i] Reconnecting with required scopes..." -ForegroundColor Gray
                     if ($UseDeviceCode) {
-                        Connect-MgGraph -Scopes $script:AllGraphScopes -UseDeviceAuthentication -NoWelcome -ErrorAction Stop
+                        $context = Connect-EcfMgGraphDeviceCode -Scopes $script:AllGraphScopes -DeviceCodeCallback $DeviceCodeCallback
                     }
                     else {
                         Connect-MgGraph -Scopes $script:AllGraphScopes -NoWelcome -ErrorAction Stop
+                        $context = Get-MgContext
                     }
-                    $context = Get-MgContext
                     Write-Host "    [OK] Connected as: $($context.Account)" -ForegroundColor Green
                 }
             }
             else {
                 # Not connected - initiate new connection
                 if ($UseDeviceCode) {
-                    Write-Host "    Using device code flow - copy the code shown below" -ForegroundColor Yellow
-                    Connect-MgGraph -Scopes $script:AllGraphScopes -UseDeviceAuthentication -NoWelcome -ErrorAction Stop
+                    Write-Host "    Requesting device code from Microsoft identity platform..." -ForegroundColor Yellow
+                    $context = Connect-EcfMgGraphDeviceCode -Scopes $script:AllGraphScopes -DeviceCodeCallback $DeviceCodeCallback
                 }
                 else {
                     Write-Host "    TIP: If browser auth fails, select [A] Authentication and try device code" -ForegroundColor Gray
                     Connect-MgGraph -Scopes $script:AllGraphScopes -NoWelcome -ErrorAction Stop
+                    $context = Get-MgContext
                 }
-                $context = Get-MgContext
                 Write-Host "    [OK] Connected as: $($context.Account)" -ForegroundColor Green
             }
 
@@ -2218,8 +2419,23 @@ function New-EcfAuthRunOptions {
     $effectiveAuthMethod = if ($SkipAuthentication -or $AuthMethod -eq 'Skip') { 'Skip' } else { $AuthMethod }
     $authAction = $null
     switch ($effectiveAuthMethod) {
-        'DeviceCode' { $authAction = { $null = Connect-EntraCheck -UseDeviceCode } }
-        'Interactive' { $authAction = { $null = Connect-EntraCheck } }
+        'DeviceCode' {
+            $authAction = {
+                param([AllowNull()][object]$Context)
+                $callback = $null
+                if ($Context -and (Get-Command Write-EcfAuthDeviceCode -ErrorAction SilentlyContinue)) {
+                    $callback = {
+                        param([Parameter(Mandatory)][object]$CodeInfo)
+                        Write-EcfAuthDeviceCode -Context $Context `
+                            -UserCode ([string]$CodeInfo.UserCode) `
+                            -VerificationUri ([string]$CodeInfo.VerificationUri) `
+                            -Capture 'captured'
+                    }.GetNewClosure()
+                }
+                $null = Connect-EntraCheck -UseDeviceCode -DeviceCodeCallback $callback
+            }
+        }
+        'Interactive' { $authAction = { param([AllowNull()][object]$Context) $null = Connect-EntraCheck } }
     }
     return [pscustomobject]@{
         Method = $effectiveAuthMethod
@@ -2412,7 +2628,7 @@ function Invoke-EcfAssessmentSequence {
                     default { Write-EcfAuthInfo -Context $RunContext -Method $AuthMethod -Message 'Using a pre-authenticated / non-interactive session' }
                 }
             }
-            & $AuthAction
+            & $AuthAction $RunContext
             # `Connect-EntraCheck` returns $false on failure, which the
             # caller's `{ $null = Connect-EntraCheck }` scriptblock
             # swallowed silently. The orchestration then emitted

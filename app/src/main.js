@@ -211,7 +211,9 @@ function renderDeviceCodePanel(verificationUri, userCode) {
   const uri = verificationUri || "https://microsoft.com/devicelogin";
   const codeBlock = userCode
     ? `<div class="dc-code">${escapeHtml(userCode)}</div>`
-    : `<p class="muted">Waiting for Microsoft.Graph to print the sign-in code…</p>`;
+    : `<p class="muted">Requesting a sign-in code from Microsoft… <br />
+         If this doesn't update within ~30 seconds, check the Log
+         below — the request may be blocked by a firewall or proxy.</p>`;
   showAuth(
     `<p>To sign in, open the verification page and enter the code:</p>
      ${codeBlock}
