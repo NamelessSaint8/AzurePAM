@@ -1,6 +1,13 @@
 //! EntraChecks desktop shell — Native App Phase 4 (MVP).
 //!
-//! Phase 5.5 (this commit): **relaunch-as-admin**. Some EntraChecks
+//! Phase 5.7 (this commit): **notify-only updater**. On launch the
+//! app GETs a static `version.json`, compares it to `app_version()`,
+//! and (only if newer) emits `update:available` for the webview to
+//! show a dismissible banner with a download link. Failure/offline
+//! is a silent no-op — launch is never blocked. No silent apply, no
+//! Tauri-updater plugin, no update-signing keypair.
+//!
+//! Phase 5.5 (earlier): **relaunch-as-admin**. Some EntraChecks
 //! local-machine checks (AD/hybrid, AAD Connect data, certain WMI/
 //! event-log reads) need an elevated token at run time. Readiness now
 //! reports `elevated`; the UI offers a "Restart as administrator"
@@ -18,6 +25,7 @@
 pub mod contract;
 mod elevation;
 mod sidecar;
+mod update;
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -112,6 +120,29 @@ fn relaunch_as_admin(app: AppHandle) -> Result<(), String> {
     // The elevated instance is the one that should be running now.
     // Exit cleanly so the user sees one window, not two.
     app.exit(0);
+    Ok(())
+}
+
+/// Phase 5.7: notify-only update check. GETs the version manifest
+/// in a background thread; if a strictly-newer version is advertised,
+/// emits `update:available` with the manifest as payload. Network
+/// failure / 404 / parse error are **silent** — never surfaced to
+/// the user; launch is never blocked. Returns immediately.
+#[tauri::command]
+fn check_update(app: AppHandle, url: Option<String>) -> Result<(), String> {
+    let manifest_url = url.unwrap_or_else(|| update::DEFAULT_MANIFEST_URL.to_string());
+    let current = app_version().to_string();
+    std::thread::spawn(move || match update::check(&manifest_url, &current) {
+        Ok(Some(m)) => {
+            let _ = app.emit("update:available", m);
+        }
+        Ok(None) => { /* up to date — no banner */ }
+        Err(e) => {
+            // Silent by policy. Verbose log only; the user never sees
+            // "couldn't reach the updater" warnings.
+            eprintln!("[update] check failed: {e}");
+        }
+    });
     Ok(())
 }
 
@@ -375,7 +406,8 @@ pub fn run() {
             winget_available,
             install_prereqs,
             install_pwsh_via_winget,
-            relaunch_as_admin
+            relaunch_as_admin,
+            check_update
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

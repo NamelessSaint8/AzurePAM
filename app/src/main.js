@@ -543,6 +543,26 @@ window.addEventListener("DOMContentLoaded", async () => {
     logLine(`[process error] ${e.payload}`, "error");
     setRunning(false);
   });
+  listen("update:available", (e) => {
+    const m = e.payload || {};
+    const text = document.querySelector("#update-text");
+    const banner = document.querySelector("#update-banner");
+    text.textContent =
+      `EntraChecks ${m.version} is available` +
+      (m.notes ? ` — ${m.notes}` : ".");
+    banner.classList.remove("hidden");
+    document.querySelector("#btn-update-download").onclick = () =>
+      invoke("open_external", { target: m.url }).catch((err) =>
+        logLine(`[update] open failed: ${err}`, "warn")
+      );
+    document.querySelector("#btn-update-dismiss").onclick = () =>
+      banner.classList.add("hidden");
+  });
+  // Silent on failure: invoke with no URL uses DEFAULT_MANIFEST_URL.
+  invoke("check_update", { url: null }).catch(() => {
+    /* no-op; the policy is silent failure */
+  });
+
   listen("install:line", (e) => logLine(`[install] ${e.payload}`));
   listen("install:exit", async (e) => {
     logLine(`[install] exited ${e.payload}`, e.payload === 0 ? "ok" : "warn");

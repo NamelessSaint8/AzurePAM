@@ -22,6 +22,11 @@ tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Phase 5.7: notify-only updater. Single GET of a static version.json
+# on launch + a semver compare. ureq is the smallest practical HTTP
+# client (one blocking call, off the UI thread). No update-signing
+# keypair, no auto-apply.
+ureq = "2"
 
 # Phase 5.5: token-elevation detection + ShellExecute(runas) for the
 # "Restart as administrator" path. Windows-only; everything else gets

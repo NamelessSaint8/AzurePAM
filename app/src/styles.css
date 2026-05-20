@@ -47,6 +47,23 @@ body {
   margin-bottom: 16px;
 }
 
+.banner.update {
+  background-color: #e8f0fe;
+  border-color: #4285f4;
+  color: #174ea6;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+.banner-actions {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-shrink: 0;
+}
+
 .form-row {
   display: flex;
   align-items: center;
@@ -463,6 +480,11 @@ button:active {
     background-color: #3a3320;
     border-color: #6b5e2e;
     color: #e6cf8a;
+  }
+  .banner.update {
+    background-color: #1c2942;
+    border-color: #3b6ed4;
+    color: #b9d2ff;
   }
   .form-row input:not([type]),
   .form-row input[type="text"] {
