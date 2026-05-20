@@ -201,6 +201,15 @@ function Write-EcfEvent {
         # Real stdout (not the PS pipeline) so the function stays
         # side-effect-only and a sidecar reads clean NDJSON.
         [Console]::Out.WriteLine($line)
+        # Force an immediate write to the pipe. When stdout is
+        # redirected (not a TTY) .NET's Console.Out switches from
+        # line-buffered to fully-buffered — events sit in a ~4KB
+        # buffer until full / process exits. That's why the device-
+        # code event was invisible during the SDK's polling loop:
+        # one ~250 B event, then `Start-Sleep + Invoke-RestMethod`
+        # for 30–90 s with nothing further to push the buffer over
+        # the threshold. Flushing per-event keeps the GUI live.
+        [Console]::Out.Flush()
     }
 }
 
