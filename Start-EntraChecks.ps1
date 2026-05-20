@@ -217,8 +217,24 @@ catch {
 $script:Version = "1.0.0"
 $script:ScriptRoot = $PSScriptRoot
 $script:ModulesPath = Join-Path $PSScriptRoot "Modules"
-$script:SnapshotsPath = Join-Path $PSScriptRoot "Snapshots"
-$script:LogsPath = Join-Path $PSScriptRoot "Logs"
+
+# Snapshots + Logs live UNDER the caller-supplied $OutputDirectory so
+# they always land somewhere user-writable. Previously they were
+# anchored to `$PSScriptRoot\{Snapshots,Logs}` — which in the packaged
+# desktop app means inside the *bundled* `core/` resource subtree,
+# which (a) is conceptually read-only and (b) didn't include a `Logs`
+# subdir at all (it's `.gitignored` in the source tree so it never
+# got bundled). The TUI's default `OutputDirectory = .\Reports` keeps
+# the behaviour close to its previous "all run artifacts in one
+# place" shape, just nested under Reports/.
+$script:OutputDirectoryResolved = if ([System.IO.Path]::IsPathRooted($OutputDirectory)) {
+    $OutputDirectory
+}
+else {
+    Join-Path $PSScriptRoot $OutputDirectory
+}
+$script:SnapshotsPath = Join-Path $script:OutputDirectoryResolved "Snapshots"
+$script:LogsPath = Join-Path $script:OutputDirectoryResolved "Logs"
 
 # Initialize data collection variables
 $script:Findings = @()
@@ -333,8 +349,11 @@ if ($ConfigFile) {
     }
 }
 
-# Ensure directories exist
-@($OutputDirectory, $script:SnapshotsPath, $script:LogsPath) | ForEach-Object {
+# Ensure directories exist. Use the resolved (absolute) output dir so
+# the create-loop matches Snapshots/Logs paths exactly — otherwise a
+# relative $OutputDirectory + absolute children could race against
+# the cwd and create dirs in two places.
+@($script:OutputDirectoryResolved, $script:SnapshotsPath, $script:LogsPath) | ForEach-Object {
     if (-not (Test-Path $_)) {
         New-Item -Path $_ -ItemType Directory -Force | Out-Null
     }
