@@ -17,11 +17,27 @@ on:
     branches: [main, develop]
     paths:
       - "app/**"
+      # Engine files bundled into app/src-tauri/tauri.conf.json's
+      # bundle.resources. A change here MUST rebuild the installer.
+      - "Invoke-EntraChecksRun.ps1"
+      - "Start-EntraChecks.ps1"
+      - "EntraChecks.Orchestration.ps1"
+      - "Install-Prerequisites.ps1"
+      - "Scripts/**"
+      - "Modules/**"
+      - "config/**"
       - ".github/workflows/desktop.yml"
   pull_request:
     branches: [main, develop]
     paths:
       - "app/**"
+      - "Invoke-EntraChecksRun.ps1"
+      - "Start-EntraChecks.ps1"
+      - "EntraChecks.Orchestration.ps1"
+      - "Install-Prerequisites.ps1"
+      - "Scripts/**"
+      - "Modules/**"
+      - "config/**"
       - ".github/workflows/desktop.yml"
   workflow_dispatch:
 
