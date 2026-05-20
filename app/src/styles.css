@@ -149,6 +149,15 @@ body {
   color: #0f0f0f;
 }
 
+select {
+  padding: 0.45em 0.7em;
+  border: 1px solid #d0d0d0;
+  border-radius: 6px;
+  font: inherit;
+  background: #fff;
+  color: #0f0f0f;
+}
+
 .form-row .check {
   display: flex;
   align-items: center;
@@ -159,6 +168,46 @@ body {
 
 button.secondary {
   background: transparent;
+}
+
+.form-row.compact {
+  margin-top: -4px;
+}
+
+.module-picker {
+  border: 1px solid #e3e3e3;
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin: 12px 0;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px 12px;
+}
+
+.module-picker legend {
+  padding: 0 6px;
+  font-size: 0.85rem;
+  font-weight: 700;
+}
+
+.module-picker label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: 0.86rem;
+}
+
+@media (max-width: 720px) {
+  .module-picker {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 460px) {
+  .module-picker {
+    grid-template-columns: 1fr;
+  }
 }
 
 .run-status {
@@ -572,7 +621,8 @@ button:active {
     color: #b9d2ff;
   }
   .form-row input:not([type]),
-  .form-row input[type="text"] {
+  .form-row input[type="text"],
+  select {
     background: #1f1f1f;
     color: #f6f6f6;
     border-color: #4a4a4a;
@@ -600,6 +650,9 @@ button:active {
   }
   .ready-row {
     background: #242424;
+  }
+  .module-picker {
+    border-color: #3a3a3a;
   }
   .rd-req {
     color: #999;

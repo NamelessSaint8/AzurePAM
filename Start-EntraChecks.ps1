@@ -47,6 +47,11 @@
 .PARAMETER SkipAuthentication
     Skip authentication prompts (use existing sessions).
 
+.PARAMETER AuthMethod
+    Interactive browser sign-in, DeviceCode sign-in, or Skip for an
+    existing session. Skip is equivalent to -SkipAuthentication for
+    the runner-auth phase.
+
 .PARAMETER SaveSnapshot
     Save assessment results as a snapshot after completion.
 
@@ -110,6 +115,9 @@ param(
     [string[]]$Modules,
 
     [switch]$SkipAuthentication,
+
+    [ValidateSet('Interactive', 'DeviceCode', 'Skip')]
+    [string]$AuthMethod = 'Interactive',
 
     [switch]$SaveSnapshot,
 

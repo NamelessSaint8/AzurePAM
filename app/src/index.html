@@ -56,19 +56,33 @@
       <section class="card">
         <h2>Run an assessment</h2>
         <p class="muted">
-          Phase 4.4 — live run. Streams a real
-          <code>Invoke-EntraChecksRun.ps1 -EmitEvents</code> through
-          the contract parser. Auth device-code panel and Cancel are
-          4.5; the rich result screen is 4.6.
+          Choose how to sign in and which assessment modules to run.
+          Results stream live as the PowerShell engine produces them.
         </p>
 
         <div class="form-row">
           <label for="tenant">Tenant</label>
           <input id="tenant" placeholder="Contoso" />
-          <label class="check">
-            <input type="checkbox" id="skip-auth" checked />
-            Skip auth (dev)
-          </label>
+          <label for="auth-mode">Auth</label>
+          <select id="auth-mode">
+            <option value="DeviceCode" selected>Device code</option>
+            <option value="Interactive">Browser sign-in</option>
+            <option value="Skip">Use existing session</option>
+          </select>
+        </div>
+        <fieldset class="module-picker">
+          <legend>Modules</legend>
+          <label><input type="checkbox" data-module="Core" checked /> Core</label>
+          <label><input type="checkbox" data-module="IdentityProtection" checked /> Identity Protection</label>
+          <label><input type="checkbox" data-module="Devices" checked /> Devices</label>
+          <label><input type="checkbox" data-module="SecureScore" checked /> Secure Score</label>
+          <label><input type="checkbox" data-module="Defender" checked /> Defender</label>
+          <label><input type="checkbox" data-module="AzurePolicy" checked /> Azure Policy</label>
+          <label><input type="checkbox" data-module="Purview" checked /> Purview</label>
+        </fieldset>
+        <div class="form-row compact">
+          <button id="btn-mod-all" type="button" class="secondary">Select all</button>
+          <button id="btn-mod-core" type="button" class="secondary">Core only</button>
         </div>
         <div class="form-row">
           <button id="btn-run" disabled>Run assessment</button>

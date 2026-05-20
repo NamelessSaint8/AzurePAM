@@ -9,6 +9,10 @@ const { listen } = window.__TAURI__.event;
 let els = {};
 let supportedMajor = 1;
 const phaseRows = new Map(); // phase name -> <li>
+const PROCESS_TAIL_LIMIT = 80;
+let runHadResult = false;
+let processTail = [];
+let lastRunModules = [];
 
 function escapeHtml(s) {
   return String(s == null ? "" : s).replace(
@@ -30,6 +34,16 @@ function logLine(text, cls) {
   span.textContent = text + "\n";
   els.log.appendChild(span);
   els.log.scrollTop = els.log.scrollHeight;
+}
+
+function rememberProcessLine(text) {
+  processTail.push(String(text == null ? "" : text));
+  if (processTail.length > PROCESS_TAIL_LIMIT) processTail.shift();
+}
+
+function logProcessLine(text, cls) {
+  rememberProcessLine(text);
+  logLine(text, cls);
 }
 
 function resetView() {
@@ -55,8 +69,8 @@ function renderResult(ev) {
   els.resultBadge.textContent = ev.status;
   els.resultBadge.className = "badge st-" + ev.status;
 
-  const mods = ev.modulesRun && ev.modulesRun.length
-    ? ev.modulesRun.join(", ")
+  const modCount = ev.modulesRun && ev.modulesRun.length
+    ? ev.modulesRun.length
     : "—";
   els.resultSummary.innerHTML =
     metric("Findings", ev.findings) +
@@ -64,7 +78,7 @@ function renderResult(ev) {
     metric("High", ev.high, ev.high > 0 ? "sev-high" : "") +
     metric("Medium", ev.medium) +
     metric("Low", ev.low) +
-    metric("Modules", mods);
+    metric("Modules", modCount);
 
   // SOC 2 verdict is an analyst-attention flag — shown verbatim,
   // never re-interpreted as a formal audit determination.
@@ -114,6 +128,46 @@ function renderResult(ev) {
   });
 
   els.resultCard.classList.remove("hidden");
+}
+
+function selectedModules() {
+  return els.moduleChecks
+    .filter((cb) => cb.checked)
+    .map((cb) => cb.dataset.module);
+}
+
+function setModuleSelection(mode) {
+  els.moduleChecks.forEach((cb) => {
+    cb.checked = mode === "all" || cb.dataset.module === "Core";
+  });
+}
+
+function synthesizeFailedResult(code, message, remediation) {
+  if (runHadResult) return;
+  runHadResult = true;
+  const tail = processTail.slice(-10).join("\n");
+  const detail = tail ? `${message}\n\nRecent process output:\n${tail}` : message;
+  els.runStatus.textContent = "Failed — see Result";
+  els.runStatus.className = "run-status st-Failed";
+  renderResult({
+    status: "Failed",
+    findings: 0,
+    critical: 0,
+    high: 0,
+    medium: 0,
+    low: 0,
+    modulesRun: lastRunModules,
+    soc2: null,
+    artifacts: [],
+    errors: [
+      {
+        code,
+        message: detail,
+        fatal: true,
+        remediation,
+      },
+    ],
+  });
 }
 
 function phaseRow(name) {
@@ -477,7 +531,6 @@ function onEvent(payload) {
 
   switch (event.type) {
     case "runStarted":
-      resetView();
       hideAuth();
       els.runStatus.textContent = "Running…";
       setRunning(true);
@@ -520,8 +573,8 @@ function onEvent(payload) {
     case "authDeviceCode": {
       const codeBlock = event.userCode
         ? `<div class="dc-code">${escapeHtml(event.userCode)}</div>`
-        : `<p class="muted">The sign-in code is printed on the console
-           output below (the Graph SDK owns it).</p>`;
+        : `<p class="muted">The sign-in code is shown in the Log below
+           when the Graph SDK prints it.</p>`;
       showAuth(
         `<p>To sign in, open the verification page and enter the code:</p>
          ${codeBlock}
@@ -563,6 +616,7 @@ function onEvent(payload) {
       els.runStatus.className = "run-status st-Cancelled";
       break;
     case "runResult": {
+      runHadResult = true;
       els.runStatus.textContent = `${event.status} — see Result`;
       els.runStatus.className = "run-status st-" + event.status;
       renderResult(event);
@@ -580,6 +634,22 @@ function onEvent(payload) {
 async function runAssessment() {
   resetView();
   hideAuth();
+  runHadResult = false;
+  processTail = [];
+  const tenant = els.tenant.value.trim();
+  const modules = selectedModules();
+  const authMethod = els.authMode.value;
+  lastRunModules = modules;
+  if (!tenant) {
+    els.runStatus.textContent = "Enter a tenant name before running.";
+    els.runStatus.className = "run-status st-Failed";
+    return;
+  }
+  if (!modules.length) {
+    els.runStatus.textContent = "Select at least one module before running.";
+    els.runStatus.className = "run-status st-Failed";
+    return;
+  }
   setRunning(true);
   els.runStatus.textContent = "Starting…";
   // Indeterminate banner with live elapsed time. The Phases card
@@ -590,8 +660,9 @@ async function runAssessment() {
   });
   try {
     await invoke("run_assessment", {
-      tenant: els.tenant.value,
-      skipAuth: els.skipAuth.checked,
+      tenant,
+      modules,
+      authMethod,
     });
   } catch (e) {
     els.runStatus.textContent = `Could not start: ${e}`;
@@ -604,7 +675,8 @@ async function runAssessment() {
 window.addEventListener("DOMContentLoaded", async () => {
   els = {
     tenant: document.querySelector("#tenant"),
-    skipAuth: document.querySelector("#skip-auth"),
+    authMode: document.querySelector("#auth-mode"),
+    moduleChecks: Array.from(document.querySelectorAll("[data-module]")),
     run: document.querySelector("#btn-run"),
     runStatus: document.querySelector("#run-status"),
     phases: document.querySelector("#phases"),
@@ -626,6 +698,12 @@ window.addEventListener("DOMContentLoaded", async () => {
   document.querySelector("#btn-run").addEventListener("click", runAssessment);
   document.querySelector("#btn-cancel").addEventListener("click", cancelRun);
   document.querySelector("#btn-readiness").addEventListener("click", loadReadiness);
+  document
+    .querySelector("#btn-mod-all")
+    .addEventListener("click", () => setModuleSelection("all"));
+  document
+    .querySelector("#btn-mod-core")
+    .addEventListener("click", () => setModuleSelection("core"));
 
   try {
     supportedMajor = await invoke("supported_schema_major");
@@ -639,19 +717,40 @@ window.addEventListener("DOMContentLoaded", async () => {
     els.runStatus.className = "run-status st-Cancelled";
   });
   listen("run:exit", (e) => {
-    logLine(`[process exited ${e.payload}]`);
+    const code = Number(e.payload);
+    logProcessLine(
+      `[process exited ${e.payload}]`,
+      code === 0 ? undefined : "warn"
+    );
+    if (!runHadResult) {
+      synthesizeFailedResult(
+        code === 0 ? "process.noResult" : "process.exit",
+        code === 0
+          ? "The PowerShell process exited without emitting a run.result event."
+          : `The PowerShell process exited before the assessment produced a result (exit code ${e.payload}).`,
+        "Review the Log output above, then re-run after fixing the underlying PowerShell or authentication error."
+      );
+    }
     setRunning(false);
     endOp();
   });
   listen("run:error", (e) => {
-    logLine(`[process error] ${e.payload}`, "error");
+    logProcessLine(`[process error] ${e.payload}`, "error");
+    synthesizeFailedResult(
+      "process.spawnFailed",
+      `The PowerShell process could not be started or streamed: ${e.payload}`,
+      "Verify PowerShell 7 is installed and the bundled EntraChecks scripts are present."
+    );
     setRunning(false);
     endOp();
   });
   listen("run:stderr-line", (e) => {
     // Engine stderr (pwsh exception text, AMSI blocks, anything
     // non-NDJSON). Red so it pops next to the contract events.
-    logLine(`[engine-stderr] ${e.payload}`, "error");
+    logProcessLine(`[engine-stderr] ${e.payload}`, "error");
+  });
+  listen("run:stdout-line", (e) => {
+    logProcessLine(`[engine] ${e.payload}`);
   });
   listen("update:available", (e) => {
     // Defensive: only surface the banner with a valid payload. If

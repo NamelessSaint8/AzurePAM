@@ -211,12 +211,58 @@ fn record_run_id(app: &AppHandle, rid: String) {
     }
 }
 
+const ALLOWED_MODULES: &[&str] = &[
+    "Core",
+    "IdentityProtection",
+    "Devices",
+    "SecureScore",
+    "Defender",
+    "AzurePolicy",
+    "Purview",
+    "ActiveDirectory",
+    "All",
+];
+
+fn normalize_modules(modules: Vec<String>) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in modules {
+        let m = raw.trim();
+        if m.is_empty() {
+            continue;
+        }
+        if !ALLOWED_MODULES.contains(&m) {
+            return Err(format!("Unknown assessment module: {m}"));
+        }
+        if !out.iter().any(|x| x == m) {
+            out.push(m.to_string());
+        }
+    }
+    if out.is_empty() {
+        return Err("Select at least one assessment module.".to_string());
+    }
+    Ok(out)
+}
+
+fn normalize_auth_method(auth_method: String) -> Result<String, String> {
+    let m = auth_method.trim();
+    match m {
+        "Interactive" | "DeviceCode" | "Skip" => Ok(m.to_string()),
+        "" => Ok("DeviceCode".to_string()),
+        other => Err(format!("Unknown auth method: {other}")),
+    }
+}
+
 /// The dedicated Result screen + Open report is 4.6. This step adds
 /// the auth panel + Cancel: the run's `runId` (envelope) and
 /// `output_dir` are recorded in `RunState` so `cancel_run` can drop
 /// the Phase-3a sentinel.
 #[tauri::command]
-fn run_assessment(app: AppHandle, tenant: String, skip_auth: bool) -> Result<(), String> {
+fn run_assessment(
+    app: AppHandle,
+    tenant: String,
+    modules: Vec<String>,
+    auth_method: String,
+) -> Result<(), String> {
     let pwsh = sidecar::discover_pwsh().map_err(|e| e.to_string())?;
     let res_dir = app.path().resource_dir().ok();
     let core = sidecar::resolve_core_script(res_dir.as_deref()).ok_or_else(|| {
@@ -224,11 +270,12 @@ fn run_assessment(app: AppHandle, tenant: String, skip_auth: bool) -> Result<(),
          ENTRACHECKS_CORE override, and not inside the repository)."
             .to_string()
     })?;
-    let tenant = if tenant.trim().is_empty() {
-        "DevTenant".to_string()
-    } else {
-        tenant
-    };
+    let tenant = tenant.trim().to_string();
+    if tenant.is_empty() {
+        return Err("Tenant name is required.".to_string());
+    }
+    let modules = normalize_modules(modules)?;
+    let auth_method = normalize_auth_method(auth_method)?;
     let out_dir = std::env::temp_dir().join("EntraChecks-GUI");
     let core_s = core.to_string_lossy().into_owned();
     let out_s = out_dir.to_string_lossy().into_owned();
@@ -243,7 +290,8 @@ fn run_assessment(app: AppHandle, tenant: String, skip_auth: bool) -> Result<(),
     }
 
     std::thread::spawn(move || {
-        let args = sidecar::core_args(&core_s, &tenant, &out_s, skip_auth);
+        let args =
+            sidecar::core_args(&core_s, &tenant, &out_s, &modules, &auth_method);
         let argrefs: Vec<&str> = args.iter().map(String::as_str).collect();
         // Two callbacks: stdout goes through the contract parser
         // (the run.* event stream); stderr bypasses the parser and
@@ -255,13 +303,12 @@ fn run_assessment(app: AppHandle, tenant: String, skip_auth: bool) -> Result<(),
         let result = sidecar::spawn_streaming(
             &pwsh.path,
             &argrefs,
-            |line| {
-                if let contract::ParsedLine::Event {
+            |line| match contract::parse_line(line) {
+                contract::ParsedLine::Event {
                     schema_major,
                     run_id,
                     event,
-                } = contract::parse_line(line)
-                {
+                } => {
                     if let Some(rid) = run_id {
                         record_run_id(&app, rid);
                     }
@@ -269,6 +316,11 @@ fn run_assessment(app: AppHandle, tenant: String, skip_auth: bool) -> Result<(),
                         "run:event",
                         serde_json::json!({ "schemaMajor": schema_major, "event": event }),
                     );
+                }
+                contract::ParsedLine::Ignored => {
+                    if !line.trim().is_empty() {
+                        let _ = app.emit("run:stdout-line", line.to_string());
+                    }
                 }
             },
             move |line| {
@@ -465,6 +517,38 @@ mod tests {
         assert!(!app_version().is_empty());
     }
 
+    #[test]
+    fn normalize_modules_dedups_and_validates() {
+        // Trims, dedups while preserving order, rejects unknown names,
+        // refuses empty selection — the engine's -Modules validator
+        // would be the second line of defence; this one fails fast
+        // with a clear UI error before any process spawns.
+        assert_eq!(
+            normalize_modules(vec![
+                " Core ".into(),
+                "SecureScore".into(),
+                "Core".into(),  // duplicate
+            ])
+            .unwrap(),
+            vec!["Core", "SecureScore"]
+        );
+        assert!(normalize_modules(vec![]).is_err());
+        assert!(normalize_modules(vec!["".into()]).is_err());
+        assert!(normalize_modules(vec!["NotAModule".into()]).is_err());
+    }
+
+    #[test]
+    fn normalize_auth_method_matches_engine_vocabulary() {
+        // Mirror `Invoke-EntraChecksRun.ps1`'s ValidateSet exactly so
+        // the engine never sees a value it would reject.
+        assert_eq!(normalize_auth_method("Interactive".into()).unwrap(), "Interactive");
+        assert_eq!(normalize_auth_method("DeviceCode".into()).unwrap(), "DeviceCode");
+        assert_eq!(normalize_auth_method("Skip".into()).unwrap(), "Skip");
+        // Empty defaults to DeviceCode (the GUI's documented default).
+        assert_eq!(normalize_auth_method("".into()).unwrap(), "DeviceCode");
+        assert!(normalize_auth_method("Something".into()).is_err());
+    }
+
     /// The automated proof of the 4.4 join: resolve the real core →
     /// spawn it via the 4.2 boundary → run each line through the 4.3
     /// parser. Asserts a coherent run (RunStarted … RunResult) where
@@ -488,7 +572,8 @@ mod tests {
             &core.to_string_lossy(),
             "PipelineTest",
             &out.to_string_lossy(),
-            true, // -SkipAuthentication: no tenant needed
+            &["Core".to_string()],
+            "Skip", // -SkipAuthentication: no tenant needed
         );
         let argrefs: Vec<&str> = args.iter().map(String::as_str).collect();
 

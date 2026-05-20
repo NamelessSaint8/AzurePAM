@@ -188,6 +188,7 @@ Describe 'Invoke-EntraChecksRun.ps1 — headless wrapper guard' {
         $wrapper = Join-Path (Split-Path -Parent $PSScriptRoot) 'Invoke-EntraChecksRun.ps1'
         $txt = Get-Content -LiteralPath $wrapper -Raw
         $txt | Should -Match "Mode\s*=\s*'Quick'"
+        $txt | Should -Match 'AuthMethod\s*=\s*\$AuthMethod'
         $txt | Should -Match 'EmitEvents\s*=\s*\[bool\]\$EmitEvents'
         $txt | Should -Match '& \$startScript @forward'
     }
@@ -350,6 +351,7 @@ Describe 'Runner parity — auth as an observed phase (Phase 3c)' {
     It 'runs the injected auth action inside a balanced Auth phase and emits auth.browser + auth.succeeded' {
         $script:authRan = $false
         $action = { $script:authRan = $true }
+        Mock Get-EcfMgContextSafe { [pscustomobject]@{ Account = 'auditor@contoso.com' } }
         $seen = New-Object System.Collections.Generic.List[object]
         $sink = { param($e) $seen.Add($e) | Out-Null }
         $seq = Invoke-EcfAssessmentSequence -TenantNameValue 'Contoso' -ModuleSet @('Core') `

@@ -1943,8 +1943,7 @@ function Start-InteractiveMode {
 
                 # Phase 3c: auth runs inside the sequence's observed Auth
                 # phase (injected, not inline) so a GUI/TUI sees auth.* events.
-                $authAction = $null
-                if (-not $SkipAuthentication) { $authAction = { $null = Connect-EntraCheck } }
+                $authRun = New-EcfAuthRunOptions
 
                 $allModules = @("Core", "IdentityProtection", "Devices", "SecureScore", "Defender", "AzurePolicy", "Purview")
 
@@ -1958,7 +1957,7 @@ function Start-InteractiveMode {
                 $null = Invoke-EcfAssessmentSequence -TenantNameValue $tenantName -ModuleSet $allModules `
                     -InvocationParams (Get-EcfInvocationParams -ResolvedTenant $tenantName) `
                     -SkipSequenceSnapshot -OpenSoc2Browser -EventSink $renderSink `
-                    -AuthAction $authAction -AuthMethod 'Interactive'
+                    -AuthAction $authRun.Action -AuthMethod $authRun.Method
 
                 if ($SaveSnapshot -or (Read-Host "`n  Save snapshot for future comparison? (Y/N)").ToUpper() -eq "Y") {
                     $deltaModule = Join-Path $script:ModulesPath "EntraChecks-DeltaReporting.psm1"
@@ -2006,8 +2005,7 @@ function Start-InteractiveMode {
                                 }
 
                                 # Phase 3c: auth injected into the observed Auth phase.
-                                $authAction = $null
-                                if (-not $SkipAuthentication) { $authAction = { $null = Connect-EntraCheck } }
+                                $authRun = New-EcfAuthRunOptions
 
                                 # Phase 2 (2c): same single runner seam +
                                 # console renderer as Quick Assessment. No
@@ -2019,7 +2017,7 @@ function Start-InteractiveMode {
                                 $null = Invoke-EcfAssessmentSequence -TenantNameValue $tenantName -ModuleSet $selectedModules `
                                     -InvocationParams (Get-EcfInvocationParams -ResolvedTenant $tenantName) `
                                     -SkipSequenceSnapshot -OpenSoc2Browser -EventSink $renderSink `
-                                    -AuthAction $authAction -AuthMethod 'Interactive'
+                                    -AuthAction $authRun.Action -AuthMethod $authRun.Method
 
                                 Read-Host "  Press Enter to continue"
                             }
@@ -2210,8 +2208,22 @@ function Get-EcfInvocationParams {
         HtmlDeepDiveDomains = $HtmlDeepDiveDomains
         EmitPrivilegedRoster = [bool]$EmitPrivilegedRoster
         IdentityOverridesPath = $IdentityOverridesPath
-        SkipAuthentication = [bool]$SkipAuthentication
+        SkipAuthentication = ([bool]$SkipAuthentication -or $AuthMethod -eq 'Skip')
+        AuthMethod = $AuthMethod
         EmitEvents = [bool]$EmitEvents
+    }
+}
+
+function New-EcfAuthRunOptions {
+    $effectiveAuthMethod = if ($SkipAuthentication -or $AuthMethod -eq 'Skip') { 'Skip' } else { $AuthMethod }
+    $authAction = $null
+    switch ($effectiveAuthMethod) {
+        'DeviceCode' { $authAction = { $null = Connect-EntraCheck -UseDeviceCode } }
+        'Interactive' { $authAction = { $null = Connect-EntraCheck } }
+    }
+    return [pscustomobject]@{
+        Method = $effectiveAuthMethod
+        Action = $authAction
     }
 }
 
@@ -2626,8 +2638,7 @@ function Start-QuickMode {
     }
 
     # Phase 3c: auth runs inside the sequence's observed Auth phase.
-    $authAction = $null
-    if (-not $SkipAuthentication) { $authAction = { $null = Connect-EntraCheck } }
+    $authRun = New-EcfAuthRunOptions
 
     $modulesToRun = if ($Modules -contains "All" -or -not $Modules) {
         @("Core", "IdentityProtection", "Devices", "SecureScore", "Defender", "AzurePolicy", "Purview")
@@ -2636,7 +2647,7 @@ function Start-QuickMode {
         $Modules
     }
 
-    $seq = Invoke-EcfAssessmentSequence -TenantNameValue $TenantName -ModuleSet $modulesToRun -DoCompareWithLast:$CompareWithLast -InvocationParams (Get-EcfInvocationParams -ResolvedTenant $TenantName) -EmitEvents:$EmitEvents -AuthAction $authAction -AuthMethod 'Interactive'
+    $seq = Invoke-EcfAssessmentSequence -TenantNameValue $TenantName -ModuleSet $modulesToRun -DoCompareWithLast:$CompareWithLast -InvocationParams (Get-EcfInvocationParams -ResolvedTenant $TenantName) -EmitEvents:$EmitEvents -AuthAction $authRun.Action -AuthMethod $authRun.Method
 
     Write-Host "`n[+] Assessment Complete" -ForegroundColor Green
     $durMin = if ($seq.Results -and $seq.Results.Duration) { $seq.Results.Duration.TotalMinutes.ToString('0.0') } else { 'n/a' }
@@ -2662,13 +2673,12 @@ function Start-HybridMode {
     }
 
     # Phase 3c: auth runs inside the sequence's observed Auth phase.
-    $authAction = $null
-    if (-not $SkipAuthentication) { $authAction = { $null = Connect-EntraCheck } }
+    $authRun = New-EcfAuthRunOptions
 
     # Core cloud set + Hybrid (AD Connect health) + on-prem AD.
     $hybridModules = @('Core', 'IdentityProtection', 'Devices', 'SecureScore', 'Defender', 'AzurePolicy', 'Purview', 'ActiveDirectory')
 
-    $seq = Invoke-EcfAssessmentSequence -TenantNameValue $TenantName -ModuleSet $hybridModules -RunHybridCorrelation -InvocationParams (Get-EcfInvocationParams -ResolvedTenant $TenantName) -EmitEvents:$EmitEvents -AuthAction $authAction -AuthMethod 'Interactive'
+    $seq = Invoke-EcfAssessmentSequence -TenantNameValue $TenantName -ModuleSet $hybridModules -RunHybridCorrelation -InvocationParams (Get-EcfInvocationParams -ResolvedTenant $TenantName) -EmitEvents:$EmitEvents -AuthAction $authRun.Action -AuthMethod $authRun.Method
 
     Write-Host "`n[+] Hybrid Analysis Complete" -ForegroundColor Green
     $durMin = if ($seq.Results -and $seq.Results.Duration) { $seq.Results.Duration.TotalMinutes.ToString('0.0') } else { 'n/a' }
@@ -2687,7 +2697,7 @@ function Start-ScheduledMode {
         throw "TenantName is required for scheduled mode"
     }
     
-    if (-not $SkipAuthentication) {
+    if (-not $SkipAuthentication -and $AuthMethod -ne 'Skip') {
         # In scheduled mode, use managed identity or service principal
         # This assumes pre-authenticated session
         $graphContext = Get-EcfMgContextSafe

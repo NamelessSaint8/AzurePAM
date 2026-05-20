@@ -76,11 +76,11 @@ Describe 'Menu run actions route through the runner seam' {
         $script:Menu | Should -Match 'Enter tenant name'
         # Phase 3c relocated auth into the sequence's observed Auth
         # phase: the run actions no longer call Connect-EntraCheck
-        # inline; they build an injected auth action gated by
-        # -SkipAuthentication and pass it as -AuthAction. The Connect
-        # preamble is preserved, now as that injected scriptblock.
-        $script:Menu | Should -Match 'if \(-not \$SkipAuthentication\) \{ \$authAction = \{ \$null = Connect-EntraCheck \} \}'
-        $script:Menu | Should -Match '-AuthAction \$authAction -AuthMethod ''Interactive'''
+        # inline; they build injected auth options and pass them as
+        # -AuthAction / -AuthMethod. The Connect preamble is preserved,
+        # now as that injected scriptblock.
+        $script:Menu | Should -Match 'New-EcfAuthRunOptions'
+        $script:Menu | Should -Match '-AuthAction \$authRun\.Action -AuthMethod \$authRun\.Method'
         $script:Menu | Should -Match 'Press Enter to continue'
     }
 

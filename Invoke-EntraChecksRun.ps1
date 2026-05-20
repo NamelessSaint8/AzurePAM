@@ -49,6 +49,10 @@
 .PARAMETER SkipAuthentication
     Use an existing pre-authenticated Graph/Az session (automation).
 
+.PARAMETER AuthMethod
+    Interactive browser sign-in, DeviceCode sign-in, or Skip for an
+    existing session. Skip also sets -SkipAuthentication.
+
 .PARAMETER EmitEvents
     Stream the NDJSON event contract to stdout. Off = silent run; the
     run-history manifest is still written.
@@ -91,6 +95,9 @@ param(
 
     [string]$IdentityOverridesPath,
 
+    [ValidateSet('Interactive', 'DeviceCode', 'Skip')]
+    [string]$AuthMethod = 'Interactive',
+
     [switch]$SkipAuthentication,
 
     [switch]$EmitEvents
@@ -118,6 +125,7 @@ $forward = @{
     Mode = 'Quick'
     TenantName = $TenantName
     OutputDirectory = $OutputDirectory
+    AuthMethod = $AuthMethod
     EmitEvents = [bool]$EmitEvents
 }
 foreach ($name in @('Modules', 'ExportFormat', 'ConfigFile', 'Environment',
@@ -126,6 +134,9 @@ foreach ($name in @('Modules', 'ExportFormat', 'ConfigFile', 'Environment',
     if ($PSBoundParameters.ContainsKey($name)) {
         $forward[$name] = $PSBoundParameters[$name]
     }
+}
+if ($AuthMethod -eq 'Skip') {
+    $forward['SkipAuthentication'] = $true
 }
 
 & $startScript @forward

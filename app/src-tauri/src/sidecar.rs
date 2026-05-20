@@ -362,13 +362,37 @@ pub fn resolve_core_script(resource_dir: Option<&Path>) -> Option<PathBuf> {
 /// Build the `pwsh` argument vector for a headless run. Owned
 /// `String`s (paths/tenant are runtime values); the caller maps to
 /// `&str` for `spawn_streaming`. Pure + unit-tested.
+fn ps_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
 pub fn core_args(
     core_script: &str,
     tenant: &str,
     output_dir: &str,
-    skip_auth: bool,
+    modules: &[String],
+    auth_method: &str,
 ) -> Vec<String> {
-    let mut a = vec![
+    let modules_literal = format!(
+        "@({})",
+        modules
+            .iter()
+            .map(|m| ps_single_quote(m))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let mut command = format!(
+        "& {} -TenantName {} -OutputDirectory {} -Modules {} -AuthMethod {} -EmitEvents",
+        ps_single_quote(core_script),
+        ps_single_quote(tenant),
+        ps_single_quote(output_dir),
+        modules_literal,
+        ps_single_quote(auth_method)
+    );
+    if auth_method == "Skip" {
+        command.push_str(" -SkipAuthentication");
+    }
+    vec![
         "-NoProfile".to_string(),
         "-NonInteractive".to_string(),
         // Bundled core scripts can be Mark-of-the-Web-tagged by NSIS;
@@ -376,20 +400,9 @@ pub fn core_args(
         // run them. Bypass scopes only to this invocation.
         "-ExecutionPolicy".to_string(),
         "Bypass".to_string(),
-        "-File".to_string(),
-        core_script.to_string(),
-        "-TenantName".to_string(),
-        tenant.to_string(),
-        "-OutputDirectory".to_string(),
-        output_dir.to_string(),
-        "-Modules".to_string(),
-        "Core".to_string(),
-        "-EmitEvents".to_string(),
-    ];
-    if skip_auth {
-        a.push("-SkipAuthentication".to_string());
-    }
-    a
+        "-Command".to_string(),
+        command,
+    ]
 }
 
 // ---- step 5.2: readiness model (PS modules detect-only) -------------
@@ -407,6 +420,8 @@ pub const READINESS_MODULES: &[(&str, bool)] = &[
     ("Az.Resources", false),
     ("Az.Security", false),
     ("Az.RecoveryServices", false),
+    ("Az.Monitor", false),
+    ("Az.OperationalInsights", false),
     ("ImportExcel", false),
 ];
 
@@ -728,22 +743,45 @@ mod tests {
 
     #[test]
     fn core_args_shape_and_skip_auth_toggle() {
-        let with = core_args("/r/Invoke-EntraChecksRun.ps1", "Contoso", "/o", true);
+        let with = core_args(
+            "/r/Invoke-EntraChecksRun.ps1",
+            "Contoso",
+            "/o",
+            &["Core".to_string(), "SecureScore".to_string()],
+            "Skip",
+        );
         // Both non-negotiable on Windows: bypass MotW-tagged bundled
         // scripts, and the core file we're running.
-        let file_idx = with.iter().position(|x| x == "-File").expect("-File");
-        assert_eq!(with[file_idx + 1], "/r/Invoke-EntraChecksRun.ps1");
         assert!(with.contains(&"-ExecutionPolicy".to_string()));
         assert!(with.contains(&"Bypass".to_string()));
-        assert!(with.iter().any(|x| x == "-TenantName"));
-        assert!(with.iter().any(|x| x == "Contoso"));
-        assert!(with.iter().any(|x| x == "-EmitEvents"));
-        assert!(with.iter().any(|x| x == "-SkipAuthentication"));
+        let cmd_idx = with
+            .iter()
+            .position(|x| x == "-Command")
+            .expect("-Command");
+        let cmd = &with[cmd_idx + 1];
+        assert!(cmd.contains("& '/r/Invoke-EntraChecksRun.ps1'"));
+        assert!(cmd.contains("-TenantName 'Contoso'"));
+        assert!(cmd.contains("-Modules @('Core','SecureScore')"));
+        assert!(cmd.contains("-AuthMethod 'Skip'"));
+        assert!(cmd.contains("-EmitEvents"));
+        assert!(cmd.contains("-SkipAuthentication"));
 
-        let without = core_args("/r/c.ps1", "T", "/o", false);
-        assert!(!without.iter().any(|x| x == "-SkipAuthentication"));
+        let without = core_args(
+            "/r/c.ps1",
+            "T",
+            "/o",
+            &["Core".to_string()],
+            "DeviceCode",
+        );
+        let without_cmd = without
+            .iter()
+            .skip_while(|x| *x != "-Command")
+            .nth(1)
+            .expect("-Command payload");
+        assert!(!without_cmd.contains("-SkipAuthentication"));
+        assert!(without_cmd.contains("-AuthMethod 'DeviceCode'"));
         // -EmitEvents is non-negotiable: it is how the GUI sees anything.
-        assert!(without.iter().any(|x| x == "-EmitEvents"));
+        assert!(without_cmd.contains("-EmitEvents"));
     }
 
     #[test]
