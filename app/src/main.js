@@ -13,6 +13,9 @@ const PROCESS_TAIL_LIMIT = 80;
 let runHadResult = false;
 let processTail = [];
 let lastRunModules = [];
+let authVerificationUri = "";
+let authRawBuffer = "";
+let shownDeviceCode = "";
 
 function escapeHtml(s) {
   return String(s == null ? "" : s).replace(
@@ -198,6 +201,114 @@ function hideAuth() {
   els.authBody.innerHTML = "";
 }
 
+function resetAuthCapture() {
+  authVerificationUri = "";
+  authRawBuffer = "";
+  shownDeviceCode = "";
+}
+
+function renderDeviceCodePanel(verificationUri, userCode) {
+  const uri = verificationUri || "https://microsoft.com/devicelogin";
+  const codeBlock = userCode
+    ? `<div class="dc-code">${escapeHtml(userCode)}</div>`
+    : `<p class="muted">Waiting for Microsoft.Graph to print the sign-in code…</p>`;
+  showAuth(
+    `<p>To sign in, open the verification page and enter the code:</p>
+     ${codeBlock}
+     <p><button id="dc-open" class="link">Open ${escapeHtml(uri)}</button></p>`
+  );
+  const b = document.querySelector("#dc-open");
+  if (b)
+    b.addEventListener("click", () =>
+      invoke("open_external", { target: uri }).catch((e) =>
+        logLine(`[auth] could not open browser: ${e}`, "warn")
+      )
+    );
+}
+
+const DEVICE_CODE_STOPWORDS = new Set([
+  "AUTHENTICATE",
+  "AUTHENTICATING",
+  "AUTHENTICATION",
+  "BELOW",
+  "CONNECTING",
+  "DEVICE",
+  "DEVICEAUTH",
+  "DEVICECODE",
+  "DEVICELOGIN",
+  "DEVICLOGIN",
+  "ENTRACHECKS",
+  "GRAPH",
+  "HTTPS",
+  "INFO",
+  "MICROSOFT",
+  "POWERSHELL",
+  "PROCESS",
+  "SHOWN",
+  "STARTING",
+  "WARNING",
+]);
+
+function normalizeDeviceCodeToken(token, allowPlainWord = false) {
+  const cleaned = String(token || "")
+    .trim()
+    .replace(/^[^A-Z0-9]+|[^A-Z0-9]+$/gi, "")
+    .toUpperCase();
+  const compact = cleaned.replace(/-/g, "");
+  if (!/^[A-Z0-9-]{6,21}$/.test(cleaned)) return "";
+  if (compact.length < 6 || compact.length > 20) return "";
+  if (DEVICE_CODE_STOPWORDS.has(cleaned) || DEVICE_CODE_STOPWORDS.has(compact))
+    return "";
+  if (!allowPlainWord && !/[-0-9]/.test(cleaned)) return "";
+  return cleaned;
+}
+
+function findDeviceCode(text) {
+  const raw = String(text || "");
+  const directPatterns = [
+    /\b(?:enter|copy|use)\s+(?:the\s+)?code(?:\s+is|:)?[ \t]*([A-Z0-9][A-Z0-9-]{5,20})\b/gi,
+    /\bcode(?:\s+is|:)[ \t]*([A-Z0-9][A-Z0-9-]{5,20})\b/gi,
+  ];
+  for (const pattern of directPatterns) {
+    let match;
+    while ((match = pattern.exec(raw)) !== null) {
+      const code = normalizeDeviceCodeToken(match[1], true);
+      if (code) return code;
+    }
+  }
+  const belowPattern =
+    /\b(?:code\s+shown\s+below|enter\s+the\s+code\s+below)[^\S\r\n]*(?:\r?\n)+\s*([A-Z0-9][A-Z0-9-]{5,20})\b/gi;
+  let belowMatch;
+  while ((belowMatch = belowPattern.exec(raw)) !== null) {
+    const code = normalizeDeviceCodeToken(belowMatch[1]);
+    if (code) return code;
+  }
+
+  if (
+    !/microsoft\.com\/devicelogin|device\s+code|enter\s+the\s+code|copy\s+the\s+code/i.test(
+      raw
+    )
+  )
+    return "";
+  const tokens = raw.toUpperCase().match(/\b[A-Z0-9][A-Z0-9-]{5,20}\b/g) || [];
+  for (const token of tokens) {
+    const code = normalizeDeviceCodeToken(token);
+    if (code) return code;
+  }
+  return "";
+}
+
+function maybeCaptureDeviceCode(text) {
+  if (!authVerificationUri) return;
+  authRawBuffer = `${authRawBuffer}\n${String(text || "")}`.slice(-6000);
+  const code = findDeviceCode(authRawBuffer);
+  if (code && code !== shownDeviceCode) {
+    shownDeviceCode = code;
+    renderDeviceCodePanel(authVerificationUri, code);
+    logLine(`[auth] device code captured: ${code}`, "ok");
+  }
+}
+
 let appReady = false;
 
 function setRunning(on) {
@@ -313,10 +424,13 @@ async function installPwshClick() {
 async function installPrereqsClick(includeAzure) {
   if (installing) return;
   // Module counts mirror Install-Prerequisites.ps1 / the [plan] line.
-  const totalModules = includeAzure ? 8 : 1;
+  // ImportExcel ships in both modes (small, no creds, no scope quirks)
+  // so the GUI can produce Excel reports without a manual install
+  // step. Graph-only: Microsoft.Graph + ImportExcel. Full: + Az.*.
+  const totalModules = includeAzure ? 9 : 2;
   const set = includeAzure
-    ? "Microsoft.Graph + the Az.* set (8 modules)"
-    : "Microsoft.Graph (1 module)";
+    ? "Microsoft.Graph + the Az.* set + ImportExcel (9 modules)"
+    : "Microsoft.Graph + ImportExcel (2 modules)";
   if (
     !confirm(
       `Install ${set}?\n\n` +
@@ -571,35 +685,24 @@ function onEvent(payload) {
       logLine(`[auth] ${event.message || "browser sign-in"}`);
       break;
     case "authDeviceCode": {
-      const codeBlock = event.userCode
-        ? `<div class="dc-code">${escapeHtml(event.userCode)}</div>`
-        : `<p class="muted">The sign-in code is shown in the Log below
-           when the Graph SDK prints it.</p>`;
-      showAuth(
-        `<p>To sign in, open the verification page and enter the code:</p>
-         ${codeBlock}
-         <p><button id="dc-open" class="link">Open ${escapeHtml(
-           event.verificationUri
-         )}</button></p>`
-      );
-      const b = document.querySelector("#dc-open");
-      if (b)
-        b.addEventListener("click", () =>
-          invoke("open_external", { target: event.verificationUri }).catch(
-            (e) => logLine(`[auth] could not open browser: ${e}`, "warn")
-          )
-        );
-      logLine(`[auth] device-code sign-in → ${event.verificationUri}`, "warn");
+      authVerificationUri =
+        event.verificationUri || "https://microsoft.com/devicelogin";
+      authRawBuffer = "";
+      shownDeviceCode = event.userCode || "";
+      renderDeviceCodePanel(authVerificationUri, shownDeviceCode);
+      logLine(`[auth] device-code sign-in → ${authVerificationUri}`, "warn");
       break;
     }
     case "authSucceeded":
       hideAuth();
+      resetAuthCapture();
       logLine(
         `[auth] signed in${event.account ? " as " + event.account : ""}`,
         "ok"
       );
       break;
     case "authFailed":
+      resetAuthCapture();
       showAuth(
         `<p class="logln error">Sign-in failed: ${escapeHtml(
           event.message
@@ -634,6 +737,7 @@ function onEvent(payload) {
 async function runAssessment() {
   resetView();
   hideAuth();
+  resetAuthCapture();
   runHadResult = false;
   processTail = [];
   const tenant = els.tenant.value.trim();
@@ -750,7 +854,11 @@ window.addEventListener("DOMContentLoaded", async () => {
     logProcessLine(`[engine-stderr] ${e.payload}`, "error");
   });
   listen("run:stdout-line", (e) => {
+    maybeCaptureDeviceCode(e.payload);
     logProcessLine(`[engine] ${e.payload}`);
+  });
+  listen("run:stdout-fragment", (e) => {
+    maybeCaptureDeviceCode(e.payload);
   });
   listen("update:available", (e) => {
     // Defensive: only surface the banner with a valid payload. If

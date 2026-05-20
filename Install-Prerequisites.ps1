@@ -152,7 +152,12 @@ function Install-RequiredModule {
 # Install-RequiredModule calls below. Backward-compatible — anything
 # that doesn't parse the [plan] prefix just sees an info line.
 
-$planTotal = if ($GraphOnly) { 1 } else { 8 }
+# Plan counts include ImportExcel — it ships with both modes now so
+# users can produce Excel reports without a separate manual install
+# step (Readiness used to flag it as "not installed" with no path to
+# fix it from the GUI). Counts: GraphOnly = Microsoft.Graph +
+# ImportExcel = 2; Full = Microsoft.Graph + 7 Az.* + ImportExcel = 9.
+$planTotal = if ($GraphOnly) { 2 } else { 9 }
 Write-Host "[plan] total=$planTotal"
 
 # -- Microsoft Graph SDK (required) ----------------------------------------
@@ -182,6 +187,17 @@ else {
     Write-Step "Skipping Azure modules (-GraphOnly specified)" "INFO"
     Write-Step "Install later if needed: .\Install-Prerequisites.ps1" "INFO"
 }
+
+# -- ImportExcel (always installed) ----------------------------------------
+#
+# Used by Modules\EntraChecks-ExcelReporting.psm1 to emit `.xlsx`
+# workbooks. Small (~3 MB), no network credentials, no scope quirks —
+# always include so users don't have to install it manually after
+# seeing "OPTIONAL — not installed" in Readiness with no fix path.
+
+Write-Host ""
+Write-Host "-- ImportExcel (Excel report generation) -------------------" -ForegroundColor White
+Install-RequiredModule "ImportExcel" "Multi-sheet Excel workbooks with charts (EntraChecks-ExcelReporting)"
 
 # -- Unblock scripts -------------------------------------------------------
 
