@@ -220,11 +220,44 @@ $script:DefenderComplianceData = $null
 $script:AzurePolicyData = $null
 $script:PurviewComplianceData = $null
 
+# -- Module load helper -----------------------------------------------
+#
+# The original imports all used `-ErrorAction SilentlyContinue`. That
+# made downstream "X is not recognized" cascades impossible to debug
+# from the GUI (the actual import error was swallowed and never
+# reached stderr). This helper surfaces the real Import-Module
+# failure with the module path so the desktop's stderr capture and
+# the TUI's console both show *why* loading failed.
+$script:ModuleLoadFailures = New-Object System.Collections.Generic.List[string]
+function script:Import-EcfModule {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string]$ImportArgs = ''
+    )
+    if (-not (Test-Path -LiteralPath $Path)) {
+        $msg = "Module file not found: $Path"
+        Write-Host "[X] $msg" -ForegroundColor Red
+        $script:ModuleLoadFailures.Add($msg) | Out-Null
+        return
+    }
+    try {
+        if ($ImportArgs -eq 'DisableNameChecking') {
+            Import-Module -Name $Path -Force -DisableNameChecking -ErrorAction Stop
+        }
+        else {
+            Import-Module -Name $Path -Force -ErrorAction Stop
+        }
+    }
+    catch {
+        $msg = "Import-Module '$Path' failed: $($_.Exception.Message)"
+        Write-Host "[X] $msg" -ForegroundColor Red
+        $script:ModuleLoadFailures.Add($msg) | Out-Null
+    }
+}
+
 # Import configuration module
 $configModule = Join-Path $script:ModulesPath "EntraChecks-Configuration.psm1"
-if (Test-Path $configModule) {
-    Import-Module $configModule -Force -ErrorAction SilentlyContinue
-}
+Import-EcfModule -Path $configModule
 
 # Load configuration from file if provided
 $script:Config = $null
@@ -301,16 +334,12 @@ if ($ConfigFile) {
 
 # Import logging module
 $loggingModule = Join-Path $script:ModulesPath "EntraChecks-Logging.psm1"
-if (Test-Path $loggingModule) {
-    Import-Module $loggingModule -Force -ErrorAction SilentlyContinue
-}
+Import-EcfModule -Path $loggingModule
 
 # Import data sources catalog so Add-Finding can tag each finding with its
 # provenance source (auto-derived from the call stack, with optional override).
 $dsModule = Join-Path $script:ModulesPath "EntraChecks-DataSources.psm1"
-if (Test-Path $dsModule) {
-    Import-Module $dsModule -Force -DisableNameChecking -ErrorAction SilentlyContinue
-}
+Import-EcfModule -Path $dsModule -ImportArgs 'DisableNameChecking'
 
 # Import the v2 finding schema module (PR 2 of Central-Finding-Schema-GRC-Plan).
 # Initialize-FindingsForReport runs at report-generation time to normalize
@@ -319,9 +348,7 @@ if (Test-Path $dsModule) {
 # function — Initialize-FindingsForReport is invoked behind a Get-Command
 # guard at the consumer sites.
 $schemaModule = Join-Path $script:ModulesPath "EntraChecks-FindingSchema.psm1"
-if (Test-Path $schemaModule) {
-    Import-Module $schemaModule -Force -ErrorAction SilentlyContinue
-}
+Import-EcfModule -Path $schemaModule
 
 # Native App Plan, Phase 1 — the headless-runner contract. The
 # non-interactive modes wrap Invoke-EcfAssessmentSequence with this
@@ -329,9 +356,7 @@ if (Test-Path $schemaModule) {
 # a Get-Command guard at the call site so a legacy install without the
 # module still runs (events simply not emitted).
 $runnerModule = Join-Path $script:ModulesPath "EntraChecks-Runner.psm1"
-if (Test-Path $runnerModule) {
-    Import-Module $runnerModule -Force -ErrorAction SilentlyContinue
-}
+Import-EcfModule -Path $runnerModule
 
 # Initialize logging subsystem (from config or defaults)
 if ($script:Config -and $script:Config.Logging) {

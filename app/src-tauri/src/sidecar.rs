@@ -22,18 +22,25 @@ use std::process::{Command, Stdio};
 
 /// Suppress the console-window that Windows otherwise allocates when
 /// a GUI-subsystem parent (Tauri) spawns a console-subsystem child
-/// (pwsh, winget). Without this flag the user sees a blinking-cursor
-/// `cmd`-like window flash up, and AllocConsole interactions can
-/// even hang the child mid-launch under Mark-of-the-Web. No-op
-/// off-Windows — `CommandExt::creation_flags` is Windows-only.
-#[cfg(windows)]
+/// (pwsh, winget); also turn off ANSI/VT colour escapes from
+/// PowerShell so a piped stderr doesn't end up littered with raw
+/// `\e[36;1m`-style bytes that look like garbage in the Log pane.
+/// `apply_no_console_window` is the misnomer name for legacy reasons;
+/// it carries both the platform-specific console suppression and the
+/// cross-platform colour-disable env vars.
 fn apply_no_console_window(cmd: &mut Command) {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    cmd.creation_flags(CREATE_NO_WINDOW);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    // De-facto cross-tool convention (also honored by many pwsh
+    // formatters / PSReadLine). Combined with the pwsh-specific
+    // legacy var below, both old and new ANSI paths are silenced.
+    cmd.env("NO_COLOR", "1");
+    cmd.env("__SuppressAnsiEscapeSequences", "1");
 }
-#[cfg(not(windows))]
-fn apply_no_console_window(_cmd: &mut Command) {}
 
 /// Which OS family we are building discovery candidates for. Kept
 /// explicit (rather than reading `cfg!` inline) so the candidate
