@@ -25,10 +25,12 @@
           <button id="btn-readiness" class="secondary">Re-check</button>
         </div>
         <p class="muted">
-          Detection only — the engine needs PowerShell&nbsp;7 + the
-          Microsoft.Graph module to run an assessment. The Az.* set is
-          optional; without it Defender / Azure Policy degrade
-          gracefully. Guided install lands in the next step.
+          The engine needs PowerShell&nbsp;7 + the Microsoft.Graph
+          module to run an assessment. The Az.* set is optional;
+          without it Defender / Azure Policy degrade gracefully.
+          Missing items can be installed inline (CurrentUser scope);
+          some local-machine checks also need administrator rights —
+          use Restart as administrator when prompted.
         </p>
         <ul id="readiness-list" class="readiness"></ul>
         <p id="readiness-hint" class="muted"></p>

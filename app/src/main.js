@@ -211,11 +211,55 @@ async function installPrereqsClick(includeAzure) {
   }
 }
 
+async function relaunchAsAdminClick() {
+  if (
+    !confirm(
+      "Restart EntraChecks under administrator rights?\n\n" +
+        "Windows will show a UAC prompt. The current window will close " +
+        "and an elevated instance will open. Some local-machine checks " +
+        "(AD/hybrid, BitLocker, event logs) need this."
+    )
+  )
+    return;
+  try {
+    await invoke("relaunch_as_admin");
+  } catch (e) {
+    logLine(`[elevation] relaunch failed: ${e}`, "error");
+  }
+}
+
 function renderReadiness(r) {
   const list = els.readinessList;
   list.innerHTML = "";
 
-  // pwsh row first — its own "module" with a different label format.
+  // Elevation row — Windows only; non-Windows dev hosts skip it
+  // entirely because the concept doesn't translate there.
+  if (r.windows) {
+    const elevRow = document.createElement("li");
+    elevRow.className = "ready-row";
+    if (r.elevated) {
+      elevRow.dataset.state = "ok";
+      elevRow.innerHTML =
+        `<span class="rd-name">Administrator</span>` +
+        `<span class="rd-req">when needed</span>` +
+        `<span class="rd-ver">running elevated</span>` +
+        `<span class="rd-path">Local-machine checks have full access.</span>`;
+    } else {
+      elevRow.dataset.state = "optional";
+      elevRow.innerHTML =
+        `<span class="rd-name">Administrator</span>` +
+        `<span class="rd-req">when needed</span>` +
+        `<span class="rd-ver">not elevated</span>` +
+        `<span class="rd-path rd-actions">` +
+        `<button class="link" data-act="relaunch-admin">Restart as administrator</button>` +
+        `</span>`;
+    }
+    list.appendChild(elevRow);
+    const btn = elevRow.querySelector('button[data-act="relaunch-admin"]');
+    if (btn) btn.addEventListener("click", relaunchAsAdminClick);
+  }
+
+  // pwsh row — its own "module" with a different label format.
   const pwshRow = document.createElement("li");
   pwshRow.className = "ready-row";
   if (r.pwsh) {

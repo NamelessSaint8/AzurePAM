@@ -1,19 +1,22 @@
 //! EntraChecks desktop shell — Native App Phase 4 (MVP).
 //!
-//! Phase 5.3 (this commit): **consented guided remediation**.
-//! `install_prereqs` runs the bundled `Install-Prerequisites.ps1`
-//! through the detected `pwsh` (`-Scope CurrentUser`, no elevation),
-//! streamed as `install:line/exit/error` via the same boundary as a
-//! run. `install_pwsh_via_winget` hands `pwsh 7` install to winget
-//! (which owns its UAC prompt); when winget is absent the command
-//! errors and the frontend opens the official download page via
-//! `open_external` — the app never silently downloads an MSI or
-//! self-elevates.
+//! Phase 5.5 (this commit): **relaunch-as-admin**. Some EntraChecks
+//! local-machine checks (AD/hybrid, AAD Connect data, certain WMI/
+//! event-log reads) need an elevated token at run time. Readiness now
+//! reports `elevated`; the UI offers a "Restart as administrator"
+//! button that calls `relaunch_as_admin`, which `ShellExecute(runas)`
+//! the current exe and exits the non-elevated instance — one UAC
+//! prompt per session, conventional Windows pattern. The rule is
+//! **no silent self-elevation**, not "no elevation": the installer +
+//! dependency-install path stay no-UAC (5.3); this is a *consented*
+//! relaunch behind a user click. Cross-platform: non-Windows hosts
+//! get a const-false `is_elevated` and a "not on this OS" error.
 //!
 //! `tauri-plugin-opener` is wired now because step 6 ("Open report")
 //! needs it; it is otherwise inert at this stage.
 
 pub mod contract;
+mod elevation;
 mod sidecar;
 
 use std::path::{Path, PathBuf};
@@ -68,6 +71,13 @@ fn discover_pwsh_cmd() -> Result<PwshInfo, String> {
 pub struct ReadinessReport {
     pwsh: Option<PwshInfo>,
     modules: Vec<sidecar::ModuleStatus>,
+    /// `true` iff this process has an elevated token (Windows). On
+    /// non-Windows hosts always `false` — see `windows` below.
+    elevated: bool,
+    /// Whether the host is Windows. The UI uses this to decide
+    /// whether the elevation row is meaningful at all (elevation is
+    /// a Windows-only construct in the sense this app uses it).
+    windows: bool,
 }
 
 /// Probe the three-dependency surface in one shot: discover `pwsh`;
@@ -88,7 +98,21 @@ fn readiness() -> ReadinessReport {
             version: loc.version,
         }),
         modules,
+        elevated: elevation::is_elevated(),
+        windows: cfg!(target_os = "windows"),
     }
+}
+
+/// Re-launch the app under UAC (`ShellExecute runas`) and exit the
+/// current non-elevated instance. Consented (user-clicked) — never
+/// invoked automatically. Windows-only; other OSes return an error.
+#[tauri::command]
+fn relaunch_as_admin(app: AppHandle) -> Result<(), String> {
+    elevation::relaunch_self_as_admin()?;
+    // The elevated instance is the one that should be running now.
+    // Exit cleanly so the user sees one window, not two.
+    app.exit(0);
+    Ok(())
 }
 
 /// Discover `pwsh`, spawn the fixed tenant-free probe, and stream its
@@ -254,9 +278,10 @@ fn winget_available() -> bool {
 /// Run the bundled `Install-Prerequisites.ps1` through the detected
 /// `pwsh`, streaming its stdout to the webview (`install:line` /
 /// `install:exit` / `install:error`). `-Scope CurrentUser` is the
-/// script's posture — no elevation requested by the app. The 5.2
-/// boundary (`spawn_streaming`) is reused verbatim; this command
-/// only composes it.
+/// script's posture — no *silent* self-elevation by the app for the
+/// install path (consented relaunch-as-admin for the *run* path is
+/// step 5.5, `relaunch_as_admin`). The 5.2 boundary (`spawn_streaming`)
+/// is reused verbatim; this command only composes it.
 #[tauri::command]
 fn install_prereqs(app: AppHandle, include_azure: bool) -> Result<(), String> {
     let pwsh = sidecar::discover_pwsh().map_err(|e| e.to_string())?;
@@ -349,7 +374,8 @@ pub fn run() {
             readiness,
             winget_available,
             install_prereqs,
-            install_pwsh_via_winget
+            install_pwsh_via_winget,
+            relaunch_as_admin
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
