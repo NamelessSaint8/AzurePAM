@@ -358,6 +358,16 @@ Import-EcfModule -Path $schemaModule
 $runnerModule = Join-Path $script:ModulesPath "EntraChecks-Runner.psm1"
 Import-EcfModule -Path $runnerModule
 
+# HTML reporting module. The orchestration calls Get-HtmlReportPlan
+# (from this module) early in its Report phase, but historically only
+# Import-Module'd the file ~200 lines later in the same function —
+# which on a packaged install meant "Get-HtmlReportPlan is not
+# recognized" and the whole Report phase failed. Pre-load up front
+# alongside the other engine modules; the lazy Import-Module deeper
+# in the orchestration is still safe (idempotent with -Force).
+$htmlModule = Join-Path $script:ModulesPath "EntraChecks-HTMLReporting.psm1"
+Import-EcfModule -Path $htmlModule
+
 # Initialize logging subsystem (from config or defaults)
 if ($script:Config -and $script:Config.Logging) {
     $logConfig = $script:Config.Logging

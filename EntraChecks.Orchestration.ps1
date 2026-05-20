@@ -2401,10 +2401,21 @@ function Invoke-EcfAssessmentSequence {
                 }
             }
             & $AuthAction
+            # `Connect-EntraCheck` returns $false on failure, which the
+            # caller's `{ $null = Connect-EntraCheck }` scriptblock
+            # swallowed silently. The orchestration then emitted
+            # `auth.succeeded` with an empty account and marched on —
+            # the GUI rendered "[auth] signed in" without the user
+            # ever signing in, then crashed downstream. Verify a real
+            # Graph context now and throw if absent — the existing
+            # catch will route it through `auth.failed` properly.
+            $acct = ''
+            $mgCtx = Get-EcfMgContextSafe
+            if ($mgCtx -and $mgCtx.Account) { $acct = [string]$mgCtx.Account }
+            if (-not $acct) {
+                throw "Authentication did not produce a Microsoft Graph context (no account). Either Connect-MgGraph failed silently, or the consented session was lost. Check the prior log lines for the underlying error."
+            }
             if ($useEvents) {
-                $acct = ''
-                $mgCtx = Get-EcfMgContextSafe
-                if ($mgCtx -and $mgCtx.Account) { $acct = [string]$mgCtx.Account }
                 Write-EcfAuthSucceeded -Context $RunContext -Account $acct -Method $AuthMethod
             }
             phaseDone 'Auth'
@@ -2628,7 +2639,8 @@ function Start-QuickMode {
     $seq = Invoke-EcfAssessmentSequence -TenantNameValue $TenantName -ModuleSet $modulesToRun -DoCompareWithLast:$CompareWithLast -InvocationParams (Get-EcfInvocationParams -ResolvedTenant $TenantName) -EmitEvents:$EmitEvents -AuthAction $authAction -AuthMethod 'Interactive'
 
     Write-Host "`n[+] Assessment Complete" -ForegroundColor Green
-    Write-Host "    Duration: $($seq.Results.Duration.TotalMinutes.ToString('0.0')) minutes" -ForegroundColor Cyan
+    $durMin = if ($seq.Results -and $seq.Results.Duration) { $seq.Results.Duration.TotalMinutes.ToString('0.0') } else { 'n/a' }
+    Write-Host "    Duration: $durMin minutes" -ForegroundColor Cyan
     Write-Host "    Reports: $($seq.ReportDir)" -ForegroundColor Cyan
 }
 
@@ -2659,7 +2671,8 @@ function Start-HybridMode {
     $seq = Invoke-EcfAssessmentSequence -TenantNameValue $TenantName -ModuleSet $hybridModules -RunHybridCorrelation -InvocationParams (Get-EcfInvocationParams -ResolvedTenant $TenantName) -EmitEvents:$EmitEvents -AuthAction $authAction -AuthMethod 'Interactive'
 
     Write-Host "`n[+] Hybrid Analysis Complete" -ForegroundColor Green
-    Write-Host "    Duration: $($seq.Results.Duration.TotalMinutes.ToString('0.0')) minutes" -ForegroundColor Cyan
+    $durMin = if ($seq.Results -and $seq.Results.Duration) { $seq.Results.Duration.TotalMinutes.ToString('0.0') } else { 'n/a' }
+    Write-Host "    Duration: $durMin minutes" -ForegroundColor Cyan
     Write-Host "    Reports: $($seq.ReportDir)" -ForegroundColor Cyan
     if ($seq.HybridCorrelation -and $seq.HybridCorrelation.CorrelationCount -gt 0) {
         Write-Host "    [!] $($seq.HybridCorrelation.CorrelationCount) principals are flagged in BOTH cloud and on-prem. See the Hybrid Correlation section of the report." -ForegroundColor Yellow
