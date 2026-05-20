@@ -128,7 +128,7 @@ body {
 
 .form-row {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 10px;
   margin: 12px 0;
   flex-wrap: wrap;
@@ -164,6 +164,35 @@ select {
   gap: 6px;
   font-weight: 400;
   color: #5a5a5a;
+}
+
+.field-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.tenant-field {
+  flex: 1 1 330px;
+}
+
+.auth-field {
+  flex: 0 1 210px;
+}
+
+.tenant-field input,
+.auth-field select {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.field-help {
+  margin: 0;
+  max-width: 520px;
+  font-size: 0.78rem;
+  line-height: 1.35;
+  color: #6a6a6a;
 }
 
 button.secondary {

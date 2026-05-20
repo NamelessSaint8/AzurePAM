@@ -16,7 +16,7 @@
 //! No NDJSON parsing here — that is step 4.3 (`contract` module).
 //! This step is deliberately "raw passthrough".
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -275,6 +275,107 @@ where
     Ok(status.code().unwrap_or(-1))
 }
 
+enum StreamItem {
+    StdoutLine(String),
+    StdoutFragment(String),
+    StderrLine(String),
+}
+
+/// Like `spawn_streaming`, but also reports raw stdout fragments as
+/// soon as bytes arrive. The assessment path needs this for auth
+/// prompts from Microsoft.Graph: the device-code prompt can be written
+/// without a trailing newline, so a line reader can leave the webview
+/// waiting while PowerShell is already blocked on sign-in.
+pub fn spawn_streaming_with_stdout_fragments<F, G, H>(
+    program: &Path,
+    args: &[&str],
+    mut on_stdout: F,
+    mut on_stderr: G,
+    mut on_stdout_fragment: H,
+) -> std::io::Result<i32>
+where
+    F: FnMut(&str),
+    G: FnMut(&str),
+    H: FnMut(&str),
+{
+    let mut cmd = Command::new(program);
+    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    apply_no_console_window(&mut cmd);
+    let mut child = cmd.spawn()?;
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let (tx, rx) = std::sync::mpsc::channel::<StreamItem>();
+
+    let err_thread = stderr.map(|s| {
+        let tx_err = tx.clone();
+        std::thread::spawn(move || {
+            let reader = BufReader::new(s);
+            for line in reader.lines().map_while(Result::ok) {
+                let _ = tx_err.send(StreamItem::StderrLine(line));
+            }
+        })
+    });
+
+    let out_thread = stdout.map(|mut s| {
+        std::thread::spawn(move || {
+            let mut buf = [0_u8; 1024];
+            let mut pending = String::new();
+            loop {
+                match s.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
+                        let _ = tx.send(StreamItem::StdoutFragment(chunk.clone()));
+                        pending.push_str(&chunk);
+                        drain_complete_lines(&mut pending, |line| {
+                            let _ = tx.send(StreamItem::StdoutLine(line));
+                        });
+                    }
+                    Err(_) => break,
+                }
+            }
+            if !pending.is_empty() {
+                let _ = tx.send(StreamItem::StdoutLine(pending));
+            }
+        })
+    });
+
+    while let Ok(item) = rx.recv() {
+        match item {
+            StreamItem::StdoutLine(line) => on_stdout(&line),
+            StreamItem::StdoutFragment(fragment) => on_stdout_fragment(&fragment),
+            StreamItem::StderrLine(line) => on_stderr(&line),
+        }
+    }
+
+    if let Some(h) = out_thread {
+        let _ = h.join();
+    }
+    if let Some(h) = err_thread {
+        let _ = h.join();
+    }
+
+    let status = child.wait()?;
+    Ok(status.code().unwrap_or(-1))
+}
+
+fn drain_complete_lines<F>(pending: &mut String, mut on_line: F)
+where
+    F: FnMut(String),
+{
+    while let Some(idx) = pending.find(['\n', '\r']) {
+        let line = pending[..idx].to_string();
+        let rest_start = if pending[idx..].starts_with("\r\n") {
+            idx + 2
+        } else {
+            idx + 1
+        };
+        pending.drain(..rest_start);
+        on_line(line);
+    }
+}
+
 /// The fixed, tenant-free probe command used by step 4.2 to prove the
 /// boundary end-to-end (launch → ordered multi-line stdout streaming
 /// → clean exit) without needing Graph/Az or a real run.
@@ -366,6 +467,39 @@ fn ps_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+/// Scrape a Microsoft.Graph SDK device-code message and pull the
+/// user code out. The SDK writes a host-UI message like
+/// "...enter the code XXXX-XXXX to authenticate." which `Connect-
+/// MgGraph -UseDeviceAuthentication` routes through PowerShell's
+/// information stream — captured by our stdout reader, but
+/// indistinguishable to the contract parser from any other
+/// non-NDJSON line. This pure helper lets the desktop shell promote
+/// that line into a synthetic `authDeviceCode` event so the Sign-in
+/// panel can show the code (instead of "waiting for the SDK to
+/// print it" forever).
+///
+/// Looks for case-insensitive `"code "` then takes the next token of
+/// uppercase letters / digits / dashes; min length 6 to avoid false
+/// positives on English words.
+pub fn extract_device_code(line: &str) -> Option<String> {
+    let lower = line.to_lowercase();
+    let pos = lower.find("code ")?;
+    let after = &line[pos + "code ".len()..];
+    let token: String = after
+        .chars()
+        .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '-')
+        .collect();
+    // Real Azure device codes are 8–9 chars (e.g. `AYR2KQHQK` or
+    // `B5C9-FXAB`). 8 as the floor reduces false positives from
+    // English noise after "code " while still catching every real
+    // SDK message.
+    if token.len() >= 8 && token.chars().any(|c| c.is_ascii_digit() || c.is_ascii_uppercase()) {
+        Some(token)
+    } else {
+        None
+    }
+}
+
 pub fn core_args(
     core_script: &str,
     tenant: &str,
@@ -392,6 +526,7 @@ pub fn core_args(
     if auth_method == "Skip" {
         command.push_str(" -SkipAuthentication");
     }
+    command.push_str(" *>&1");
     vec![
         "-NoProfile".to_string(),
         "-NonInteractive".to_string(),
@@ -765,6 +900,7 @@ mod tests {
         assert!(cmd.contains("-AuthMethod 'Skip'"));
         assert!(cmd.contains("-EmitEvents"));
         assert!(cmd.contains("-SkipAuthentication"));
+        assert!(cmd.contains("*>&1"), "must merge PS streams to stdout");
 
         let without = core_args(
             "/r/c.ps1",
@@ -782,6 +918,16 @@ mod tests {
         assert!(without_cmd.contains("-AuthMethod 'DeviceCode'"));
         // -EmitEvents is non-negotiable: it is how the GUI sees anything.
         assert!(without_cmd.contains("-EmitEvents"));
+        assert!(without_cmd.contains("*>&1"), "must merge PS streams to stdout");
+    }
+
+    #[test]
+    fn drains_complete_lines_and_keeps_partial_tail() {
+        let mut pending = "alpha\r\nbeta\npartial".to_string();
+        let mut lines = Vec::new();
+        drain_complete_lines(&mut pending, |line| lines.push(line));
+        assert_eq!(lines, vec!["alpha", "beta"]);
+        assert_eq!(pending, "partial");
     }
 
     #[test]
@@ -884,6 +1030,39 @@ garbage line without a pipe
             .find(|s| s.contains("Install-Prerequisites.ps1"))
             .unwrap();
         assert!(cmd.contains("with''quote"), "single quotes must be doubled");
+    }
+
+    #[test]
+    fn extracts_device_code_from_sdk_messages() {
+        // Two real-world phrasings Microsoft.Graph has used; both
+        // route through `code <TOKEN>`. The scraper must grab the
+        // token and ignore everything after whitespace/punctuation.
+        assert_eq!(
+            extract_device_code(
+                "To sign in, use a web browser to open the page \
+                 https://microsoft.com/devicelogin and enter the code \
+                 ABCD-1234 to authenticate."
+            ),
+            Some("ABCD-1234".to_string())
+        );
+        assert_eq!(
+            extract_device_code(
+                "To sign in, open https://microsoft.com/devicelogin in a \
+                 browser. Enter the code A1B2C3D4 to authenticate."
+            ),
+            Some("A1B2C3D4".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_device_code_rejects_false_positives() {
+        // English words after "code " mustn't trigger.
+        assert_eq!(extract_device_code("error: bad code format"), None);
+        assert_eq!(extract_device_code("status code 500 returned"), None);
+        // No "code " at all.
+        assert_eq!(extract_device_code("starting auth flow"), None);
+        // Too short.
+        assert_eq!(extract_device_code("Code ABC-12"), None);
     }
 
     #[test]

@@ -542,7 +542,7 @@ function renderReadiness(r) {
   list.appendChild(pwshRow);
 
   let missingRequired = !r.pwsh;
-  let missingRequiredModule = false;
+  let anyModuleMissing = false;
   let anyAzMissing = false;
   (r.modules || []).forEach((m) => {
     const row = document.createElement("li");
@@ -550,8 +550,8 @@ function renderReadiness(r) {
     row.dataset.state = m.present ? "ok" : m.required ? "missing" : "optional";
     if (m.required && !m.present) {
       missingRequired = true;
-      missingRequiredModule = true;
     }
+    if (!m.present) anyModuleMissing = true;
     if (m.name.startsWith("Az.") && !m.present) anyAzMissing = true;
     row.innerHTML =
       `<span class="rd-name">${escapeHtml(m.name)}</span>` +
@@ -576,15 +576,21 @@ function renderReadiness(r) {
     });
   }
 
-  // Bottom action: a single "Install dependencies" button when any
-  // required module is missing (pwsh has its own row actions). Mirrors
-  // Install-Prerequisites.ps1's surface (Graph + optional Az.*).
+  // Bottom action: a single "Install dependencies" button shown
+  // whenever *any* module row is missing — required OR optional. The
+  // bundled `Install-Prerequisites.ps1` is idempotent (each
+  // Install-RequiredModule skips when already present), so re-running
+  // with everything checked simply tops up the remaining gaps. This
+  // covers the case where a user already installed Graph + Az.* but
+  // ImportExcel is still showing as "not installed" — previously
+  // there was no path from the GUI to fix that without dropping to
+  // a pwsh prompt.
   const actionBar = document.createElement("div");
   actionBar.className = "ready-actions";
-  if (missingRequiredModule && r.pwsh) {
+  if (anyModuleMissing && r.pwsh) {
     const includeAzDefault = anyAzMissing;
     actionBar.innerHTML =
-      `<button id="btn-install-prereqs">Install dependencies</button>` +
+      `<button id="btn-install-prereqs">Install missing modules</button>` +
       `<label class="check"><input type="checkbox" id="chk-az"` +
       (includeAzDefault ? " checked" : "") +
       `/> Include Az.* (Defender / Policy / Recovery)</label>`;

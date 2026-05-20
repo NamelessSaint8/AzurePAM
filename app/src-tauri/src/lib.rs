@@ -300,7 +300,8 @@ fn run_assessment(
         // shows up in the Log pane — that's what surfaces "exited 1
         // with no detail" properly.
         let app_err = app.clone();
-        let result = sidecar::spawn_streaming(
+        let app_frag = app.clone();
+        let result = sidecar::spawn_streaming_with_stdout_fragments(
             &pwsh.path,
             &argrefs,
             |line| match contract::parse_line(line) {
@@ -321,10 +322,38 @@ fn run_assessment(
                     if !line.trim().is_empty() {
                         let _ = app.emit("run:stdout-line", line.to_string());
                     }
+                    // Microsoft.Graph's `Connect-MgGraph -UseDevice-
+                    // Authentication` prints the device code to the
+                    // PowerShell host UI rather than as a contract
+                    // event, which the Sign-in panel then can't show.
+                    // Scrape the SDK's "enter the code XXXX-XXXX"
+                    // line and promote it into a synthetic
+                    // `authDeviceCode` event the existing webview
+                    // handler already renders. Matches the engine's
+                    // `Write-EcfAuthDeviceCode -Capture captured`
+                    // shape so the JS code path is identical.
+                    if let Some(user_code) = sidecar::extract_device_code(line) {
+                        let _ = app.emit(
+                            "run:event",
+                            serde_json::json!({
+                                "schemaMajor": 1,
+                                "event": {
+                                    "type": "authDeviceCode",
+                                    "userCode": user_code,
+                                    "verificationUri":
+                                        "https://microsoft.com/devicelogin",
+                                    "capture": "captured"
+                                }
+                            }),
+                        );
+                    }
                 }
             },
             move |line| {
                 let _ = app_err.emit("run:stderr-line", line.to_string());
+            },
+            move |fragment| {
+                let _ = app_frag.emit("run:stdout-fragment", fragment.to_string());
             },
         );
         match result {

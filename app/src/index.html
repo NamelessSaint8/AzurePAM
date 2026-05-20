@@ -61,14 +61,24 @@
         </p>
 
         <div class="form-row">
-          <label for="tenant">Tenant</label>
-          <input id="tenant" placeholder="Contoso" />
-          <label for="auth-mode">Auth</label>
-          <select id="auth-mode">
-            <option value="DeviceCode" selected>Device code</option>
-            <option value="Interactive">Browser sign-in</option>
-            <option value="Skip">Use existing session</option>
-          </select>
+          <div class="field-stack tenant-field">
+            <label for="tenant">Tenant</label>
+            <input id="tenant" placeholder="contoso.onmicrosoft.com" aria-describedby="tenant-help" />
+            <p id="tenant-help" class="field-help">
+              <strong>Example:</strong> <code>contoso.onmicrosoft.com</code>,
+              <code>contoso.com</code> (verified custom domain), or the tenant
+              GUID. The value is used to label the report; the signed-in
+              account determines which tenant is actually queried.
+            </p>
+          </div>
+          <div class="field-stack auth-field">
+            <label for="auth-mode">Auth</label>
+            <select id="auth-mode">
+              <option value="DeviceCode" selected>Device code</option>
+              <option value="Interactive">Browser sign-in</option>
+              <option value="Skip">Use existing session</option>
+            </select>
+          </div>
         </div>
         <fieldset class="module-picker">
           <legend>Modules</legend>
