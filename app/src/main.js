@@ -563,7 +563,19 @@ window.addEventListener("DOMContentLoaded", async () => {
     /* no-op; the policy is silent failure */
   });
 
-  listen("install:line", (e) => logLine(`[install] ${e.payload}`));
+  listen("install:line", (e) => {
+    // Install-Prerequisites.ps1 emits lines prefixed [X] / [!] / [+]
+    // / [*]; surface the failure / warning ones in colour so the
+    // user can actually see when an install silently goes sideways.
+    const raw = String(e.payload || "");
+    let cls;
+    if (/^\s*\[X\]/.test(raw)) cls = "error";
+    else if (/^\s*\[!\]/.test(raw)) cls = "warn";
+    else if (/^\s*\[\+\]/.test(raw)) cls = "ok";
+    else if (raw.toLowerCase().includes("error") ||
+             raw.toLowerCase().includes("exception")) cls = "error";
+    logLine(`[install] ${raw}`, cls);
+  });
   listen("install:exit", async (e) => {
     logLine(`[install] exited ${e.payload}`, e.payload === 0 ? "ok" : "warn");
     installing = false;

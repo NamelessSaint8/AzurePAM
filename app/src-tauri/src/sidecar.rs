@@ -298,6 +298,11 @@ pub fn core_args(
     let mut a = vec![
         "-NoProfile".to_string(),
         "-NonInteractive".to_string(),
+        // Bundled core scripts can be Mark-of-the-Web-tagged by NSIS;
+        // the default RemoteSigned policy would silently refuse to
+        // run them. Bypass scopes only to this invocation.
+        "-ExecutionPolicy".to_string(),
+        "Bypass".to_string(),
         "-File".to_string(),
         core_script.to_string(),
         "-TenantName".to_string(),
@@ -441,19 +446,35 @@ pub fn resolve_install_prereqs_script(core_script: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Build `pwsh` args to run `Install-Prerequisites.ps1`. `-GraphOnly`
-/// is the script's existing switch (skip the Az.* set). Pure + tested.
+/// Build `pwsh` args to run `Install-Prerequisites.ps1`. Two
+/// posture choices baked in here, learned from a real Windows run
+/// where the script appeared to "run but not install":
+///
+/// 1. `-ExecutionPolicy Bypass` — Tauri-bundled .ps1 files may be
+///    Mark-of-the-Web tagged by the installer; the default
+///    `RemoteSigned` policy then silently refuses to run them.
+///    Bypass scopes only to this invocation; nothing system-wide.
+/// 2. `-Command "& '<script>' -GraphOnly:$x *>&1"` — `*>&1` merges
+///    every PowerShell stream (Error / Warning / Verbose / Debug /
+///    Information / Success) into stdout. The spawn boundary
+///    captures stdout only, so without this any `Install-Module` /
+///    PSGallery exception lands on stderr and is dropped — the
+///    user sees "OK" lines then silence. With it, the actual
+///    failure cause reaches the log pane.
+///
+/// `-GraphOnly` mirrors the script's existing switch. Pure + tested.
 pub fn install_prereqs_args(script: &Path, include_azure: bool) -> Vec<String> {
-    let mut a = vec![
+    let path_esc = script.to_string_lossy().replace('\'', "''");
+    let graph_only = if include_azure { "$false" } else { "$true" };
+    let cmd = format!("& '{path_esc}' -GraphOnly:{graph_only} *>&1");
+    vec![
         "-NoProfile".to_string(),
         "-NonInteractive".to_string(),
-        "-File".to_string(),
-        script.to_string_lossy().into_owned(),
-    ];
-    if !include_azure {
-        a.push("-GraphOnly".to_string());
-    }
-    a
+        "-ExecutionPolicy".to_string(),
+        "Bypass".to_string(),
+        "-Command".to_string(),
+        cmd,
+    ]
 }
 
 /// Whether `winget` is on PATH. The Phase-5 §4 decision is to *use
@@ -631,8 +652,12 @@ mod tests {
     #[test]
     fn core_args_shape_and_skip_auth_toggle() {
         let with = core_args("/r/Invoke-EntraChecksRun.ps1", "Contoso", "/o", true);
-        assert_eq!(with[2], "-File");
-        assert_eq!(with[3], "/r/Invoke-EntraChecksRun.ps1");
+        // Both non-negotiable on Windows: bypass MotW-tagged bundled
+        // scripts, and the core file we're running.
+        let file_idx = with.iter().position(|x| x == "-File").expect("-File");
+        assert_eq!(with[file_idx + 1], "/r/Invoke-EntraChecksRun.ps1");
+        assert!(with.contains(&"-ExecutionPolicy".to_string()));
+        assert!(with.contains(&"Bypass".to_string()));
         assert!(with.iter().any(|x| x == "-TenantName"));
         assert!(with.iter().any(|x| x == "Contoso"));
         assert!(with.iter().any(|x| x == "-EmitEvents"));
@@ -708,15 +733,42 @@ garbage line without a pipe
             Path::new("/r/Install-Prerequisites.ps1"),
             true,
         );
-        assert_eq!(full[2], "-File");
-        assert_eq!(full[3], "/r/Install-Prerequisites.ps1");
-        assert!(!full.iter().any(|x| x == "-GraphOnly"));
+        // -Command form (with *>&1 stream merge), bypass MotW.
+        assert!(full.contains(&"-ExecutionPolicy".to_string()));
+        assert!(full.contains(&"Bypass".to_string()));
+        let cmd_idx = full
+            .iter()
+            .position(|x| x == "-Command")
+            .expect("-Command present");
+        let cmd = &full[cmd_idx + 1];
+        assert!(cmd.contains("/r/Install-Prerequisites.ps1"));
+        assert!(cmd.contains("*>&1"), "must merge PS streams to stdout");
+        assert!(cmd.contains("-GraphOnly:$false"));
 
         let graph_only = install_prereqs_args(
             Path::new("/r/Install-Prerequisites.ps1"),
             false,
         );
-        assert!(graph_only.iter().any(|x| x == "-GraphOnly"));
+        let g_cmd = graph_only
+            .iter()
+            .find(|s| s.contains("-GraphOnly"))
+            .expect("graph-only present");
+        assert!(g_cmd.contains("-GraphOnly:$true"));
+    }
+
+    #[test]
+    fn install_prereqs_args_escapes_single_quotes_in_path() {
+        // A path with a single quote shouldn't break the -Command
+        // string. PS escape rule for single-quoted strings is `''`.
+        let args = install_prereqs_args(
+            Path::new("/some/dir/with'quote/Install-Prerequisites.ps1"),
+            true,
+        );
+        let cmd = args
+            .iter()
+            .find(|s| s.contains("Install-Prerequisites.ps1"))
+            .unwrap();
+        assert!(cmd.contains("with''quote"), "single quotes must be doubled");
     }
 
     #[test]
