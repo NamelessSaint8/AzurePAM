@@ -157,9 +157,17 @@ fn run_sidecar_probe(app: AppHandle) -> Result<(), String> {
     let loc = sidecar::discover_pwsh().map_err(|e| e.to_string())?;
     std::thread::spawn(move || {
         let args = sidecar::probe_args();
-        let result = sidecar::spawn_streaming(&loc.path, &args, |line| {
-            let _ = app.emit("sidecar:line", line.to_string());
-        });
+        let app_err = app.clone();
+        let result = sidecar::spawn_streaming(
+            &loc.path,
+            &args,
+            |line| {
+                let _ = app.emit("sidecar:line", line.to_string());
+            },
+            move |line| {
+                let _ = app_err.emit("sidecar:line", format!("[stderr] {line}"));
+            },
+        );
         match result {
             Ok(code) => {
                 let _ = app.emit("sidecar:exit", code);
@@ -237,22 +245,36 @@ fn run_assessment(app: AppHandle, tenant: String, skip_auth: bool) -> Result<(),
     std::thread::spawn(move || {
         let args = sidecar::core_args(&core_s, &tenant, &out_s, skip_auth);
         let argrefs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let result = sidecar::spawn_streaming(&pwsh.path, &argrefs, |line| {
-            if let contract::ParsedLine::Event {
-                schema_major,
-                run_id,
-                event,
-            } = contract::parse_line(line)
-            {
-                if let Some(rid) = run_id {
-                    record_run_id(&app, rid);
+        // Two callbacks: stdout goes through the contract parser
+        // (the run.* event stream); stderr bypasses the parser and
+        // goes straight to the UI as `run:stderr-line` so a pwsh
+        // crash, an early exception, or any non-NDJSON noise actually
+        // shows up in the Log pane — that's what surfaces "exited 1
+        // with no detail" properly.
+        let app_err = app.clone();
+        let result = sidecar::spawn_streaming(
+            &pwsh.path,
+            &argrefs,
+            |line| {
+                if let contract::ParsedLine::Event {
+                    schema_major,
+                    run_id,
+                    event,
+                } = contract::parse_line(line)
+                {
+                    if let Some(rid) = run_id {
+                        record_run_id(&app, rid);
+                    }
+                    let _ = app.emit(
+                        "run:event",
+                        serde_json::json!({ "schemaMajor": schema_major, "event": event }),
+                    );
                 }
-                let _ = app.emit(
-                    "run:event",
-                    serde_json::json!({ "schemaMajor": schema_major, "event": event }),
-                );
-            }
-        });
+            },
+            move |line| {
+                let _ = app_err.emit("run:stderr-line", line.to_string());
+            },
+        );
         match result {
             Ok(code) => {
                 let _ = app.emit("run:exit", code);
@@ -328,10 +350,23 @@ fn install_prereqs(app: AppHandle, include_azure: bool) -> Result<(), String> {
 
     std::thread::spawn(move || {
         let argrefs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let result =
-            sidecar::spawn_streaming(&pwsh.path, &argrefs, |line| {
+        // *>&1 in install_prereqs_args already merges PS streams
+        // inside the child, but anything pwsh writes to stderr *before*
+        // executing the script (load failure, signature gates,
+        // AMSI blocks) lands on the process stderr and would still be
+        // lost. Route it to the same install:line so failures are
+        // never silent.
+        let app_err = app.clone();
+        let result = sidecar::spawn_streaming(
+            &pwsh.path,
+            &argrefs,
+            |line| {
                 let _ = app.emit("install:line", line.to_string());
-            });
+            },
+            move |line| {
+                let _ = app_err.emit("install:line", format!("[stderr] {line}"));
+            },
+        );
         match result {
             Ok(code) => {
                 let _ = app.emit("install:exit", code);
@@ -360,10 +395,17 @@ fn install_pwsh_via_winget(app: AppHandle) -> Result<(), String> {
     let args = sidecar::winget_install_pwsh_args();
     std::thread::spawn(move || {
         // `Path::new("winget")` lets the OS resolve via PATH.
-        let result =
-            sidecar::spawn_streaming(Path::new("winget"), &args, |line| {
+        let app_err = app.clone();
+        let result = sidecar::spawn_streaming(
+            Path::new("winget"),
+            &args,
+            |line| {
                 let _ = app.emit("install:line", line.to_string());
-            });
+            },
+            move |line| {
+                let _ = app_err.emit("install:line", format!("[stderr] {line}"));
+            },
+        );
         match result {
             Ok(code) => {
                 let _ = app.emit("install:exit", code);
@@ -451,11 +493,16 @@ mod tests {
         let argrefs: Vec<&str> = args.iter().map(String::as_str).collect();
 
         let mut events = Vec::new();
-        let code = sidecar::spawn_streaming(&pwsh.path, &argrefs, |line| {
-            if let ParsedLine::Event { event, .. } = parse_line(line) {
-                events.push(event);
-            }
-        })
+        let code = sidecar::spawn_streaming(
+            &pwsh.path,
+            &argrefs,
+            |line| {
+                if let ParsedLine::Event { event, .. } = parse_line(line) {
+                    events.push(event);
+                }
+            },
+            |_| {},
+        )
         .expect("core should spawn once pwsh + script resolve");
 
         assert_eq!(events.first(), Some(&AppEvent::RunStarted));

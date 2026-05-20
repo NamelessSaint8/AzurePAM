@@ -33,8 +33,13 @@ body {
   text-align: center;
 }
 
-.hidden {
-  display: none;
+.hidden,
+[hidden] {
+  /* !important so the utility class beats component-specific
+     display rules. Without this the update-banner (`.banner.update`
+     has `display: flex` at higher specificity than `.hidden`) showed
+     on every launch — empty span + a context-less "Download" button. */
+  display: none !important;
 }
 
 .op-banner {

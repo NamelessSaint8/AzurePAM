@@ -368,7 +368,7 @@ function renderReadiness(r) {
       (wingetOk
         ? `<button class="link" data-act="winget">Install via winget</button>`
         : "") +
-      `<button class="link" data-act="open">Open download page</button>` +
+      `<button class="link" data-act="open">Download PowerShell 7</button>` +
       `</span>`;
   }
   list.appendChild(pwshRow);
@@ -648,12 +648,21 @@ window.addEventListener("DOMContentLoaded", async () => {
     setRunning(false);
     endOp();
   });
+  listen("run:stderr-line", (e) => {
+    // Engine stderr (pwsh exception text, AMSI blocks, anything
+    // non-NDJSON). Red so it pops next to the contract events.
+    logLine(`[engine-stderr] ${e.payload}`, "error");
+  });
   listen("update:available", (e) => {
+    // Defensive: only surface the banner with a valid payload. If
+    // some future engine emits a malformed update event, don't show
+    // a context-less "Download" button.
     const m = e.payload || {};
+    if (!m.version || !m.url) return;
     const text = document.querySelector("#update-text");
     const banner = document.querySelector("#update-banner");
     text.textContent =
-      `EntraChecks ${m.version} is available` +
+      `A newer EntraChecks (v${m.version}) is available` +
       (m.notes ? ` — ${m.notes}` : ".");
     banner.classList.remove("hidden");
     document.querySelector("#btn-update-download").onclick = () =>

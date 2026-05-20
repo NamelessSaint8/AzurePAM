@@ -196,28 +196,72 @@ pub fn discover_pwsh() -> Result<PwshLocation, PwshError> {
 /// child writes to stdout, in order, until EOF; then wait for exit
 /// and return the exit code (or -1 if the process reported none).
 ///
-/// Generic on purpose: step 4.4 calls this with the headless core
-/// entry and `-EmitEvents`; step 4.2 calls it with the fixed probe.
-pub fn spawn_streaming<F: FnMut(&str)>(
+/// Spawn `program args...`, pipe both stdout and stderr, and call
+/// `on_stdout` / `on_stderr` for every line on each stream in arrival
+/// order. Two callbacks (rather than one merged stream) so the run
+/// path can keep the parser-fed stdout cleanly separated from
+/// engine error output that should bypass the parser and go straight
+/// to the user — exactly the gap that caused the "Run exited 1 with
+/// no detail" report.
+///
+/// Implementation: two reader threads → an mpsc channel → the
+/// calling thread drains it serially, calling the right callback per
+/// line. Real-time, no lifetime gymnastics on the callbacks.
+pub fn spawn_streaming<F, G>(
     program: &Path,
     args: &[&str],
-    mut on_line: F,
-) -> std::io::Result<i32> {
+    mut on_stdout: F,
+    mut on_stderr: G,
+) -> std::io::Result<i32>
+where
+    F: FnMut(&str),
+    G: FnMut(&str),
+{
     let mut cmd = Command::new(program);
-    cmd.args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null()); // 4.2: stdout only; stderr handling is later
+    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
     apply_no_console_window(&mut cmd);
     let mut child = cmd.spawn()?;
 
-    if let Some(stdout) = child.stdout.take() {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines() {
-            match line {
-                Ok(l) => on_line(&l),
-                Err(_) => break,
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let (tx, rx) = std::sync::mpsc::channel::<(bool, String)>();
+
+    // Stderr reader thread (owns its tx clone).
+    let err_thread = stderr.map(|s| {
+        let tx_err = tx.clone();
+        std::thread::spawn(move || {
+            let reader = BufReader::new(s);
+            for line in reader.lines().map_while(Result::ok) {
+                let _ = tx_err.send((true, line));
             }
+        })
+    });
+
+    // Stdout reader thread (owns the original tx).
+    let out_thread = stdout.map(|s| {
+        std::thread::spawn(move || {
+            let reader = BufReader::new(s);
+            for line in reader.lines().map_while(Result::ok) {
+                let _ = tx.send((false, line));
+            }
+        })
+    });
+
+    // Both thread copies of tx are now in their respective threads;
+    // when both finish, the channel closes and rx returns Err.
+    while let Ok((is_err, line)) = rx.recv() {
+        if is_err {
+            on_stderr(&line);
+        } else {
+            on_stdout(&line);
         }
+    }
+
+    if let Some(h) = out_thread {
+        let _ = h.join();
+    }
+    if let Some(h) = err_thread {
+        let _ = h.join();
     }
 
     let status = child.wait()?;
@@ -427,6 +471,7 @@ pub fn collect_readiness(pwsh: &Path) -> std::io::Result<Vec<ModuleStatus>> {
     let _ = spawn_streaming(pwsh, &args, |line| {
         buf.push_str(line);
         buf.push('\n');
+    }, |_| {
     })?;
     let parsed = parse_modules_probe_output(&buf);
     let map: std::collections::HashMap<&str, Option<String>> = parsed
@@ -637,9 +682,12 @@ mod tests {
             Err(_) => return,
         };
         let mut lines = Vec::new();
-        let code = spawn_streaming(&loc.path, &probe_args(), |l| {
-            lines.push(l.to_string())
-        })
+        let code = spawn_streaming(
+            &loc.path,
+            &probe_args(),
+            |l| lines.push(l.to_string()),
+            |_| {},
+        )
         .expect("probe should spawn once pwsh is discovered");
         assert_eq!(code, 0, "probe must exit 0");
         assert!(
