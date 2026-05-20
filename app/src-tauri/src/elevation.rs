@@ -81,7 +81,8 @@ pub fn relaunch_self_as_admin() -> Result<(), String> {
             exe_w.as_ptr(),
             std::ptr::null(),
             std::ptr::null(),
-            SW_NORMAL as i32,
+            // `SW_NORMAL` is already `i32` in windows-sys; no cast.
+            SW_NORMAL,
         )
     };
     // Per Win32: a value > 32 means success; anything ≤ 32 is an
