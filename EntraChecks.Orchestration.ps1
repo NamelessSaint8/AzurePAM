@@ -1778,11 +1778,29 @@ function Export-AssessmentResult {
     # PR 4 — consult the routing helper. Returns the concrete plan
     # (which deep dives to emit, whether to render cockpit/comprehensive/
     # unified, plus user-facing warnings).
+    #
+    # "Available" must mean "data is actually present and useful", not just
+    # "the variable is non-null". License-blocked modules return an empty
+    # shell hashtable from Get-*Assessment; a naive `$null -ne` check would
+    # let that sneak past Get-HtmlReportPlan and trigger Export-*Report,
+    # which then renders "No data available. Run Get-*Assessment first."
+    # instead of being honestly suppressed.
+    function _HasContent {
+        param($Data, [string[]]$Keys = @('Findings', 'Controls', 'Policies', 'Standards', 'Assessments', 'Subscriptions'))
+        if ($null -eq $Data) { return $false }
+        foreach ($k in $Keys) {
+            $v = $null
+            if ($Data -is [hashtable] -and $Data.ContainsKey($k)) { $v = $Data[$k] }
+            elseif ($Data.PSObject.Properties[$k]) { $v = $Data.$k }
+            if ($null -ne $v -and @($v).Count -gt 0) { return $true }
+        }
+        return $false
+    }
     $availableSources = @{
-        SecureScore = ($null -ne $script:SecureScoreData)
-        DefenderCompliance = ($null -ne $script:DefenderComplianceData)
-        AzurePolicy = ($null -ne $script:AzurePolicyData)
-        PurviewCompliance = ($null -ne $script:PurviewComplianceData)
+        SecureScore = (_HasContent -Data $script:SecureScoreData)
+        DefenderCompliance = (_HasContent -Data $script:DefenderComplianceData)
+        AzurePolicy = (_HasContent -Data $script:AzurePolicyData)
+        PurviewCompliance = (_HasContent -Data $script:PurviewComplianceData)
         Delta = $false  # set later if a delta report is generated
         PrivilegedIdentity = ($null -ne $script:UnifiedPrivilegedRoster)
     }
@@ -1805,11 +1823,18 @@ function Export-AssessmentResult {
 
     # Generate the requested per-domain deep dives. The domain set is the
     # intersection of (requested or LegacyAll-inferred) and (available data).
+    # Pipe every Export-*Report call to Out-Null. They are typed
+    # [OutputType([hashtable])] and return a hashtable on success — without
+    # the suppression, that hashtable bubbles into Export-AssessmentResult's
+    # output stream and `$reportDir = Export-AssessmentResult ...` becomes
+    # an array [hashtable, "C:\..."]. Downstream Test-Path / Get-ChildItem /
+    # Add-EcfArtifact then trip on the bogus first element with
+    # "The provided Path argument was null or an empty collection."
     if ('SecureScore' -in $htmlPlan.GenerateDomainReports) {
         $ssModule = Join-Path $script:ModulesPath "EntraChecks-SecureScore.psm1"
         Import-Module $ssModule -Force
         $beforeFiles = @(Get-ChildItem -Path $deepDivesDir -Filter 'SecureScore-Report-*.html' -ErrorAction SilentlyContinue)
-        Export-SecureScoreReport -OutputDirectory $deepDivesDir -TenantName $TenantName
+        Export-SecureScoreReport -OutputDirectory $deepDivesDir -TenantName $TenantName | Out-Null
         $afterFiles = @(Get-ChildItem -Path $deepDivesDir -Filter 'SecureScore-Report-*.html' -ErrorAction SilentlyContinue)
         $new = ($afterFiles | Where-Object { $_.FullName -notin ($beforeFiles | ForEach-Object FullName) } | Sort-Object LastWriteTime -Descending | Select-Object -First 1)
         if ($new) { $generatedDeepDives['SecureScore'] = $new.FullName }
@@ -1819,7 +1844,7 @@ function Export-AssessmentResult {
         $defModule = Join-Path $script:ModulesPath "EntraChecks-DefenderCompliance.psm1"
         Import-Module $defModule -Force
         $beforeFiles = @(Get-ChildItem -Path $deepDivesDir -Filter 'DefenderCompliance-Report-*.html' -ErrorAction SilentlyContinue)
-        Export-DefenderComplianceReport -OutputDirectory $deepDivesDir -TenantName $TenantName
+        Export-DefenderComplianceReport -OutputDirectory $deepDivesDir -TenantName $TenantName | Out-Null
         $afterFiles = @(Get-ChildItem -Path $deepDivesDir -Filter 'DefenderCompliance-Report-*.html' -ErrorAction SilentlyContinue)
         $new = ($afterFiles | Where-Object { $_.FullName -notin ($beforeFiles | ForEach-Object FullName) } | Sort-Object LastWriteTime -Descending | Select-Object -First 1)
         if ($new) { $generatedDeepDives['DefenderCompliance'] = $new.FullName }
@@ -1829,7 +1854,7 @@ function Export-AssessmentResult {
         $apModule = Join-Path $script:ModulesPath "EntraChecks-AzurePolicy.psm1"
         Import-Module $apModule -Force
         $beforeFiles = @(Get-ChildItem -Path $deepDivesDir -Filter 'AzurePolicy-Report-*.html' -ErrorAction SilentlyContinue)
-        Export-AzurePolicyReport -OutputDirectory $deepDivesDir -TenantName $TenantName
+        Export-AzurePolicyReport -OutputDirectory $deepDivesDir -TenantName $TenantName | Out-Null
         $afterFiles = @(Get-ChildItem -Path $deepDivesDir -Filter 'AzurePolicy-Report-*.html' -ErrorAction SilentlyContinue)
         $new = ($afterFiles | Where-Object { $_.FullName -notin ($beforeFiles | ForEach-Object FullName) } | Sort-Object LastWriteTime -Descending | Select-Object -First 1)
         if ($new) { $generatedDeepDives['AzurePolicy'] = $new.FullName }
@@ -1839,7 +1864,7 @@ function Export-AssessmentResult {
         $pvModule = Join-Path $script:ModulesPath "EntraChecks-PurviewCompliance.psm1"
         Import-Module $pvModule -Force
         $beforeFiles = @(Get-ChildItem -Path $deepDivesDir -Filter 'PurviewCompliance-Report-*.html' -ErrorAction SilentlyContinue)
-        Export-PurviewComplianceReport -OutputDirectory $deepDivesDir -TenantName $TenantName
+        Export-PurviewComplianceReport -OutputDirectory $deepDivesDir -TenantName $TenantName | Out-Null
         $afterFiles = @(Get-ChildItem -Path $deepDivesDir -Filter 'PurviewCompliance-Report-*.html' -ErrorAction SilentlyContinue)
         $new = ($afterFiles | Where-Object { $_.FullName -notin ($beforeFiles | ForEach-Object FullName) } | Sort-Object LastWriteTime -Descending | Select-Object -First 1)
         if ($new) { $generatedDeepDives['PurviewCompliance'] = $new.FullName }
@@ -2043,7 +2068,13 @@ function Export-AssessmentResult {
                 HybridCorrelation = $script:HybridCorrelationData
                 PrivilegedIdentityRoster = $script:UnifiedPrivilegedRoster
                 DeepDives = $generatedDeepDives
-                RequestedDeepDives = @($htmlPlan.GenerateDomainReports)
+                # Pass the user's RAW request, not the filtered plan, so the
+                # Deep Dive Hub can distinguish "skipped - no data" (user
+                # ticked it but the source returned nothing) from "skipped
+                # - not selected" (user didn't tick it). GenerateDomainReports
+                # is the intersection (request AND data); $HtmlDeepDiveDomains
+                # is what the user asked for.
+                RequestedDeepDives = @($HtmlDeepDiveDomains)
             }
             New-EntraChecksAnalystHtmlReport @cockpitArgs | Out-Null
             Write-Host "    [OK] Analyst cockpit: $cockpitPath" -ForegroundColor Green

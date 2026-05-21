@@ -299,7 +299,11 @@ function New-EntraFindingId {
     param(
         [AllowEmptyString()][AllowNull()][string]$TenantId,
         [Parameter(Mandatory)][string]$Source,
-        [Parameter(Mandatory)][string]$CheckName,
+        # CheckName is part of the identity hash but legacy findings from
+        # IdentityProtection / Devices have no `Check` field; allow empty
+        # rather than rejecting the whole finding. The downstream hash
+        # still uses Object / FindingKey to dedupe so identity stays stable.
+        [Parameter(Mandatory)][AllowEmptyString()][string]$CheckName,
         [AllowEmptyString()][AllowNull()][string]$Type,
         [AllowEmptyString()][AllowNull()][string]$ObjectType,
         [AllowEmptyString()][AllowNull()][string]$ObjectId,
@@ -907,10 +911,17 @@ function ConvertTo-EntraFindingV2 {
         # FindingId — only generate if absent. Re-runs over the same finding
         # must produce the same ID.
         if (-not (Get-EcfFindingProperty -Finding $Finding -Name 'FindingId')) {
+            # Backfill CheckName from the legacy `Check` field (and finally
+            # from Object) before hashing so identity stays stable across
+            # runs. IdentityProtection / Devices findings carry their check
+            # name in `Object` rather than `CheckName`.
+            $checkName = [string](Get-EcfFindingProperty -Finding $Finding -Name 'CheckName')
+            if (-not $checkName) { $checkName = [string](Get-EcfFindingProperty -Finding $Finding -Name 'Check') }
+            if (-not $checkName) { $checkName = [string](Get-EcfFindingProperty -Finding $Finding -Name 'Object') }
             $newId = New-EntraFindingId `
                 -TenantId   ([string](Get-EcfFindingProperty -Finding $Finding -Name 'TenantId')) `
                 -Source     ([string](Get-EcfFindingProperty -Finding $Finding -Name 'Source')) `
-                -CheckName  ([string](Get-EcfFindingProperty -Finding $Finding -Name 'CheckName')) `
+                -CheckName  $checkName `
                 -Type       ([string](Get-EcfFindingProperty -Finding $Finding -Name 'Type')) `
                 -ObjectType ([string](Get-EcfFindingProperty -Finding $Finding -Name 'ObjectType')) `
                 -ObjectId   ([string](Get-EcfFindingProperty -Finding $Finding -Name 'ObjectId')) `
