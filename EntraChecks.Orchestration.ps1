@@ -1777,30 +1777,16 @@ function Export-AssessmentResult {
 
     # PR 4 — consult the routing helper. Returns the concrete plan
     # (which deep dives to emit, whether to render cockpit/comprehensive/
-    # unified, plus user-facing warnings).
-    #
-    # "Available" must mean "data is actually present and useful", not just
-    # "the variable is non-null". License-blocked modules return an empty
-    # shell hashtable from Get-*Assessment; a naive `$null -ne` check would
-    # let that sneak past Get-HtmlReportPlan and trigger Export-*Report,
-    # which then renders "No data available. Run Get-*Assessment first."
-    # instead of being honestly suppressed.
-    function _HasContent {
-        param($Data, [string[]]$Keys = @('Findings', 'Controls', 'Policies', 'Standards', 'Assessments', 'Subscriptions'))
-        if ($null -eq $Data) { return $false }
-        foreach ($k in $Keys) {
-            $v = $null
-            if ($Data -is [hashtable] -and $Data.ContainsKey($k)) { $v = $Data[$k] }
-            elseif ($Data.PSObject.Properties[$k]) { $v = $Data.$k }
-            if ($null -ne $v -and @($v).Count -gt 0) { return $true }
-        }
-        return $false
-    }
+    # unified, plus user-facing warnings). "Available" here means the
+    # module's data is non-null — empty-shell hashtables from license-
+    # blocked modules are caught downstream by Export-*Report's own
+    # `if (-not $Data) { return $null }` guard, which now no longer leaks
+    # because every Export-*Report call is piped to Out-Null.
     $availableSources = @{
-        SecureScore = (_HasContent -Data $script:SecureScoreData)
-        DefenderCompliance = (_HasContent -Data $script:DefenderComplianceData)
-        AzurePolicy = (_HasContent -Data $script:AzurePolicyData)
-        PurviewCompliance = (_HasContent -Data $script:PurviewComplianceData)
+        SecureScore = ($null -ne $script:SecureScoreData)
+        DefenderCompliance = ($null -ne $script:DefenderComplianceData)
+        AzurePolicy = ($null -ne $script:AzurePolicyData)
+        PurviewCompliance = ($null -ne $script:PurviewComplianceData)
         Delta = $false  # set later if a delta report is generated
         PrivilegedIdentity = ($null -ne $script:UnifiedPrivilegedRoster)
     }
