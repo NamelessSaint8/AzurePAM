@@ -534,6 +534,7 @@ pub fn core_args(
     output_dir: &str,
     modules: &[String],
     auth_method: &str,
+    deep_dives: &[String],
 ) -> Vec<String> {
     let modules_literal = format!(
         "@({})",
@@ -551,6 +552,19 @@ pub fn core_args(
         modules_literal,
         ps_single_quote(auth_method)
     );
+    if !deep_dives.is_empty() {
+        let dd_literal = format!(
+            "@({})",
+            deep_dives
+                .iter()
+                .map(|d| ps_single_quote(d))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        command.push_str(&format!(
+            " -HtmlReportSet 'CockpitAndDeepDives' -HtmlDeepDiveDomains {dd_literal}"
+        ));
+    }
     if auth_method == "Skip" {
         command.push_str(" -SkipAuthentication");
     }
@@ -912,6 +926,7 @@ mod tests {
             "/o",
             &["Core".to_string(), "SecureScore".to_string()],
             "Skip",
+            &[],
         );
         // Both non-negotiable on Windows: bypass MotW-tagged bundled
         // scripts, and the core file we're running.
@@ -929,6 +944,11 @@ mod tests {
         assert!(cmd.contains("-EmitEvents"));
         assert!(cmd.contains("-SkipAuthentication"));
         assert!(cmd.contains("*>&1"), "must merge PS streams to stdout");
+        // No deep-dives selected -> no HtmlReportSet / no
+        // HtmlDeepDiveDomains overrides. Cockpit is the default in
+        // Start-EntraChecks.ps1 and we want that path unaltered.
+        assert!(!cmd.contains("-HtmlReportSet"));
+        assert!(!cmd.contains("-HtmlDeepDiveDomains"));
 
         let without = core_args(
             "/r/c.ps1",
@@ -936,6 +956,7 @@ mod tests {
             "/o",
             &["Core".to_string()],
             "DeviceCode",
+            &[],
         );
         let without_cmd = without
             .iter()
@@ -947,6 +968,31 @@ mod tests {
         // -EmitEvents is non-negotiable: it is how the GUI sees anything.
         assert!(without_cmd.contains("-EmitEvents"));
         assert!(without_cmd.contains("*>&1"), "must merge PS streams to stdout");
+    }
+
+    #[test]
+    fn core_args_includes_deep_dive_switches_when_selected() {
+        let args = core_args(
+            "/r/c.ps1",
+            "T",
+            "/o",
+            &["Core".to_string()],
+            "DeviceCode",
+            &[
+                "SecureScore".to_string(),
+                "DefenderCompliance".to_string(),
+            ],
+        );
+        let cmd = args
+            .iter()
+            .skip_while(|x| *x != "-Command")
+            .nth(1)
+            .expect("-Command payload");
+        // Engine flips to CockpitAndDeepDives whenever the GUI requested
+        // at least one deep dive. The cockpit still renders; the named
+        // deep dives render alongside as separate HTML files.
+        assert!(cmd.contains("-HtmlReportSet 'CockpitAndDeepDives'"));
+        assert!(cmd.contains("-HtmlDeepDiveDomains @('SecureScore','DefenderCompliance')"));
     }
 
     #[test]

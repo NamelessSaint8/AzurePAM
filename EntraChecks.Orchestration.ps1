@@ -2043,6 +2043,7 @@ function Export-AssessmentResult {
                 HybridCorrelation = $script:HybridCorrelationData
                 PrivilegedIdentityRoster = $script:UnifiedPrivilegedRoster
                 DeepDives = $generatedDeepDives
+                RequestedDeepDives = @($htmlPlan.GenerateDomainReports)
             }
             New-EntraChecksAnalystHtmlReport @cockpitArgs | Out-Null
             Write-Host "    [OK] Analyst cockpit: $cockpitPath" -ForegroundColor Green

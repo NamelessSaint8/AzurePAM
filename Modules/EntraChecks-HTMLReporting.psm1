@@ -673,48 +673,306 @@ $rowsHtml
 "@
 }
 
+function Get-CockpitCompliancePostureSection {
+    <#
+    .SYNOPSIS
+        Renders the Defender for Cloud Compliance Posture section.
+    .DESCRIPTION
+        Heatmap-style standard rows. Each row shows the framework name,
+        aggregate compliance percentage across subscriptions, a stacked
+        pass/fail bar, and P/F counts. Each row is a <details> accordion
+        that expands to show up to the top 25 failing controls for that
+        standard, sorted by failed-resource count descending.
+
+        Returns the empty string when $DefenderCompliance is $null (the
+        cockpit assembler is responsible for deciding whether to call this
+        function). Standards with zero failing controls render in a
+        secondary "fully passing" group at the bottom so analyst attention
+        stays on the worst-first ordering.
+    #>
+    [OutputType([string])]
+    param(
+        [object]$DefenderCompliance,
+        [int]$MaxControlsPerStandard = 25
+    )
+
+    if (-not $DefenderCompliance) { return '' }
+    # Hashtables don't expose keys through PSObject.Properties the way
+    # PSCustomObjects do, so check direct property access — it works for
+    # both shapes the orchestrator might hand us.
+    if (-not $DefenderCompliance.Standards) { return '' }
+
+    # The Standards property is a hashtable keyed by StandardId. Aggregate
+    # Passed/Failed across subscriptions and join each standard to its
+    # per-control rows from the flat Controls array.
+    $controls = @()
+    if ($DefenderCompliance.Controls) {
+        $controls = @($DefenderCompliance.Controls)
+    }
+    $controlsByFramework = @{}
+    foreach ($c in $controls) {
+        $fw = [string]$c.Framework
+        if (-not $controlsByFramework.ContainsKey($fw)) {
+            $controlsByFramework[$fw] = New-Object System.Collections.Generic.List[object]
+        }
+        $controlsByFramework[$fw].Add($c)
+    }
+
+    $rows = New-Object System.Collections.Generic.List[object]
+    foreach ($entry in $DefenderCompliance.Standards.GetEnumerator()) {
+        $std = $entry.Value
+        $totalPassed = 0
+        $totalFailed = 0
+        if ($std.Subscriptions) {
+            foreach ($subRow in $std.Subscriptions) {
+                # $subRow is a PSCustomObject (see DefenderCompliance.psm1
+                # line ~670), so PSObject.Properties works here.
+                if ($subRow.PSObject.Properties['Passed']) { $totalPassed += [int]$subRow.Passed }
+                if ($subRow.PSObject.Properties['Failed']) { $totalFailed += [int]$subRow.Failed }
+            }
+        }
+        $totalAssessed = $totalPassed + $totalFailed
+        $compliancePercent = if ($totalAssessed -gt 0) {
+            [math]::Round(($totalPassed / $totalAssessed) * 100, 1)
+        } else { 0 }
+
+        $shortName = if ($std.ShortName) {
+            [string]$std.ShortName
+        } else { [string]$entry.Key }
+        $longName = if ($std.Name) {
+            [string]$std.Name
+        } else { $shortName }
+
+        $rows.Add([PSCustomObject]@{
+                StandardId        = [string]$entry.Key
+                ShortName         = $shortName
+                LongName          = $longName
+                Passed            = $totalPassed
+                Failed            = $totalFailed
+                CompliancePercent = $compliancePercent
+                Controls          = if ($controlsByFramework.ContainsKey($shortName)) {
+                    $controlsByFramework[$shortName]
+                } else {
+                    New-Object System.Collections.Generic.List[object]
+                }
+            })
+    }
+
+    # Worst-first: standards with failed controls, sorted by compliance %
+    # ascending. Fully-passing standards sink to the bottom so the analyst
+    # sees real gaps before the green checkmarks.
+    $withGaps = @($rows | Where-Object { $_.Failed -gt 0 } | Sort-Object CompliancePercent)
+    $allPassing = @($rows | Where-Object { $_.Failed -eq 0 } | Sort-Object ShortName)
+
+    if ($rows.Count -eq 0) {
+        return @"
+<section class="cockpit-section" id="compliance-posture">
+    <h2 class="cockpit-section-title">Compliance Posture (Defender for Cloud)</h2>
+    <p class="cockpit-section-lede empty">No compliance standards returned from Defender for Cloud. Confirm the assessment ran with Azure credentials that have <code>Reader</code> on at least one subscription.</p>
+</section>
+"@
+    }
+
+    function _RenderRow {
+        param([PSCustomObject]$Row, [int]$MaxControls)
+        $short = ConvertTo-SafeHtml -Text $Row.ShortName
+        $long = ConvertTo-SafeHtml -Text $Row.LongName
+        $pct = $Row.CompliancePercent
+        $passed = $Row.Passed
+        $failed = $Row.Failed
+        $passedPct = if (($passed + $failed) -gt 0) {
+            [math]::Round(($passed / ($passed + $failed)) * 100, 2)
+        } else { 0 }
+        $failedPct = if (($passed + $failed) -gt 0) { 100 - $passedPct } else { 0 }
+        $sevClass = if ($pct -ge 80) { 'good' } elseif ($pct -ge 60) { 'warn' } else { 'bad' }
+
+        # Pick failing controls; sort by FailedResources desc, then ControlId.
+        $failingControls = @($Row.Controls | Where-Object {
+                [string]$_.Status -eq 'Failed'
+            } | Sort-Object @{ Expression = {
+                    if ($_.PSObject.Properties['FailedResources']) { -([int]$_.FailedResources) } else { 0 }
+                }
+            }, ControlId)
+
+        $totalFailingControls = $failingControls.Count
+        $shown = $failingControls | Select-Object -First $MaxControls
+
+        $controlCardsHtml = ''
+        if ($shown.Count -gt 0) {
+            $controlCardsHtml = ($shown | ForEach-Object {
+                    $ctrlId = ConvertTo-SafeHtml -Text ([string]$_.ControlId)
+                    $title = ''
+                    if ($_.PSObject.Properties['ControlTitle']) { $title = [string]$_.ControlTitle }
+                    if ([string]::IsNullOrWhiteSpace($title) -and $_.PSObject.Properties['Description']) {
+                        $title = [string]$_.Description
+                    }
+                    $titleHtml = ConvertTo-SafeHtml -Text $title
+                    $failedRes = if ($_.PSObject.Properties['FailedResources']) { [int]$_.FailedResources } else { 0 }
+                    $passedRes = if ($_.PSObject.Properties['PassedResources']) { [int]$_.PassedResources } else { 0 }
+                    $subName = if ($_.PSObject.Properties['SubscriptionName']) {
+                        ConvertTo-SafeHtml -Text ([string]$_.SubscriptionName)
+                    } else { '' }
+                    $remediation = if ($_.PSObject.Properties['Remediation']) {
+                        ConvertTo-SafeHtml -Text ([string]$_.Remediation)
+                    } else { '' }
+                    $subRow = if ($subName) { "<span class=`"compliance-control-sub`">$subName</span>" } else { '' }
+                    @"
+            <article class="compliance-control-card">
+                <header class="compliance-control-head">
+                    <code class="compliance-control-id">$ctrlId</code>
+                    $subRow
+                    <span class="compliance-control-count" title="Failed resources / passed resources">${failedRes} failed &middot; ${passedRes} passed</span>
+                </header>
+                <p class="compliance-control-title">$titleHtml</p>
+                <p class="compliance-control-remediation">$remediation</p>
+            </article>
+"@
+                }) -join "`n"
+        }
+
+        $moreNote = ''
+        if ($totalFailingControls -gt $MaxControls) {
+            $extra = $totalFailingControls - $MaxControls
+            $moreNote = "<p class=`"compliance-control-overflow`">+ $extra additional failing control(s) — see the Defender for Cloud regulatory compliance blade for the full list.</p>"
+        }
+        $emptyNote = ''
+        if ($totalFailingControls -eq 0) {
+            $emptyNote = '<p class="compliance-control-empty">No failing controls reported for this standard.</p>'
+        }
+
+        $controlsBody = if ($controlCardsHtml) { $controlCardsHtml } else { $emptyNote }
+
+        return @"
+<details class="compliance-standard $sevClass">
+    <summary class="compliance-standard-summary">
+        <span class="compliance-standard-name">$short</span>
+        <span class="compliance-standard-fullname">$long</span>
+        <span class="compliance-standard-pct" aria-label="Compliance percentage">${pct}%</span>
+        <span class="compliance-standard-bar" role="img" aria-label="Pass/fail ratio">
+            <span class="bar-pass" style="width: ${passedPct}%"></span><span class="bar-fail" style="width: ${failedPct}%"></span>
+        </span>
+        <span class="compliance-standard-counts">P:$passed &nbsp;&middot;&nbsp; F:$failed</span>
+        <span class="compliance-standard-caret" aria-hidden="true">&#x25BE;</span>
+    </summary>
+    <div class="compliance-standard-body">
+        $controlsBody
+        $moreNote
+    </div>
+</details>
+"@
+    }
+
+    $withGapsHtml = ($withGaps | ForEach-Object { _RenderRow -Row $_ -MaxControls $MaxControlsPerStandard }) -join "`n"
+    $allPassingHtml = ''
+    if ($allPassing.Count -gt 0) {
+        $passingRows = ($allPassing | ForEach-Object { _RenderRow -Row $_ -MaxControls $MaxControlsPerStandard }) -join "`n"
+        $allPassingHtml = @"
+<details class="compliance-passing-group">
+    <summary class="compliance-passing-group-summary">All passing standards ($($allPassing.Count))</summary>
+    <div class="compliance-passing-group-body">
+$passingRows
+    </div>
+</details>
+"@
+    }
+
+    $summary = $DefenderCompliance.Summary
+    $totalControls = if ($summary -and $null -ne $summary.TotalControls) { [int]$summary.TotalControls } else { 0 }
+    $passedControls = if ($summary -and $null -ne $summary.PassedControls) { [int]$summary.PassedControls } else { 0 }
+    $failedControls = if ($summary -and $null -ne $summary.FailedControls) { [int]$summary.FailedControls } else { 0 }
+    $totalStandards = if ($summary -and $null -ne $summary.TotalStandards) { [int]$summary.TotalStandards } else { $rows.Count }
+    $totalSubs = if ($summary -and $null -ne $summary.TotalSubscriptions) { [int]$summary.TotalSubscriptions } else { 0 }
+    $overallPct = if ($totalControls -gt 0) {
+        [math]::Round(($passedControls / $totalControls) * 100, 1)
+    } else { 0 }
+
+    return @"
+<section class="cockpit-section" id="compliance-posture">
+    <h2 class="cockpit-section-title">Compliance Posture (Defender for Cloud)</h2>
+    <p class="cockpit-section-lede">$totalStandards standard(s) assessed across $totalSubs subscription(s). Overall control compliance: <strong>$overallPct%</strong> ($passedControls passing / $failedControls failing of $totalControls). Worst-first ordering — expand a standard to see the highest-impact failing controls.</p>
+    <div class="compliance-standard-list">
+$withGapsHtml
+$allPassingHtml
+    </div>
+    <p class="cockpit-section-note">Up to $MaxControlsPerStandard failing controls per standard shown. Defender for Cloud assesses additional controls beyond what is surfaced here; open the Azure portal Regulatory Compliance blade for the complete catalog.</p>
+</section>
+"@
+}
+
 function Get-CockpitDeepDiveHubSection {
     <#
     .SYNOPSIS
         Renders the Deep Dive Hub — status cards for each on-demand report.
     .DESCRIPTION
         Each domain (Secure Score, Defender, Azure Policy, Purview, Delta,
-        Privileged Identity) gets a card showing whether the corresponding
-        deep-dive HTML has been generated, and a hint command for generating
-        it when not. The DeepDives hashtable maps domain name -> file path
-        for generated reports.
+        Privileged Identity) gets a card with one of four honest states:
+
+          1. Generated         — the deep-dive HTML was produced this run.
+          2. Skipped (no data) — the user requested it but the underlying
+             data source returned nothing (missing license or RBAC).
+          3. Skipped (not selected) — the user did not tick the box in
+             the GUI's deep-dive picker (CLI: omit -HtmlDeepDiveDomains).
+          4. Pending (legacy) — the call site didn't tell us either way.
+             Falls through to the "include this card next run" hint.
     #>
     [OutputType([string])]
-    param([hashtable]$DeepDives = @{})
+    param(
+        [hashtable]$DeepDives = @{},
+        [string[]]$RequestedDeepDives = @(),
+        [hashtable]$Availability = @{}
+    )
 
     $domains = @(
-        @{ Key = 'SecureScore'; Name = 'Microsoft Secure Score'; Hint = '-HtmlReportSet CockpitAndDeepDives -HtmlDeepDiveDomains SecureScore' }
-        @{ Key = 'DefenderCompliance'; Name = 'Defender for Cloud Compliance'; Hint = '-HtmlReportSet CockpitAndDeepDives -HtmlDeepDiveDomains DefenderCompliance' }
-        @{ Key = 'AzurePolicy'; Name = 'Azure Policy Initiatives'; Hint = '-HtmlReportSet CockpitAndDeepDives -HtmlDeepDiveDomains AzurePolicy' }
-        @{ Key = 'PurviewCompliance'; Name = 'Purview Compliance Manager'; Hint = '-HtmlReportSet CockpitAndDeepDives -HtmlDeepDiveDomains PurviewCompliance' }
-        @{ Key = 'Delta'; Name = 'Delta vs Previous Assessment'; Hint = '-HtmlReportSet CockpitAndDeepDives -HtmlDeepDiveDomains Delta' }
-        @{ Key = 'PrivilegedIdentity'; Name = 'Privileged Identity Roster'; Hint = '-HtmlReportSet CockpitAndDeepDives -HtmlDeepDiveDomains PrivilegedIdentity' }
+        @{ Key = 'SecureScore'; Name = 'Microsoft Secure Score' }
+        @{ Key = 'DefenderCompliance'; Name = 'Defender for Cloud Compliance' }
+        @{ Key = 'AzurePolicy'; Name = 'Azure Policy Initiatives' }
+        @{ Key = 'PurviewCompliance'; Name = 'Purview Compliance Manager' }
+        @{ Key = 'Delta'; Name = 'Delta vs Previous Assessment' }
+        @{ Key = 'PrivilegedIdentity'; Name = 'Privileged Identity Roster' }
     )
 
     $cardsHtml = ($domains | ForEach-Object {
+            $key = $_.Key
             $name = ConvertTo-SafeHtml -Text $_.Name
-            $hint = ConvertTo-SafeHtml -Text $_.Hint
-            if ($DeepDives.ContainsKey($_.Key) -and $DeepDives[$_.Key]) {
-                # Generated — link to the file. Relative path so the cockpit
-                # works under file:// when opened from the report folder.
-                $rel = Split-Path -Leaf $DeepDives[$_.Key]
-                $linkHtml = New-SafeExternalLink -Url $rel -LinkText 'Open deep dive'
+            $hint = ConvertTo-SafeHtml -Text "Tick `"$($_.Name)`" in the GUI's deep-dive picker, or pass -HtmlDeepDiveDomains $key on the CLI."
+
+            $wasRequested = $RequestedDeepDives -contains $key
+            $hasArtifact = ($DeepDives.ContainsKey($key) -and $DeepDives[$key])
+            $hasData = if ($Availability.ContainsKey($key)) { [bool]$Availability[$key] } else { $true }
+
+            if ($hasArtifact) {
+                # Relative path to the deep-dive HTML file alongside the
+                # cockpit. New-SafeExternalLink rejects URLs without an
+                # http/https scheme (which is correct for finding-derived
+                # URLs), so render a plain <a> here with attribute-encoded
+                # filename. Split-Path -Leaf guarantees no traversal.
+                $rel = Split-Path -Leaf $DeepDives[$key]
+                $relAttr = ConvertTo-SafeHtmlAttribute -Text $rel
+                $linkHtml = "<a href=`"$relAttr`">Open deep dive</a>"
                 "<div class=`"deep-dive-card generated`"><h4>$name</h4><p class=`"status`">Generated</p><p>$linkHtml</p></div>"
             }
+            elseif ($wasRequested -and -not $hasData) {
+                # Requested but data source returned nothing — license,
+                # RBAC, or the module wasn't selected for collection.
+                "<div class=`"deep-dive-card no-data`"><h4>$name</h4><p class=`"status`">Skipped &mdash; no data</p><p class=`"hint`">The underlying data source returned no rows. Most common cause is missing license/RBAC for this surface; check the Source Posture panel above.</p></div>"
+            }
+            elseif ($wasRequested) {
+                # Requested, data was there, but no artifact was produced —
+                # unusual, but render an honest "expected but missing" state.
+                "<div class=`"deep-dive-card no-data`"><h4>$name</h4><p class=`"status`">Skipped &mdash; not produced</p><p class=`"hint`">Reporter did not emit an HTML file for this domain on this run. See the engine log for warnings.</p></div>"
+            }
+            elseif (-not $hasData) {
+                "<div class=`"deep-dive-card not-available`"><h4>$name</h4><p class=`"status`">Skipped &mdash; no data available</p><p class=`"hint`">The data source for this report was not collected on this run.</p></div>"
+            }
             else {
-                "<div class=`"deep-dive-card pending`"><h4>$name</h4><p class=`"status`">Not generated this run</p><p class=`"hint`">Run with: <code>$hint</code></p></div>"
+                "<div class=`"deep-dive-card not-selected`"><h4>$name</h4><p class=`"status`">Skipped &mdash; not selected</p><p class=`"hint`">$hint</p></div>"
             }
         }) -join "`n"
 
     return @"
 <section class="cockpit-section" id="deep-dive-hub">
     <h2 class="cockpit-section-title">Deep Dive Hub</h2>
-    <p class="cockpit-section-lede">Detailed per-domain reports. Generated on demand; not part of the default run to keep the report set focused.</p>
+    <p class="cockpit-section-lede">Per-domain HTML reports rendered alongside the cockpit. Cards below report whether the deep-dive was generated, skipped because the data wasn't available, or skipped because the user didn't request it.</p>
     <div class="deep-dive-grid">
 $cardsHtml
     </div>
@@ -1298,7 +1556,7 @@ function Get-CockpitFullFindingsSection {
         <button type="button" class="cockpit-saved-view" data-view-set="due-bucket=due-0-7">Due within 7 days</button>
         <button type="button" class="cockpit-saved-view cockpit-saved-view-clear" data-view-set="">Clear filters</button>
     </div>
-    <div class="cockpit-filters">
+    <div class="cockpit-filters cockpit-filters-primary">
         <input type="search" placeholder="Search description, object, owner..." data-filter-key="_search" aria-label="Search Full Findings" />
         <select data-filter-key="status" aria-label="Filter by status">
             <option value="">All statuses</option>
@@ -1308,37 +1566,42 @@ function Get-CockpitFullFindingsSection {
             <option value="">All risk levels</option>
             $riskOptionsHtml
         </select>
-        <select data-filter-key="disposition" aria-label="Filter by disposition">
-            <option value="">All dispositions</option>
-            $dispOptionsHtml
-        </select>
-        <select data-filter-key="source" aria-label="Filter by source">
-            <option value="">All sources</option>
-            $sourceOptionsHtml
-        </select>
-        <select data-filter-key="owner" aria-label="Filter by owner">
-            <option value="">All owners</option>
-            $ownerOptionsHtml
-        </select>
-        <select data-filter-key="frameworks" data-filter-mode="contains" aria-label="Filter by framework">
-            <option value="">All frameworks</option>
-            $frameworkOptionsHtml
-        </select>
-        <input type="search" placeholder="Filter by control id (e.g. 1.1.1)" data-filter-key="controls" data-filter-mode="contains" aria-label="Filter by control id" />
-        <select data-filter-key="exception-status" aria-label="Filter by exception status">
-            <option value="">All exception states</option>
-            $exceptionOptionsHtml
-        </select>
-        <select data-filter-key="review-state" aria-label="Filter by review state">
-            <option value="">All review states</option>
-            $reviewStateOptionsHtml
-        </select>
-        <select data-filter-key="due-bucket" aria-label="Filter by due date">
-            <option value="">All due dates</option>
-            $dueBucketOptionsHtml
-        </select>
         <span class="cockpit-counter" aria-live="polite"></span>
     </div>
+    <details class="cockpit-filters-advanced">
+        <summary class="cockpit-filters-advanced-summary">Advanced filters</summary>
+        <div class="cockpit-filters cockpit-filters-secondary">
+            <select data-filter-key="disposition" aria-label="Filter by disposition">
+                <option value="">All dispositions</option>
+                $dispOptionsHtml
+            </select>
+            <select data-filter-key="source" aria-label="Filter by source">
+                <option value="">All sources</option>
+                $sourceOptionsHtml
+            </select>
+            <select data-filter-key="owner" aria-label="Filter by owner">
+                <option value="">All owners</option>
+                $ownerOptionsHtml
+            </select>
+            <select data-filter-key="frameworks" data-filter-mode="contains" aria-label="Filter by framework">
+                <option value="">All frameworks</option>
+                $frameworkOptionsHtml
+            </select>
+            <input type="search" placeholder="Filter by control id (e.g. 1.1.1)" data-filter-key="controls" data-filter-mode="contains" aria-label="Filter by control id" />
+            <select data-filter-key="exception-status" aria-label="Filter by exception status">
+                <option value="">All exception states</option>
+                $exceptionOptionsHtml
+            </select>
+            <select data-filter-key="review-state" aria-label="Filter by review state">
+                <option value="">All review states</option>
+                $reviewStateOptionsHtml
+            </select>
+            <select data-filter-key="due-bucket" aria-label="Filter by due date">
+                <option value="">All due dates</option>
+                $dueBucketOptionsHtml
+            </select>
+        </div>
+    </details>
     <div class="cockpit-row-list">
 $rowsHtml
     </div>
@@ -1748,6 +2011,14 @@ function New-EntraChecksAnalystHtmlReport {
         'AzurePolicy', 'Delta', etc.) to the path of the generated deep-dive
         HTML file. The Deep Dive Hub renders linkified cards for present
         entries and "not generated this run" cards for missing ones.
+    .PARAMETER RequestedDeepDives
+        Optional array of deep-dive domain names the user explicitly
+        opted into for this run (the GUI checkbox group, or the
+        `-HtmlDeepDiveDomains` switch). Drives the four-state status
+        the Deep Dive Hub renders per card:
+          - Generated         (requested AND in $DeepDives)
+          - Skipped (no data) (requested but data source unavailable)
+          - Skipped (no license / not selected) (not requested)
     .OUTPUTS
         String — the OutputPath of the written HTML file.
     #>
@@ -1766,6 +2037,7 @@ function New-EntraChecksAnalystHtmlReport {
         [object]$PrivilegedIdentityRoster,
         [object]$Branding,
         [hashtable]$DeepDives = @{},
+        [string[]]$RequestedDeepDives = @(),
         [int]$MaxInitialRows = 100,
         [bool]$IncludeIntegrityBadge = $true
     )
@@ -1833,12 +2105,26 @@ function New-EntraChecksAnalystHtmlReport {
     # expandable rows). Wired by the cockpit JS emitted near </body>.
     $actionQueueHtml = Get-CockpitActionQueueSection -EnhancedFindings $enhancedFindings -MaxInitialRows $MaxInitialRows
     $reviewQueueHtml = Get-CockpitReviewQueueSection -EnhancedFindings $enhancedFindings -MaxInitialRows $MaxInitialRows
+    $compliancePostureHtml = Get-CockpitCompliancePostureSection -DefenderCompliance $DefenderCompliance
     $sourcePostureHtml = Get-CockpitSourcePostureSection `
         -SecureScore $SecureScore -DefenderCompliance $DefenderCompliance `
         -AzurePolicy $AzurePolicy -PurviewCompliance $PurviewCompliance `
         -HybridCorrelation $HybridCorrelation -PrivilegedIdentityRoster $PrivilegedIdentityRoster
     $evidenceHtml = Get-CockpitEvidenceProvenanceSection -Findings $enhancedFindings
-    $deepDiveHtml = Get-CockpitDeepDiveHubSection -DeepDives $DeepDives
+
+    # Availability map for the four-state Deep Dive Hub. A deep-dive can
+    # be unavailable for two distinct reasons — the user didn't tick it
+    # (skipped: not selected) vs. they did but no underlying data came
+    # back (skipped: no data, typically a missing license or RBAC).
+    $availability = @{
+        SecureScore = [bool]$SecureScore
+        DefenderCompliance = [bool]$DefenderCompliance
+        AzurePolicy = [bool]$AzurePolicy
+        PurviewCompliance = [bool]$PurviewCompliance
+        Delta = [bool]$PreviousAssessment
+        PrivilegedIdentity = [bool]$PrivilegedIdentityRoster
+    }
+    $deepDiveHtml = Get-CockpitDeepDiveHubSection -DeepDives $DeepDives -RequestedDeepDives $RequestedDeepDives -Availability $availability
     $fullFindingsHtml = Get-CockpitFullFindingsSection -EnhancedFindings $enhancedFindings -MaxInitialRows $MaxInitialRows
     $cockpitJs = Get-CockpitJavaScript
 
@@ -1849,12 +2135,18 @@ function New-EntraChecksAnalystHtmlReport {
     $htmlHead = Get-HTMLHead
     $cockpitCss = Get-CockpitCss
 
-    # Header — branding overrides if supplied.
+    # Header — branding overrides if supplied. PR Cockpit-Polish:
+    # hero tenant name + posture badge + stat row replace the prior
+    # squished single-block header. Posture / counts come from the digest
+    # we already computed above.
     $tenantName = ConvertTo-SafeHtml -Text ([string]$TenantInfo.TenantName)
     $tenantId = ConvertTo-SafeHtml -Text ([string]$TenantInfo.TenantId)
     $reportTitle = if ($Branding -and $Branding.ReportTitle) {
         ConvertTo-SafeHtml -Text ([string]$Branding.ReportTitle)
     } else { 'EntraChecks Analyst Cockpit' }
+    $reportGeneratedDate = Get-Date -Format "MMMM dd, yyyy 'at' HH:mm:ss"
+    $verdictText = ConvertTo-SafeHtml -Text ([string]$execDigest.Verdict)
+    $verdictClassAttr = ConvertTo-SafeHtmlAttribute -Text ([string]$execDigest.VerdictClass)
 
     # Static-report Content Security Policy. This is a local file: inline
     # script and inline style are required (no external CDNs). Block
@@ -1876,19 +2168,25 @@ function New-EntraChecksAnalystHtmlReport {
 <body>
     <a class="skip-link" href="#main-content">Skip to main content</a>
     <main id="main-content" class="container">
-        <header class="report-header">
-            <h1>$reportTitle</h1>
-            <div class="tenant-info">
-                <p><strong>Tenant:</strong> $tenantName</p>
-                <p><strong>Tenant ID:</strong> $tenantId</p>
-                <p><strong>Report Generated:</strong> $(Get-Date -Format "MMMM dd, yyyy 'at' HH:mm:ss")</p>
-                <p><strong>Total Findings:</strong> $($enhancedFindings.Count)</p>
-                <p><strong>Report Mode:</strong> Cockpit</p>
+        <header class="cockpit-hero">
+            <div class="cockpit-hero-meta">
+                <p class="cockpit-hero-product">$reportTitle</p>
+                <h1 class="cockpit-hero-tenant">$tenantName</h1>
+                <p class="cockpit-hero-tenantid"><span class="cockpit-hero-tenantid-label">Tenant ID</span> <code>$tenantId</code></p>
+                <p class="cockpit-hero-generated">Generated $reportGeneratedDate</p>
+            </div>
+            <div class="cockpit-hero-verdict">
+                <span class="cockpit-hero-verdict-label">Overall posture</span>
+                <span class="cockpit-hero-verdict-pill $verdictClassAttr">$verdictText</span>
+                <span class="cockpit-hero-verdict-count">$($enhancedFindings.Count) findings</span>
             </div>
         </header>
 
         <!-- Section 1: Executive Digest -->
         $execDigestHtml
+
+        <!-- Section 1b: Defender for Cloud Compliance Posture -->
+        $compliancePostureHtml
 
         <!-- Section 2: Action Queue (PR 3 makes this interactive) -->
         $actionQueueHtml
@@ -1947,12 +2245,18 @@ function Get-CockpitCss {
 .source-metric { color: #555; font-size: 0.85em; margin-top: 4px; }
 .deep-dive-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; }
 .deep-dive-card { padding: 12px; border-radius: 6px; border-left: 4px solid #ccc; background: #f8f9fb; }
-.deep-dive-card.generated { border-left-color: #0078d4; }
+.deep-dive-card.generated { border-left-color: #0078d4; background: #eff6fb; }
 .deep-dive-card.pending { border-left-color: #ffaa44; opacity: 0.95; }
+.deep-dive-card.no-data { border-left-color: #c52733; background: #fdeded; }
+.deep-dive-card.not-available { border-left-color: #9aa3af; }
+.deep-dive-card.not-selected { border-left-color: #5c6873; opacity: 0.9; }
 .deep-dive-card h4 { margin: 0 0 6px 0; font-size: 1em; }
 .deep-dive-card .status { font-weight: 600; font-size: 0.9em; }
 .deep-dive-card.generated .status { color: #0078d4; }
 .deep-dive-card.pending .status { color: #b87100; }
+.deep-dive-card.no-data .status { color: #a4373a; }
+.deep-dive-card.not-available .status { color: #4b5563; }
+.deep-dive-card.not-selected .status { color: #4b5563; }
 .deep-dive-card .hint { color: #555; font-size: 0.82em; margin-top: 6px; }
 .deep-dive-card .hint code { background: #eef; padding: 2px 5px; border-radius: 3px; font-size: 0.92em; }
 .provenance-table { width: 100%; border-collapse: collapse; font-size: 0.85em; }
@@ -1974,6 +2278,14 @@ function Get-CockpitCss {
 .cockpit-saved-view-clear { border-color: #9aa3af; color: #555; }
 .cockpit-saved-view-clear:hover { background: #f0f1f3; }
 .cockpit-filters { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; align-items: center; }
+.cockpit-filters-primary { margin-bottom: 8px; }
+.cockpit-filters-advanced { margin: 0 0 14px 0; border: 1px solid #e5e7eb; border-radius: 6px; background: #fafbfc; }
+.cockpit-filters-advanced-summary { cursor: pointer; padding: 8px 14px; font-size: 0.86em; color: #0078d4; font-weight: 600; list-style: none; user-select: none; }
+.cockpit-filters-advanced-summary::-webkit-details-marker { display: none; }
+.cockpit-filters-advanced-summary::before { content: '\25BE'; display: inline-block; margin-right: 8px; transition: transform 0.15s; color: #888; }
+.cockpit-filters-advanced[open] .cockpit-filters-advanced-summary::before { transform: rotate(180deg); }
+.cockpit-filters-advanced[open] .cockpit-filters-advanced-summary { border-bottom: 1px solid #e5e7eb; }
+.cockpit-filters-advanced .cockpit-filters-secondary { padding: 10px 14px 12px; margin-bottom: 0; }
 .cockpit-filters input[type="search"], .cockpit-filters select { padding: 6px 10px; border: 1px solid #d0d5dc; border-radius: 4px; font-size: 0.9em; background: #fff; }
 .cockpit-filters input[type="search"] { flex: 1 1 240px; min-width: 200px; }
 .cockpit-filters select { min-width: 130px; }
@@ -2014,10 +2326,157 @@ function Get-CockpitCss {
 .cockpit-show-more { margin-top: 12px; padding: 8px 16px; border: 1px solid #0078d4; background: #fff; color: #0078d4; border-radius: 4px; cursor: pointer; font-size: 0.9em; display: none; }
 .cockpit-show-more:hover { background: #0078d4; color: #fff; }
 .cockpit-show-more:focus { outline: 2px solid #0078d4; outline-offset: 2px; }
+/* Cockpit hero header */
+.cockpit-hero { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 24px; align-items: center; padding: 28px 30px; margin: 20px 0 24px 0; background: linear-gradient(135deg, #0a2540 0%, #0078d4 100%); color: #fff; border-radius: 12px; box-shadow: 0 4px 16px rgba(0, 50, 100, 0.18); }
+.cockpit-hero-meta { min-width: 0; }
+.cockpit-hero-product { margin: 0 0 4px 0; font-size: 0.84em; text-transform: uppercase; letter-spacing: 0.12em; color: rgba(255, 255, 255, 0.78); font-weight: 600; }
+.cockpit-hero-tenant { margin: 0; font-size: 2.05em; font-weight: 700; color: #fff; letter-spacing: -0.01em; line-height: 1.15; word-break: break-word; }
+.cockpit-hero-tenantid { margin: 6px 0 0 0; font-size: 0.86em; color: rgba(255, 255, 255, 0.78); }
+.cockpit-hero-tenantid-label { text-transform: uppercase; letter-spacing: 0.06em; font-size: 0.86em; margin-right: 4px; }
+.cockpit-hero-tenantid code { background: rgba(255, 255, 255, 0.12); padding: 2px 8px; border-radius: 4px; font-family: monospace; color: #fff; }
+.cockpit-hero-generated { margin: 4px 0 0 0; font-size: 0.82em; color: rgba(255, 255, 255, 0.7); }
+.cockpit-hero-verdict { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; min-width: 180px; }
+.cockpit-hero-verdict-label { font-size: 0.74em; text-transform: uppercase; letter-spacing: 0.08em; color: rgba(255, 255, 255, 0.72); font-weight: 600; }
+.cockpit-hero-verdict-pill { padding: 8px 16px; border-radius: 22px; font-weight: 700; font-size: 1em; letter-spacing: 0.02em; background: rgba(255, 255, 255, 0.92); color: #1f2937; box-shadow: 0 2px 6px rgba(0, 0, 0, 0.16); }
+.cockpit-hero-verdict-pill.verdict-strong { background: #dff6dd; color: #107c10; }
+.cockpit-hero-verdict-pill.verdict-minor { background: #fff4ce; color: #8a5a00; }
+.cockpit-hero-verdict-pill.verdict-gaps { background: #fde7e9; color: #a4373a; }
+.cockpit-hero-verdict-pill.verdict-insufficient { background: #e5e7eb; color: #4b5563; }
+.cockpit-hero-verdict-count { font-size: 0.86em; color: rgba(255, 255, 255, 0.86); font-variant-numeric: tabular-nums; }
+@media (max-width: 720px) {
+    .cockpit-hero { grid-template-columns: 1fr; padding: 20px 22px; }
+    .cockpit-hero-tenant { font-size: 1.6em; }
+    .cockpit-hero-verdict { align-items: flex-start; }
+}
+@media print {
+    .cockpit-hero { background: #fff !important; color: #0a2540 !important; box-shadow: none !important; border: 1px solid #0078d4; }
+    .cockpit-hero-product, .cockpit-hero-tenantid, .cockpit-hero-tenantid-label, .cockpit-hero-generated, .cockpit-hero-verdict-label, .cockpit-hero-verdict-count { color: #4b5563 !important; }
+    .cockpit-hero-tenant { color: #0a2540 !important; }
+    .cockpit-hero-tenantid code { background: #f4f5f7 !important; color: #1f2937 !important; }
+}
+
+/* Executive Digest redesign */
+.exec-digest { margin: 20px 0 30px 0; padding: 24px 26px; background: #fff; border-radius: 10px; box-shadow: 0 3px 10px rgba(0,0,0,0.05); border-top: 4px solid #0078d4; }
+.exec-digest-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 12px; margin-bottom: 14px; }
+.exec-digest-title { margin: 0; font-size: 1.55em; color: #0078d4; }
+.exec-verdict-line { margin: 0; font-size: 1.02em; color: #1f2937; }
+.exec-verdict { display: inline-block; padding: 3px 10px; border-radius: 12px; font-weight: 700; font-size: 0.88em; margin-left: 6px; }
+.exec-verdict.verdict-strong { background: #dff6dd; color: #107c10; }
+.exec-verdict.verdict-minor { background: #fff4ce; color: #8a5a00; }
+.exec-verdict.verdict-gaps { background: #fde7e9; color: #a4373a; }
+.exec-verdict.verdict-insufficient { background: #e5e7eb; color: #4b5563; }
+.exec-stat-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 10px; margin: 14px 0; }
+.exec-stat { padding: 12px 14px; border-radius: 8px; background: #f8f9fb; border-left: 4px solid #9aa3af; }
+.exec-stat-value { font-size: 1.7em; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1; color: #1f2937; }
+.exec-stat-label { font-size: 0.78em; text-transform: uppercase; letter-spacing: 0.05em; color: #6b7280; margin-top: 4px; }
+.exec-stat-total { border-left-color: #0078d4; }
+.exec-stat-critical { border-left-color: #c52733; }
+.exec-stat-critical .exec-stat-value { color: #a4373a; }
+.exec-stat-high { border-left-color: #e8893a; }
+.exec-stat-high .exec-stat-value { color: #c46a1f; }
+.exec-stat-review { border-left-color: #5c2d91; }
+.exec-stat-review .exec-stat-value { color: #5c2d91; }
+.exec-stat-quickwin { border-left-color: #107c10; }
+.exec-stat-quickwin .exec-stat-value { color: #107c10; }
+.exec-delta { color: #555; font-size: 0.92em; margin: 6px 0 12px 0; }
+.exec-subhead { font-size: 1.08em; color: #1f2937; margin: 18px 0 8px 0; }
+.exec-subhead-meta { font-weight: 400; color: #6b7280; font-size: 0.82em; margin-left: 8px; }
+.exec-top-cards-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; }
+.exec-top-card { padding: 14px 16px; border-radius: 8px; background: #fff; border: 1px solid #e5e7eb; border-left: 4px solid #c52733; box-shadow: 0 2px 4px rgba(0,0,0,0.04); }
+.exec-top-card-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; gap: 8px; }
+.exec-pill { display: inline-block; padding: 2px 9px; border-radius: 11px; font-size: 0.78em; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; background: #e5e7eb; color: #1f2937; }
+.exec-pill-critical { background: #c52733; color: #fff; }
+.exec-pill-high { background: #e8893a; color: #fff; }
+.exec-pill-medium { background: #ffd166; color: #7b5e00; }
+.exec-pill-low { background: #95c19e; color: #1f3d22; }
+.exec-pill-info { background: #deecf9; color: #004578; }
+.exec-pill-review { background: #5c2d91; color: #fff; }
+.exec-card-risk { font-size: 0.82em; color: #6b7280; font-variant-numeric: tabular-nums; }
+.exec-card-desc { font-size: 0.96em; color: #1f2937; line-height: 1.4; margin: 4px 0 6px 0; }
+.exec-card-object { font-size: 0.82em; color: #555; margin: 4px 0; }
+.exec-card-object code { font-family: monospace; background: #f4f5f7; padding: 1px 5px; border-radius: 3px; }
+.exec-card-remediation { font-size: 0.84em; color: #4b5563; line-height: 1.4; margin: 6px 0 0 0; padding-top: 6px; border-top: 1px dashed #e5e7eb; }
+.exec-gap-list { display: flex; flex-direction: column; gap: 6px; }
+.exec-gap-framework { border: 1px solid #e5e7eb; border-radius: 6px; background: #fff; }
+.exec-gap-framework > summary { display: grid; grid-template-columns: 1fr auto 16px; gap: 10px; align-items: center; padding: 10px 14px; cursor: pointer; font-size: 0.94em; list-style: none; }
+.exec-gap-framework > summary::-webkit-details-marker { display: none; }
+.exec-gap-framework > summary:focus-visible { outline: 3px solid #0078d4; outline-offset: -3px; }
+.exec-gap-framework-name { font-weight: 700; color: #1f2937; }
+.exec-gap-framework-count { color: #a4373a; font-weight: 600; font-size: 0.86em; }
+.exec-gap-caret { color: #888; font-size: 0.85em; transition: transform 0.15s; justify-self: end; }
+.exec-gap-framework[open] > summary .exec-gap-caret { transform: rotate(180deg); }
+.exec-gap-framework[open] > summary { border-bottom: 1px solid #e5e7eb; }
+.exec-gap-framework-body { padding: 10px 14px 14px; background: #fafbfc; display: flex; flex-direction: column; gap: 6px; }
+.exec-gap-control { border: 1px solid #e5e7eb; border-radius: 4px; background: #fff; }
+.exec-gap-control > summary { padding: 7px 12px; cursor: pointer; font-size: 0.88em; list-style: none; display: flex; gap: 8px; align-items: center; }
+.exec-gap-control > summary::-webkit-details-marker { display: none; }
+.exec-gap-control > summary::before { content: '\25BE'; color: #888; transition: transform 0.15s; }
+.exec-gap-control[open] > summary::before { transform: rotate(180deg); }
+.exec-gap-control-id { font-family: monospace; font-size: 0.88em; background: #f4f5f7; padding: 1px 6px; border-radius: 3px; color: #1f2937; }
+.exec-gap-control-count { color: #6b7280; font-size: 0.82em; margin-left: auto; }
+.exec-gap-finding-list { padding: 4px 14px 10px 28px; margin: 0; font-size: 0.86em; color: #444; list-style-type: disc; }
+.exec-gap-finding-list li { margin: 3px 0; line-height: 1.4; }
+.exec-gap-finding-desc { color: #1f2937; }
+.exec-gap-finding-obj { font-family: monospace; font-size: 0.92em; background: #f4f5f7; padding: 1px 4px; border-radius: 3px; color: #4b5563; }
+.exec-gap-finding-risk { color: #6b7280; font-size: 0.86em; }
+.exec-gap-finding-overflow { color: #6b7280; font-style: italic; list-style: none; margin-left: -16px; }
+.exec-gap-overflow { color: #6b7280; font-style: italic; font-size: 0.84em; margin: 6px 0 0 0; }
+@media print {
+    .exec-gap-framework, .exec-gap-control { page-break-inside: avoid; }
+    .exec-gap-framework-body, .exec-gap-finding-list { display: block !important; }
+    .exec-top-card { page-break-inside: avoid; }
+}
+
+/* Compliance Posture (Defender for Cloud) */
+.compliance-standard-list { display: flex; flex-direction: column; gap: 6px; }
+.compliance-standard { border: 1px solid #e5e7eb; border-left-width: 4px; border-radius: 4px; background: #fff; }
+.compliance-standard.good { border-left-color: #107c10; }
+.compliance-standard.warn { border-left-color: #d29200; }
+.compliance-standard.bad  { border-left-color: #c52733; }
+.compliance-standard-summary { display: grid; grid-template-columns: minmax(120px, 1fr) minmax(140px, 2fr) 60px minmax(120px, 1.5fr) 110px 16px; gap: 12px; align-items: center; padding: 10px 14px; cursor: pointer; font-size: 0.92em; list-style: none; }
+.compliance-standard-summary::-webkit-details-marker { display: none; }
+.compliance-standard-summary:focus-visible { outline: 3px solid #0078d4; outline-offset: -3px; }
+.compliance-standard[open] .compliance-standard-summary { border-bottom: 1px solid #e5e7eb; }
+.compliance-standard[open] .compliance-standard-caret { transform: rotate(180deg); }
+.compliance-standard-name { font-weight: 700; color: #1f2937; }
+.compliance-standard-fullname { color: #555; font-size: 0.88em; }
+.compliance-standard-pct { font-weight: 700; font-variant-numeric: tabular-nums; text-align: right; }
+.compliance-standard.good .compliance-standard-pct { color: #107c10; }
+.compliance-standard.warn .compliance-standard-pct { color: #8a5a00; }
+.compliance-standard.bad  .compliance-standard-pct { color: #a4373a; }
+.compliance-standard-bar { display: flex; height: 10px; border-radius: 5px; overflow: hidden; background: #eef0f2; }
+.compliance-standard-bar .bar-pass { background: #107c10; }
+.compliance-standard-bar .bar-fail { background: #c52733; }
+.compliance-standard-counts { color: #555; font-size: 0.85em; font-variant-numeric: tabular-nums; }
+.compliance-standard-caret { color: #888; font-size: 0.85em; transition: transform 0.15s; justify-self: end; }
+.compliance-standard-body { padding: 12px 16px 16px; background: #fafbfc; display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 10px; }
+.compliance-control-card { border: 1px solid #e5e7eb; border-radius: 4px; background: #fff; padding: 10px 12px; }
+.compliance-control-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 6px; }
+.compliance-control-id { font-family: monospace; font-size: 0.85em; background: #f4f5f7; padding: 2px 6px; border-radius: 3px; color: #1f2937; }
+.compliance-control-sub { font-size: 0.78em; color: #6b7280; }
+.compliance-control-count { margin-left: auto; font-size: 0.78em; color: #a4373a; font-weight: 600; }
+.compliance-control-title { font-size: 0.92em; color: #1f2937; margin: 4px 0; line-height: 1.35; }
+.compliance-control-remediation { font-size: 0.82em; color: #555; word-break: break-word; }
+.compliance-control-empty { grid-column: 1 / -1; color: #6b7280; font-style: italic; font-size: 0.88em; }
+.compliance-control-overflow { grid-column: 1 / -1; color: #555; font-size: 0.82em; margin-top: 4px; font-style: italic; }
+.compliance-passing-group { margin-top: 10px; border: 1px dashed #d0d5dc; border-radius: 4px; background: #f8f9fb; }
+.compliance-passing-group-summary { cursor: pointer; padding: 8px 14px; font-size: 0.88em; color: #555; }
+.compliance-passing-group-summary::-webkit-details-marker { display: none; }
+.compliance-passing-group-summary::before { content: '\25BE'; display: inline-block; margin-right: 8px; transition: transform 0.15s; }
+.compliance-passing-group[open] .compliance-passing-group-summary::before { transform: rotate(180deg); }
+.compliance-passing-group-body { padding: 8px 12px 12px; display: flex; flex-direction: column; gap: 4px; }
+@media (max-width: 800px) {
+    .compliance-standard-summary { grid-template-columns: 1fr auto; row-gap: 4px; }
+    .compliance-standard-fullname, .compliance-standard-bar, .compliance-standard-counts { grid-column: 1 / -1; }
+    .compliance-standard-caret { grid-column: 2; }
+}
 @media print {
     .cockpit-filters, .cockpit-saved-views, .cockpit-show-more, .cockpit-caret { display: none !important; }
     .cockpit-row { page-break-inside: avoid; }
     .cockpit-row-body { display: block !important; }
+    .compliance-standard { page-break-inside: avoid; }
+    .compliance-standard-body { display: block !important; }
+    .compliance-passing-group-body { display: block !important; }
 }
 </style>
 '@
@@ -3319,15 +3778,22 @@ function Get-EntraChecksExecutiveDigest {
             Select-Object -First 3)
 
     # Frameworks with the most affected controls.
+    # Carry the underlying Controls hashtable through so the renderer can
+    # show specific failing controls + their findings inside an accordion
+    # rather than just a count.
     $frameworkGaps = @()
     if ($ComplianceGap -and $ComplianceGap.FrameworkGaps) {
         foreach ($key in @('CIS', 'NIST', 'SOC2', 'PCIDSS')) {
             $g = $ComplianceGap.FrameworkGaps[$key]
             if ($g -and $g.ControlsAffected -gt 0) {
-                $frameworkGaps += [pscustomobject]@{ Framework = $key; ControlsAffected = $g.ControlsAffected }
+                $frameworkGaps += [pscustomobject]@{
+                    Framework        = $key
+                    ControlsAffected = $g.ControlsAffected
+                    Controls         = $g.Controls
+                }
             }
         }
-        $frameworkGaps = @($frameworkGaps | Sort-Object ControlsAffected -Descending | Select-Object -First 3)
+        $frameworkGaps = @($frameworkGaps | Sort-Object ControlsAffected -Descending | Select-Object -First 4)
     }
 
     return [pscustomobject]@{
@@ -3349,6 +3815,11 @@ function Format-ExecutiveDigest {
     .SYNOPSIS
         Renders the Get-EntraChecksExecutiveDigest output as the cover digest
         block at the top of the unified report.
+    .DESCRIPTION
+        Top findings render as feature cards (risk pill + description + object
+        + remediation). Compliance gaps render as accordions — each framework
+        is a <details> that expands to show the specific failing controls and
+        the findings underneath each one.
     #>
     param(
         [Parameter(Mandatory)] [object]$Digest,
@@ -3360,33 +3831,147 @@ function Format-ExecutiveDigest {
     $deltaLine = ""
     if ($Digest.FindingsDelta) {
         $d = $Digest.FindingsDelta
-        $deltaLine = "<p><strong>Since last assessment:</strong> $($d.Resolved) resolved &middot; $($d.New) new &middot; $($d.Persistent) persistent.</p>"
+        $deltaLine = "<p class=`"exec-delta`"><strong>Since last assessment:</strong> $($d.Resolved) resolved &middot; $($d.New) new &middot; $($d.Persistent) persistent.</p>"
     }
 
-    $topRows = ""
+    # Top findings as feature cards.
+    $topCards = ""
     if ($Digest.TopFindings -and $Digest.TopFindings.Count -gt 0) {
-        $topRows = "<p><strong>Top findings (by risk score):</strong></p><ol class='top-list'>"
-        foreach ($f in $Digest.TopFindings) {
-            $desc = [System.Web.HttpUtility]::HtmlEncode([string]$f.Description)
-            $obj = [System.Web.HttpUtility]::HtmlEncode([string]$f.Object)
-            $topRows += "<li>${desc} <em>(${obj})</em> &mdash; risk $($f.RiskScore)</li>"
+        $cards = foreach ($f in $Digest.TopFindings) {
+            $desc = ConvertTo-SafeHtml -Text ([string]$f.Description)
+            $obj = ConvertTo-SafeHtml -Text ([string]$f.Object)
+            $score = if ($f.PSObject.Properties['RiskScore']) { [int]$f.RiskScore } else { 0 }
+            $level = if ($f.PSObject.Properties['RiskLevel'] -and $f.RiskLevel) {
+                [string]$f.RiskLevel
+            } elseif ($f.PSObject.Properties['Severity'] -and $f.Severity) {
+                [string]$f.Severity
+            } else { 'Unknown' }
+            $levelLower = $level.ToLowerInvariant()
+            $levelClass = "exec-pill exec-pill-$levelLower"
+            $levelLabel = ConvertTo-SafeHtml -Text $level
+            $remediation = ''
+            if ($f.PSObject.Properties['RemediationGuidance'] -and $f.RemediationGuidance) {
+                $rg = $f.RemediationGuidance
+                if ($rg -is [string]) {
+                    $remediation = $rg
+                } elseif ($rg.PSObject.Properties['Summary'] -and $rg.Summary) {
+                    $remediation = [string]$rg.Summary
+                } elseif ($rg.PSObject.Properties['Description'] -and $rg.Description) {
+                    $remediation = [string]$rg.Description
+                }
+            }
+            if ([string]::IsNullOrWhiteSpace($remediation) -and $f.PSObject.Properties['Remediation']) {
+                $remediation = [string]$f.Remediation
+            }
+            $remediationHtml = if ($remediation) {
+                "<p class=`"exec-card-remediation`">$([System.Web.HttpUtility]::HtmlEncode($remediation))</p>"
+            } else { '' }
+            @"
+        <article class="exec-top-card">
+            <header class="exec-top-card-head">
+                <span class="$levelClass">$levelLabel</span>
+                <span class="exec-card-risk" title="Risk score">Risk $score</span>
+            </header>
+            <p class="exec-card-desc">$desc</p>
+            <p class="exec-card-object"><code>$obj</code></p>
+            $remediationHtml
+        </article>
+"@
         }
-        $topRows += "</ol>"
+        $topCardsBody = $cards -join "`n"
+        $topCards = @"
+    <h3 class="exec-subhead">Top findings <span class="exec-subhead-meta">by risk score</span></h3>
+    <div class="exec-top-cards-grid">
+$topCardsBody
+    </div>
+"@
     }
 
-    $gapLine = ""
+    # Compliance gap accordions.
+    $gapAccordions = ""
     if ($Digest.FrameworkGaps -and $Digest.FrameworkGaps.Count -gt 0) {
-        $parts = $Digest.FrameworkGaps | ForEach-Object { "$($_.Framework) ($($_.ControlsAffected))" }
-        $gapLine = "<p><strong>Compliance gaps:</strong> $($parts -join ' &middot; ')</p>"
+        $accordions = foreach ($g in $Digest.FrameworkGaps) {
+            $fwLabel = ConvertTo-SafeHtml -Text ([string]$g.Framework)
+            $controlsAffected = [int]$g.ControlsAffected
+            $controlsHtml = ''
+            if ($g.PSObject.Properties['Controls'] -and $g.Controls) {
+                # Sort controls by # of findings desc.
+                $sortedKeys = @($g.Controls.Keys | Sort-Object @{ Expression = { -([int](@($g.Controls[$_]).Count)) } }, { [string]$_ })
+                $topKeys = $sortedKeys | Select-Object -First 12
+                $controlRows = foreach ($key in $topKeys) {
+                    $findings = @($g.Controls[$key])
+                    $ctrl = ConvertTo-SafeHtml -Text ([string]$key)
+                    $count = $findings.Count
+                    # Sort findings by risk desc, take top 5 to keep the
+                    # digest scannable. Full list is in the Action Queue.
+                    $topFindings = $findings | Sort-Object @{ Expression = {
+                            if ($_.PSObject.Properties['RiskScore']) { -([int]$_.RiskScore) } else { 0 }
+                        }
+                    } | Select-Object -First 5
+                    $itemRows = foreach ($itm in $topFindings) {
+                        $itmDesc = ConvertTo-SafeHtml -Text ([string]$itm.Description)
+                        $itmObj = ConvertTo-SafeHtml -Text ([string]$itm.Object)
+                        $itmScore = if ($itm.PSObject.Properties['RiskScore']) { [int]$itm.RiskScore } else { 0 }
+                        "<li><span class=`"exec-gap-finding-desc`">$itmDesc</span> <code class=`"exec-gap-finding-obj`">$itmObj</code> <span class=`"exec-gap-finding-risk`">risk $itmScore</span></li>"
+                    }
+                    $overflow = if ($count -gt 5) {
+                        $extra = $count - 5
+                        "<li class=`"exec-gap-finding-overflow`">+ $extra more under this control &mdash; see Action Queue.</li>"
+                    } else { '' }
+                    @"
+                <details class="exec-gap-control">
+                    <summary><code class="exec-gap-control-id">$ctrl</code> <span class="exec-gap-control-count">$count finding(s)</span></summary>
+                    <ul class="exec-gap-finding-list">
+                        $($itemRows -join "`n                        ")
+                        $overflow
+                    </ul>
+                </details>
+"@
+                }
+                $controlsHtml = $controlRows -join "`n"
+                if ($sortedKeys.Count -gt 12) {
+                    $extraCtrls = $sortedKeys.Count - 12
+                    $controlsHtml += "`n<p class=`"exec-gap-overflow`">+ $extraCtrls additional affected control(s) under this framework.</p>"
+                }
+            }
+            @"
+        <details class="exec-gap-framework">
+            <summary>
+                <span class="exec-gap-framework-name">$fwLabel</span>
+                <span class="exec-gap-framework-count">$controlsAffected control(s) affected</span>
+                <span class="exec-gap-caret" aria-hidden="true">&#x25BE;</span>
+            </summary>
+            <div class="exec-gap-framework-body">
+                $controlsHtml
+            </div>
+        </details>
+"@
+        }
+        $gapAccordionsBody = $accordions -join "`n"
+        $gapAccordions = @"
+    <h3 class="exec-subhead">Compliance gaps <span class="exec-subhead-meta">expand a framework to see failing controls</span></h3>
+    <div class="exec-gap-list">
+$gapAccordionsBody
+    </div>
+"@
     }
 
     return @"
 <section class="exec-digest" id="exec-digest">
-    <h2>&#128202; Executive Digest</h2>
-    <p class="verdict-line"><strong>Posture:</strong>$verdictHtml &mdash; $($Digest.TotalFindings) findings total ($($Digest.CriticalCount) critical, $($Digest.HighCount) high, $($Digest.ReviewCount) to review). $($Digest.QuickWinsCount) quick wins available.</p>
+    <header class="exec-digest-head">
+        <h2 class="exec-digest-title">Executive Digest</h2>
+        <p class="exec-verdict-line"><strong>Posture:</strong> $verdictHtml</p>
+    </header>
+    <div class="exec-stat-row">
+        <div class="exec-stat exec-stat-total"><div class="exec-stat-value">$($Digest.TotalFindings)</div><div class="exec-stat-label">Total findings</div></div>
+        <div class="exec-stat exec-stat-critical"><div class="exec-stat-value">$($Digest.CriticalCount)</div><div class="exec-stat-label">Critical</div></div>
+        <div class="exec-stat exec-stat-high"><div class="exec-stat-value">$($Digest.HighCount)</div><div class="exec-stat-label">High</div></div>
+        <div class="exec-stat exec-stat-review"><div class="exec-stat-value">$($Digest.ReviewCount)</div><div class="exec-stat-label">To review</div></div>
+        <div class="exec-stat exec-stat-quickwin"><div class="exec-stat-value">$($Digest.QuickWinsCount)</div><div class="exec-stat-label">Quick wins</div></div>
+    </div>
     $deltaLine
-    $topRows
-    $gapLine
+    $topCards
+    $gapAccordions
 </section>
 "@
 }

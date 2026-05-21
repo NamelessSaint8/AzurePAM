@@ -252,6 +252,37 @@ fn normalize_auth_method(auth_method: String) -> Result<String, String> {
     }
 }
 
+/// Whitelist matches the engine's `-HtmlDeepDiveDomains` ValidateSet
+/// (see Get-HtmlReportPlan in EntraChecks-HTMLReporting.psm1). The
+/// GUI checkboxes feed straight into this list; reject anything we
+/// don't recognise so a future renamed key from the webview surfaces
+/// loudly instead of silently doing nothing.
+const ALLOWED_DEEP_DIVES: &[&str] = &[
+    "SecureScore",
+    "DefenderCompliance",
+    "AzurePolicy",
+    "PurviewCompliance",
+    "Delta",
+    "PrivilegedIdentity",
+];
+
+fn normalize_deep_dives(deep_dives: Vec<String>) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in deep_dives {
+        let d = raw.trim();
+        if d.is_empty() {
+            continue;
+        }
+        if !ALLOWED_DEEP_DIVES.contains(&d) {
+            return Err(format!("Unknown deep-dive report: {d}"));
+        }
+        if !out.iter().any(|x| x == d) {
+            out.push(d.to_string());
+        }
+    }
+    Ok(out)
+}
+
 /// The dedicated Result screen + Open report is 4.6. This step adds
 /// the auth panel + Cancel: the run's `runId` (envelope) and
 /// `output_dir` are recorded in `RunState` so `cancel_run` can drop
@@ -262,6 +293,7 @@ fn run_assessment(
     tenant: String,
     modules: Vec<String>,
     auth_method: String,
+    deep_dives: Vec<String>,
 ) -> Result<(), String> {
     let pwsh = sidecar::discover_pwsh().map_err(|e| e.to_string())?;
     let res_dir = app.path().resource_dir().ok();
@@ -276,6 +308,7 @@ fn run_assessment(
     }
     let modules = normalize_modules(modules)?;
     let auth_method = normalize_auth_method(auth_method)?;
+    let deep_dives = normalize_deep_dives(deep_dives)?;
     let out_dir = sidecar::strip_extended_length_prefix(
         std::env::temp_dir().join("EntraChecks-GUI"),
     );
@@ -292,8 +325,14 @@ fn run_assessment(
     }
 
     std::thread::spawn(move || {
-        let args =
-            sidecar::core_args(&core_s, &tenant, &out_s, &modules, &auth_method);
+        let args = sidecar::core_args(
+            &core_s,
+            &tenant,
+            &out_s,
+            &modules,
+            &auth_method,
+            &deep_dives,
+        );
         let argrefs: Vec<&str> = args.iter().map(String::as_str).collect();
         // Two callbacks: stdout goes through the contract parser
         // (the run.* event stream); stderr bypasses the parser and
@@ -580,6 +619,25 @@ mod tests {
         assert!(normalize_auth_method("Something".into()).is_err());
     }
 
+    #[test]
+    fn normalize_deep_dives_dedups_and_rejects_unknown() {
+        assert_eq!(
+            normalize_deep_dives(vec![
+                "SecureScore".into(),
+                "  DefenderCompliance  ".into(),
+                "SecureScore".into(), // duplicate
+                "".into(),            // ignored
+            ])
+            .unwrap(),
+            vec!["SecureScore", "DefenderCompliance"]
+        );
+        // Empty input is allowed — that's "no deep dives this run".
+        assert_eq!(normalize_deep_dives(vec![]).unwrap(), Vec::<String>::new());
+        // Anything outside the allow-list must fail loudly: silently
+        // dropping a renamed key would make the GUI checkbox a no-op.
+        assert!(normalize_deep_dives(vec!["NotAReport".into()]).is_err());
+    }
+
     /// The automated proof of the 4.4 join: resolve the real core →
     /// spawn it via the 4.2 boundary → run each line through the 4.3
     /// parser. Asserts a coherent run (RunStarted … RunResult) where
@@ -605,6 +663,7 @@ mod tests {
             &out.to_string_lossy(),
             &["Core".to_string()],
             "Skip", // -SkipAuthentication: no tenant needed
+            &[],    // no deep-dive reports for the pipeline test
         );
         let argrefs: Vec<&str> = args.iter().map(String::as_str).collect();
 

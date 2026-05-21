@@ -145,6 +145,20 @@ function setModuleSelection(mode) {
   });
 }
 
+function selectedDeepDives() {
+  if (!els.deepDiveChecks) return [];
+  return els.deepDiveChecks
+    .filter((cb) => cb.checked)
+    .map((cb) => cb.dataset.deepdive);
+}
+
+function setDeepDiveSelection(mode) {
+  if (!els.deepDiveChecks) return;
+  els.deepDiveChecks.forEach((cb) => {
+    cb.checked = mode === "all";
+  });
+}
+
 function synthesizeFailedResult(code, message, remediation) {
   if (runHadResult) return;
   runHadResult = true;
@@ -750,6 +764,7 @@ async function runAssessment() {
   processTail = [];
   const tenant = els.tenant.value.trim();
   const modules = selectedModules();
+  const deepDives = selectedDeepDives();
   const authMethod = els.authMode.value;
   lastRunModules = modules;
   if (!tenant) {
@@ -775,6 +790,7 @@ async function runAssessment() {
       tenant,
       modules,
       authMethod,
+      deepDives,
     });
   } catch (e) {
     els.runStatus.textContent = `Could not start: ${e}`;
@@ -789,6 +805,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     tenant: document.querySelector("#tenant"),
     authMode: document.querySelector("#auth-mode"),
     moduleChecks: Array.from(document.querySelectorAll("[data-module]")),
+    deepDiveChecks: Array.from(document.querySelectorAll("[data-deepdive]")),
     run: document.querySelector("#btn-run"),
     runStatus: document.querySelector("#run-status"),
     phases: document.querySelector("#phases"),
@@ -816,6 +833,14 @@ window.addEventListener("DOMContentLoaded", async () => {
   document
     .querySelector("#btn-mod-core")
     .addEventListener("click", () => setModuleSelection("core"));
+  const ddAllBtn = document.querySelector("#btn-dd-all");
+  if (ddAllBtn) {
+    ddAllBtn.addEventListener("click", () => setDeepDiveSelection("all"));
+  }
+  const ddNoneBtn = document.querySelector("#btn-dd-none");
+  if (ddNoneBtn) {
+    ddNoneBtn.addEventListener("click", () => setDeepDiveSelection("none"));
+  }
 
   try {
     supportedMajor = await invoke("supported_schema_major");
