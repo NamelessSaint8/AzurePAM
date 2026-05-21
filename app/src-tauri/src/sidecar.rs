@@ -458,6 +458,34 @@ pub fn resolve_core_script(resource_dir: Option<&Path>) -> Option<PathBuf> {
         }
     }
     resolve_core_in(env_override.as_deref(), resource_dir, &starts)
+        .map(strip_extended_length_prefix)
+}
+
+/// Strip Windows' `\\?\` long-path namespace prefix from a `PathBuf`
+/// so PowerShell sees a normal `C:\...` path. Tauri's
+/// `app.path().resource_dir()` on Windows returns paths in
+/// `\\?\C:\Users\...\core` form. We pass that to `pwsh -File`,
+/// `$PSScriptRoot` ends up prefixed too, and PowerShell's
+/// `Test-Path` against the FileSystem provider becomes inconsistent
+/// with the prefix — returns `False` for files that genuinely exist.
+/// That made every module branch in `Invoke-ModuleAssessment` silently
+/// no-op (`if (Test-Path $modulePath) { ... }`) and the run completed
+/// with 0 findings in 0 minutes. No-op off-Windows.
+pub fn strip_extended_length_prefix(p: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let s = p.to_string_lossy();
+        // `\\?\UNC\server\share\...` is a separate UNC long-path
+        // form — strip the `\\?\UNC\` and put `\\` back so it remains
+        // a valid UNC path.
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    p
 }
 
 /// Build the `pwsh` argument vector for a headless run. Owned
@@ -1096,6 +1124,35 @@ garbage line without a pipe
             Some(prereqs)
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn strips_extended_length_prefix() {
+        // On Windows this is the active case; the cfg-gated impl
+        // strips both the plain and UNC variants. Off-Windows the
+        // helper is a no-op so the input round-trips.
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                strip_extended_length_prefix(PathBuf::from(r"\\?\C:\Users\admin\AppData\Local\EntraChecks\core")),
+                PathBuf::from(r"C:\Users\admin\AppData\Local\EntraChecks\core")
+            );
+            assert_eq!(
+                strip_extended_length_prefix(PathBuf::from(r"\\?\UNC\server\share\app")),
+                PathBuf::from(r"\\server\share\app")
+            );
+            assert_eq!(
+                strip_extended_length_prefix(PathBuf::from(r"C:\already\clean")),
+                PathBuf::from(r"C:\already\clean")
+            );
+        }
+        // Off-Windows: never strips. Path-string comparison sidesteps
+        // OS-separator differences in the literal.
+        #[cfg(not(windows))]
+        {
+            let input = PathBuf::from("/tmp/foo");
+            assert_eq!(strip_extended_length_prefix(input.clone()), input);
+        }
     }
 
     #[test]

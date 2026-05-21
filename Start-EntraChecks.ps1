@@ -215,8 +215,27 @@ catch {
 #region ==================== CONFIGURATION ====================
 
 $script:Version = "1.0.0"
-$script:ScriptRoot = $PSScriptRoot
-$script:ModulesPath = Join-Path $PSScriptRoot "Modules"
+
+# Defensive: strip Windows' `\\?\` long-path prefix from $PSScriptRoot
+# before anything depends on it. Tauri's resource_dir() on Windows
+# can hand pwsh a `-File \\?\C:\...\core\Invoke-EntraChecksRun.ps1`
+# path; that propagates into $PSScriptRoot and breaks PowerShell's
+# Test-Path against the FileSystem provider — every downstream
+# `if (Test-Path $modulePath) { ... }` returns False even when the
+# file genuinely exists, and modules silently no-op. The desktop
+# shell already strips the prefix on the Rust side; this is the
+# matching engine-side guard for any path PowerShell still infers
+# from $PSScriptRoot itself.
+$script:ScriptRoot = if ($PSScriptRoot -and $PSScriptRoot.StartsWith('\\?\UNC\')) {
+    '\\' + $PSScriptRoot.Substring(8)
+}
+elseif ($PSScriptRoot -and $PSScriptRoot.StartsWith('\\?\')) {
+    $PSScriptRoot.Substring(4)
+}
+else {
+    $PSScriptRoot
+}
+$script:ModulesPath = Join-Path $script:ScriptRoot "Modules"
 
 # Snapshots + Logs live UNDER the caller-supplied $OutputDirectory so
 # they always land somewhere user-writable. Previously they were

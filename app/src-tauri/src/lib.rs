@@ -276,7 +276,9 @@ fn run_assessment(
     }
     let modules = normalize_modules(modules)?;
     let auth_method = normalize_auth_method(auth_method)?;
-    let out_dir = std::env::temp_dir().join("EntraChecks-GUI");
+    let out_dir = sidecar::strip_extended_length_prefix(
+        std::env::temp_dir().join("EntraChecks-GUI"),
+    );
     let core_s = core.to_string_lossy().into_owned();
     let out_s = out_dir.to_string_lossy().into_owned();
 
