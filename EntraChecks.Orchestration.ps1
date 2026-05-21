@@ -682,6 +682,29 @@ function Invoke-ModuleAssessment {
     $totalModules = $SelectedModules.Count
     $currentModule = 0
 
+    # Path-resolution diagnostic: every module branch is guarded by
+    # `if (Test-Path $modulePath) { ... }` with a fall-through that
+    # *still* prints `[OK] Complete`. If `$script:ScriptRoot` doesn't
+    # match where the files actually got bundled in the packaged app,
+    # every Test-Path returns false, every module silently no-ops,
+    # and the run "Succeeds" with 0 findings in 0.0 minutes — exactly
+    # the symptom seen on the live GUI run.
+    Write-Host ("`n[diag] script-root: " + $script:ScriptRoot) -ForegroundColor DarkGray
+    Write-Host ("[diag] modules-path: " + $script:ModulesPath) -ForegroundColor DarkGray
+    $diagCorePath = Join-Path (Join-Path $script:ScriptRoot 'Scripts') 'Invoke-EntraChecks.ps1'
+    Write-Host ("[diag] Scripts/Invoke-EntraChecks.ps1 exists? " + (Test-Path $diagCorePath) + " (" + $diagCorePath + ")") -ForegroundColor DarkGray
+    foreach ($probeModuleName in @(
+            'EntraChecks-IdentityProtection.psm1',
+            'EntraChecks-Devices.psm1',
+            'EntraChecks-SecureScore.psm1',
+            'EntraChecks-DefenderCompliance.psm1',
+            'EntraChecks-AzurePolicy.psm1',
+            'EntraChecks-PurviewCompliance.psm1')) {
+        $probePath = Join-Path $script:ModulesPath $probeModuleName
+        Write-Host ("[diag] " + $probeModuleName + " exists? " + (Test-Path $probePath)) -ForegroundColor DarkGray
+    }
+    [Console]::Out.Flush()
+
     # Validate prerequisites for selected modules
     Write-Host "`n[+] Validating prerequisites..." -ForegroundColor Cyan
     $prerequisitesFailed = @()
