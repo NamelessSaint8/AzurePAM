@@ -907,19 +907,25 @@ function Get-CockpitDeepDiveHubSection {
         Each domain (Secure Score, Defender, Azure Policy, Purview, Delta,
         Privileged Identity) gets a card with one of four honest states:
 
-          1. Generated         — the deep-dive HTML was produced this run.
-          2. Skipped (no data) — the user requested it but the underlying
-             data source returned nothing (missing license or RBAC).
-          3. Skipped (not selected) — the user did not tick the box in
-             the GUI's deep-dive picker (CLI: omit -HtmlDeepDiveDomains).
-          4. Pending (legacy) — the call site didn't tell us either way.
-             Falls through to the "include this card next run" hint.
+          1. Generated   — the deep-dive HTML was produced this run.
+          2. Skipped (no data)       — the user requested it but the
+             underlying assessment returned no rows.
+          3. Skipped (not collected) — the matching module wasn't run
+             this assessment, so there's nothing to report on.
+          4. Skipped (not requested) — the user did not tick the box.
+
+        The CockpitDir parameter (parent directory of the cockpit HTML
+        file) is required so the "Open deep dive" link can render the
+        correct relative href: deep-dive files live in a `DeepDives/`
+        sub-folder alongside the cockpit, not next to it, so a plain
+        filename href returns ERR_FILE_NOT_FOUND in the browser.
     #>
     [OutputType([string])]
     param(
         [hashtable]$DeepDives = @{},
         [string[]]$RequestedDeepDives = @(),
-        [hashtable]$Availability = @{}
+        [hashtable]$Availability = @{},
+        [string]$CockpitDir = ''
     )
 
     $domains = @(
@@ -934,45 +940,60 @@ function Get-CockpitDeepDiveHubSection {
     $cardsHtml = ($domains | ForEach-Object {
             $key = $_.Key
             $name = ConvertTo-SafeHtml -Text $_.Name
-            $hint = ConvertTo-SafeHtml -Text "Tick `"$($_.Name)`" in the GUI's deep-dive picker, or pass -HtmlDeepDiveDomains $key on the CLI."
+            $shortName = $_.Name
+            $hint = ConvertTo-SafeHtml -Text ("To include the $shortName report in your next run, tick its box in the Deep-dive reports section before clicking Run assessment.")
 
             $wasRequested = $RequestedDeepDives -contains $key
             $hasArtifact = ($DeepDives.ContainsKey($key) -and $DeepDives[$key])
             $hasData = if ($Availability.ContainsKey($key)) { [bool]$Availability[$key] } else { $true }
 
             if ($hasArtifact) {
-                # Relative path to the deep-dive HTML file alongside the
-                # cockpit. New-SafeExternalLink rejects URLs without an
-                # http/https scheme (which is correct for finding-derived
-                # URLs), so render a plain <a> here with attribute-encoded
-                # filename. Split-Path -Leaf guarantees no traversal.
-                $rel = Split-Path -Leaf $DeepDives[$key]
+                # Build a relative href the cockpit's <a> can actually
+                # follow. Deep-dive files live in `<reportDir>/DeepDives/`
+                # while the cockpit sits at `<reportDir>/<cockpit>.html`,
+                # so the link must include the parent folder. Try the
+                # platform's relative-path helper when CockpitDir is known;
+                # fall back to "DeepDives/<filename>" otherwise (matches
+                # the orchestrator's actual layout for Cockpit mode).
+                $deepPath = [string]$DeepDives[$key]
+                $rel = ''
+                if ($CockpitDir) {
+                    try {
+                        $rel = [System.IO.Path]::GetRelativePath($CockpitDir, $deepPath)
+                    } catch { $rel = '' }
+                }
+                if (-not $rel -or $rel -eq $deepPath) {
+                    $parent = Split-Path -Leaf (Split-Path -Parent $deepPath)
+                    $leaf = Split-Path -Leaf $deepPath
+                    $rel = if ($parent) { "$parent/$leaf" } else { $leaf }
+                }
+                # Normalize backslashes for cross-platform href correctness.
+                $rel = $rel -replace '\\', '/'
                 $relAttr = ConvertTo-SafeHtmlAttribute -Text $rel
                 $linkHtml = "<a href=`"$relAttr`">Open deep dive</a>"
                 "<div class=`"deep-dive-card generated`"><h4>$name</h4><p class=`"status`">Generated</p><p>$linkHtml</p></div>"
             }
             elseif ($wasRequested -and -not $hasData) {
-                # Requested but data source returned nothing — license,
-                # RBAC, or the module wasn't selected for collection.
-                "<div class=`"deep-dive-card no-data`"><h4>$name</h4><p class=`"status`">Skipped &mdash; no data</p><p class=`"hint`">The underlying data source returned no rows. Most common cause is missing license/RBAC for this surface; check the Source Posture panel above.</p></div>"
+                "<div class=`"deep-dive-card no-data`"><h4>$name</h4><p class=`"status`">Skipped &mdash; no data</p><p class=`"hint`">The assessment ran but didn't return any data for this surface. The most common causes are a missing Microsoft license (e.g. Defender for Cloud, Microsoft Purview, Azure AD P2) or a role on the signed-in account that lacks read access. See the Source Posture panel above for what was collected.</p></div>"
             }
             elseif ($wasRequested) {
                 # Requested, data was there, but no artifact was produced —
-                # unusual, but render an honest "expected but missing" state.
-                "<div class=`"deep-dive-card no-data`"><h4>$name</h4><p class=`"status`">Skipped &mdash; not produced</p><p class=`"hint`">Reporter did not emit an HTML file for this domain on this run. See the engine log for warnings.</p></div>"
+                # rare, e.g. reporter threw partway through. Engine log
+                # has the underlying error.
+                "<div class=`"deep-dive-card no-data`"><h4>$name</h4><p class=`"status`">Skipped &mdash; report not produced</p><p class=`"hint`">The data was collected but the deep-dive report didn't write out successfully. Re-run the assessment to retry; if it persists, capture the log and open an issue.</p></div>"
             }
             elseif (-not $hasData) {
-                "<div class=`"deep-dive-card not-available`"><h4>$name</h4><p class=`"status`">Skipped &mdash; no data available</p><p class=`"hint`">The data source for this report was not collected on this run.</p></div>"
+                "<div class=`"deep-dive-card not-available`"><h4>$name</h4><p class=`"status`">Skipped &mdash; not collected</p><p class=`"hint`">The matching module wasn't selected for this assessment, so there's nothing to report on. Tick its module checkbox before re-running.</p></div>"
             }
             else {
-                "<div class=`"deep-dive-card not-selected`"><h4>$name</h4><p class=`"status`">Skipped &mdash; not selected</p><p class=`"hint`">$hint</p></div>"
+                "<div class=`"deep-dive-card not-selected`"><h4>$name</h4><p class=`"status`">Skipped &mdash; not requested</p><p class=`"hint`">$hint</p></div>"
             }
         }) -join "`n"
 
     return @"
 <section class="cockpit-section" id="deep-dive-hub">
     <h2 class="cockpit-section-title">Deep Dive Hub</h2>
-    <p class="cockpit-section-lede">Per-domain HTML reports rendered alongside the cockpit. Cards below report whether the deep-dive was generated, skipped because the data wasn't available, or skipped because the user didn't request it.</p>
+    <p class="cockpit-section-lede">Detailed per-domain reports that accompany this cockpit. Each card below shows whether the report was generated, skipped because the data source returned nothing (e.g. missing license or read role), skipped because the module wasn't selected, or skipped because the box wasn't ticked when the run was launched.</p>
     <div class="deep-dive-grid">
 $cardsHtml
     </div>
@@ -2124,7 +2145,8 @@ function New-EntraChecksAnalystHtmlReport {
         Delta = [bool]$PreviousAssessment
         PrivilegedIdentity = [bool]$PrivilegedIdentityRoster
     }
-    $deepDiveHtml = Get-CockpitDeepDiveHubSection -DeepDives $DeepDives -RequestedDeepDives $RequestedDeepDives -Availability $availability
+    $cockpitDir = Split-Path -Parent $OutputPath
+    $deepDiveHtml = Get-CockpitDeepDiveHubSection -DeepDives $DeepDives -RequestedDeepDives $RequestedDeepDives -Availability $availability -CockpitDir $cockpitDir
     $fullFindingsHtml = Get-CockpitFullFindingsSection -EnhancedFindings $enhancedFindings -MaxInitialRows $MaxInitialRows
     $cockpitJs = Get-CockpitJavaScript
 
@@ -2295,7 +2317,7 @@ function Get-CockpitCss {
 .cockpit-row { background: #fff; border: 1px solid #e5e7eb; border-radius: 4px; transition: box-shadow 0.15s; }
 .cockpit-row.filtered-out, .cockpit-row.paginated-out { display: none; }
 .cockpit-row:hover { box-shadow: 0 2px 4px rgba(0,0,0,0.06); }
-.cockpit-row-header { display: grid; grid-template-columns: auto auto 1fr 2fr auto auto auto; gap: 10px; align-items: center; padding: 8px 12px; cursor: pointer; user-select: none; font-size: 0.9em; width: 100%; background: transparent; border: 0; text-align: left; font-family: inherit; color: inherit; }
+.cockpit-row-header { display: grid; grid-template-columns: auto auto minmax(160px, 1.4fr) minmax(240px, 2.6fr) auto auto auto; gap: 10px; align-items: center; padding: 8px 12px; cursor: pointer; user-select: none; font-size: 0.9em; width: 100%; background: transparent; border: 0; text-align: left; font-family: inherit; color: inherit; }
 .cockpit-row-header:hover { background: #f7f9fb; }
 .cockpit-row-header:focus { outline: none; }
 .cockpit-row-header:focus-visible { outline: 3px solid #0078d4; outline-offset: -3px; box-shadow: inset 0 0 0 1px #fff; }
@@ -2312,8 +2334,8 @@ function Get-CockpitCss {
 .cockpit-badge.risk-low { background: #95c19e; color: #1f3d22; }
 .cockpit-badge.risk-info { background: #d6deea; color: #283b50; }
 .cockpit-badge.risk-review { background: #5c2d91; color: #fff; }
-.cockpit-cell-object { font-family: monospace; font-size: 0.88em; color: #333; word-break: break-all; }
-.cockpit-cell-desc { color: #444; }
+.cockpit-cell-object { font-family: monospace; font-size: 0.88em; color: #333; overflow-wrap: anywhere; min-width: 0; }
+.cockpit-cell-desc { color: #444; overflow-wrap: anywhere; min-width: 0; }
 .cockpit-cell-owner, .cockpit-cell-disposition, .cockpit-cell-source, .cockpit-cell-state, .cockpit-cell-score { color: #555; font-size: 0.85em; }
 .cockpit-caret { color: #888; font-size: 0.85em; transition: transform 0.15s; }
 .cockpit-row-body { display: none; padding: 14px 18px; background: #fafbfc; border-top: 1px solid #e5e7eb; }

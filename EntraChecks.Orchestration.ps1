@@ -1826,11 +1826,20 @@ function Export-AssessmentResult {
         if ($new) { $generatedDeepDives['SecureScore'] = $new.FullName }
     }
 
+    # IMPORTANT: pass the orchestrator's data explicitly via the
+    # -ComplianceData / -PolicyData / -PurviewData parameters. The
+    # `Import-Module ... -Force` line above re-imports the module and
+    # wipes its own script-scope `$script:XData` variable; without an
+    # explicit arg, the Export function would fall back to that wiped
+    # value and bail with "No <X> data available." SecureScore avoids
+    # this because Export-SecureScoreReport re-fetches via Get-SecureScore
+    # itself; Defender / Azure Policy / Purview don't, so we must hand
+    # them the data the assessment phase already collected.
     if ('DefenderCompliance' -in $htmlPlan.GenerateDomainReports) {
         $defModule = Join-Path $script:ModulesPath "EntraChecks-DefenderCompliance.psm1"
         Import-Module $defModule -Force
         $beforeFiles = @(Get-ChildItem -Path $deepDivesDir -Filter 'DefenderCompliance-Report-*.html' -ErrorAction SilentlyContinue)
-        Export-DefenderComplianceReport -OutputDirectory $deepDivesDir -TenantName $TenantName | Out-Null
+        Export-DefenderComplianceReport -ComplianceData $script:DefenderComplianceData -OutputDirectory $deepDivesDir -TenantName $TenantName | Out-Null
         $afterFiles = @(Get-ChildItem -Path $deepDivesDir -Filter 'DefenderCompliance-Report-*.html' -ErrorAction SilentlyContinue)
         $new = ($afterFiles | Where-Object { $_.FullName -notin ($beforeFiles | ForEach-Object FullName) } | Sort-Object LastWriteTime -Descending | Select-Object -First 1)
         if ($new) { $generatedDeepDives['DefenderCompliance'] = $new.FullName }
@@ -1840,7 +1849,7 @@ function Export-AssessmentResult {
         $apModule = Join-Path $script:ModulesPath "EntraChecks-AzurePolicy.psm1"
         Import-Module $apModule -Force
         $beforeFiles = @(Get-ChildItem -Path $deepDivesDir -Filter 'AzurePolicy-Report-*.html' -ErrorAction SilentlyContinue)
-        Export-AzurePolicyReport -OutputDirectory $deepDivesDir -TenantName $TenantName | Out-Null
+        Export-AzurePolicyReport -PolicyData $script:AzurePolicyData -OutputDirectory $deepDivesDir -TenantName $TenantName | Out-Null
         $afterFiles = @(Get-ChildItem -Path $deepDivesDir -Filter 'AzurePolicy-Report-*.html' -ErrorAction SilentlyContinue)
         $new = ($afterFiles | Where-Object { $_.FullName -notin ($beforeFiles | ForEach-Object FullName) } | Sort-Object LastWriteTime -Descending | Select-Object -First 1)
         if ($new) { $generatedDeepDives['AzurePolicy'] = $new.FullName }
@@ -1850,7 +1859,7 @@ function Export-AssessmentResult {
         $pvModule = Join-Path $script:ModulesPath "EntraChecks-PurviewCompliance.psm1"
         Import-Module $pvModule -Force
         $beforeFiles = @(Get-ChildItem -Path $deepDivesDir -Filter 'PurviewCompliance-Report-*.html' -ErrorAction SilentlyContinue)
-        Export-PurviewComplianceReport -OutputDirectory $deepDivesDir -TenantName $TenantName | Out-Null
+        Export-PurviewComplianceReport -PurviewData $script:PurviewComplianceData -OutputDirectory $deepDivesDir -TenantName $TenantName | Out-Null
         $afterFiles = @(Get-ChildItem -Path $deepDivesDir -Filter 'PurviewCompliance-Report-*.html' -ErrorAction SilentlyContinue)
         $new = ($afterFiles | Where-Object { $_.FullName -notin ($beforeFiles | ForEach-Object FullName) } | Sort-Object LastWriteTime -Descending | Select-Object -First 1)
         if ($new) { $generatedDeepDives['PurviewCompliance'] = $new.FullName }

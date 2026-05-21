@@ -863,9 +863,9 @@ window.addEventListener("DOMContentLoaded", async () => {
       synthesizeFailedResult(
         code === 0 ? "process.noResult" : "process.exit",
         code === 0
-          ? "The PowerShell process exited without emitting a run.result event."
-          : `The PowerShell process exited before the assessment produced a result (exit code ${e.payload}).`,
-        "Review the Log output above, then re-run after fixing the underlying PowerShell or authentication error."
+          ? "The assessment finished without producing a final result. The most likely cause is a PowerShell or sign-in error early in the run."
+          : `The assessment ended early and didn't produce a result (exit code ${e.payload}).`,
+        "Open the Log section below to see what failed, fix the underlying problem (typically a sign-in or missing-module error), then run the assessment again."
       );
     }
     setRunning(false);
