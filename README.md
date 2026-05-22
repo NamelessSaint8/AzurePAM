@@ -72,6 +72,31 @@ The desktop app is a thin Tauri shell that spawns the same PowerShell engine
 the CLI uses, so anything you can do in the CLI you can do from the GUI
 (module selection, deep-dive opt-in, auth-method choice, etc.).
 
+### Installing via a package manager
+
+If you prefer not to download the `.exe` by hand, EntraChecks is listed in:
+
+**Scoop**
+
+```powershell
+# Add this repo as a Scoop bucket (one-time setup)
+scoop bucket add entrachecks https://github.com/f8l124/AzurePAM
+
+# Then install (needs an elevated shell — the NSIS installer writes to
+# Program Files)
+scoop install entrachecks
+```
+
+**WinGet** (after the first manifest is accepted into `microsoft/winget-pkgs` — see [Packaging](#packaging) for status)
+
+```powershell
+winget install Stells.EntraChecks
+```
+
+Both channels pull the same NSIS installer that lives on the GitHub
+release; the package manager just handles the download + invocation +
+later upgrades for you.
+
 ---
 
 ## PowerShell CLI Quick Start (5 Minutes)
@@ -501,6 +526,33 @@ Azure AD:
     -ClientCertificateThumbprint "your-cert-thumbprint" `
     -Modules All -SaveSnapshot
 ```
+
+---
+
+## Packaging
+
+EntraChecks ships as:
+
+- **GitHub Releases** (canonical) — `EntraChecks_<version>_x64-setup.exe`
+  is attached to each release for direct download.
+- **Scoop bucket** — this repo doubles as a Scoop bucket via
+  [`bucket/entrachecks.json`](bucket/entrachecks.json). On every published
+  release a [`scoop-update.yml`](.github/workflows/scoop-update.yml)
+  workflow recomputes the SHA256 and bumps the manifest in-place.
+- **WinGet** — submission pipeline lives in
+  [`winget-submit.yml`](.github/workflows/winget-submit.yml). It uses
+  [`vedantmgoyal9/winget-releaser`](https://github.com/vedantmgoyal9/winget-releaser)
+  to open a PR against `microsoft/winget-pkgs` whenever a release is
+  published. The workflow is a no-op until the `WINGET_TOKEN` repo
+  secret is set (a fine-grained PAT with `Contents: write` and
+  `Pull requests: write` on the user who'll fork `microsoft/winget-pkgs`).
+  The very first submission gets human-reviewed by WinGet maintainers
+  (1–3 days); after that, future releases auto-submit under the
+  `Stells.EntraChecks` identifier.
+
+Microsoft Store packaging is deferred; the Tauri shell could be repackaged
+as MSIX if the free Microsoft signing route ever becomes worth the effort.
+Chocolatey isn't currently planned — happy to take a contribution.
 
 ---
 

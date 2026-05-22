@@ -1,0 +1,96 @@
+# Bump bucket/entrachecks.json on every published release.
+#
+# Fires on `release: published` (i.e. the moment you click Publish on the
+# GitHub release page). Pulls the new .exe asset, recomputes its SHA256,
+# writes the new version + hash into the Scoop manifest, and commits the
+# result back to main. Users who added this repo as a Scoop bucket will
+# then see the new version on their next `scoop update`.
+
+name: Scoop bucket update
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to bump to (e.g. v1.7.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Need full history so the commit + push at the end works.
+          fetch-depth: 0
+
+      - name: Resolve target tag + version
+        id: tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${{ github.event.release.tag_name }}"
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=$TAG"     >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Bumping Scoop manifest to $TAG (version $VERSION)"
+
+      - name: Download installer + compute SHA256
+        id: hash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/installer
+          gh release download "${{ steps.tag.outputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --pattern "*.exe" \
+            --dir /tmp/installer
+          INSTALLER="/tmp/installer/EntraChecks_${{ steps.tag.outputs.version }}_x64-setup.exe"
+          if [ ! -f "$INSTALLER" ]; then
+            echo "::error::Expected installer not found at $INSTALLER"
+            ls -la /tmp/installer
+            exit 1
+          fi
+          HASH=$(sha256sum "$INSTALLER" | awk '{print $1}')
+          echo "hash=$HASH" >> "$GITHUB_OUTPUT"
+          echo "SHA256: $HASH"
+
+      - name: Update Scoop manifest in-place
+        env:
+          VERSION: ${{ steps.tag.outputs.version }}
+          HASH: ${{ steps.hash.outputs.hash }}
+        run: |
+          set -euo pipefail
+          # Use jq for safe JSON editing — no regex traps, no formatting drift.
+          jq --arg ver "$VERSION" --arg hash "$HASH" \
+             --arg url "https://github.com/${{ github.repository }}/releases/download/v${VERSION}/EntraChecks_${VERSION}_x64-setup.exe" '
+                .version = $ver
+                | .architecture["64bit"].url = $url
+                | .architecture["64bit"].hash = $hash
+             ' bucket/entrachecks.json > bucket/entrachecks.json.tmp
+          mv bucket/entrachecks.json.tmp bucket/entrachecks.json
+          echo "--- new manifest ---"
+          cat bucket/entrachecks.json
+
+      - name: Commit + push if changed
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet bucket/entrachecks.json; then
+            echo "Manifest already at ${{ steps.tag.outputs.version }} — nothing to commit."
+            exit 0
+          fi
+          git add bucket/entrachecks.json
+          git commit -m "Scoop: bump to ${{ steps.tag.outputs.tag }}"
+          git push origin HEAD:main
