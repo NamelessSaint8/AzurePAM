@@ -583,8 +583,18 @@ mod tests {
 
     #[test]
     fn app_version_matches_cargo_manifest() {
-        assert_eq!(app_version(), "0.1.0");
+        // Don't hardcode the version — that turns every release bump
+        // into a CI break. Assert the function returns the same value
+        // CARGO_PKG_VERSION resolves to (which it does, by construction
+        // in app_version() above) and that the value is a non-empty
+        // dot-separated string. That's what consumers actually rely on.
+        assert_eq!(app_version(), env!("CARGO_PKG_VERSION"));
         assert!(!app_version().is_empty());
+        assert!(
+            app_version().contains('.'),
+            "app_version() must be a dotted version, got {:?}",
+            app_version()
+        );
     }
 
     #[test]
