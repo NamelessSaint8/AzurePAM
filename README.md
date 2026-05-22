@@ -1,11 +1,20 @@
 # EntraChecks — Microsoft Cloud Compliance Assessment Toolkit
 
-**Version 1.6.0** · PowerShell 5.1+ · Windows 10/11 or Server 2016+
+**Version 1.7.0** · Windows desktop app + PowerShell 5.1+ CLI · Windows 10/11 or Server 2016+
 **Author:** David Stells
 
 EntraChecks runs read-only security and compliance checks across your Microsoft 365
 and Azure environment, then produces actionable HTML/CSV/JSON/Excel reports you can
 hand to auditors, leadership, or your remediation team.
+
+## Two ways to run
+
+| | Use this if you want… |
+|---|---|
+| **🖥️ Desktop app** (new in 1.7.0) | A point-and-click GUI. Module / deep-dive selection via checkboxes, live streaming output, auto-install of missing PowerShell modules. Best for most users. |
+| **⌨️ PowerShell CLI / TUI** | Headless / scheduled / CI use, or the menu-driven console. The CLI is unchanged from 1.6.0 and remains fully supported. |
+
+Both surfaces drive the same assessment engine and produce the same reports.
 
 ---
 
@@ -29,7 +38,8 @@ hand to auditors, leadership, or your remediation team.
 
 | Mode | What runs | When to use |
 |---|---|---|
-| `-Mode Interactive` (default) | Menu-driven | Ad-hoc exploration |
+| **Desktop app** | GUI-driven; full module + deep-dive choice via checkboxes | Most users; live streaming output |
+| `-Mode Interactive` (default CLI) | Menu-driven console | Ad-hoc exploration from a shell |
 | `-Mode Quick` | All cloud modules | Fast full cloud assessment |
 | `-Mode Scheduled` | All cloud modules, silent | CI/CD, scheduled tasks |
 | `-Mode Hybrid` | Cloud + on-prem AD + cross-plane correlation | Hybrid-identity environments; see [docs/Hybrid-Analysis-Guide.md](docs/Hybrid-Analysis-Guide.md) |
@@ -38,7 +48,33 @@ hand to auditors, leadership, or your remediation team.
 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/K3K71U9F55)
 
-## Quick Start (5 Minutes)
+## Desktop App — Quick Start (Windows)
+
+1. Download **`EntraChecks_<version>_x64-setup.exe`** from the
+   [latest release](https://github.com/f8l124/AzurePAM/releases/latest).
+2. Run the installer. The first time you launch it Windows SmartScreen will
+   show **"Windows protected your PC"** — this is expected for unsigned
+   installers from small projects. Click **More info → Run anyway**.
+   (The installer is built unsigned by design; see
+   [Code signing](#code-signing-smartscreen-warning) below for the rationale
+   and how to flip CI to signed if you ever add a code-signing cert.)
+3. Launch EntraChecks from the Start menu. On first run it'll check for the
+   PowerShell modules it needs (Microsoft.Graph, Az.\*, ImportExcel) and
+   offer to install anything missing — one click, no shell required.
+4. Enter your tenant, pick an auth method (device code, browser sign-in, or
+   "use existing session"), tick which modules and deep-dives to run, and
+   click **Run assessment**.
+5. Output streams live in the log pane. When the run finishes, the **Result**
+   card shows finding counts plus direct **Open cockpit-html** / **Open json**
+   buttons pointing at the generated reports under your temp folder.
+
+The desktop app is a thin Tauri shell that spawns the same PowerShell engine
+the CLI uses, so anything you can do in the CLI you can do from the GUI
+(module selection, deep-dive opt-in, auth-method choice, etc.).
+
+---
+
+## PowerShell CLI Quick Start (5 Minutes)
 
 ### Step 1 — Install Prerequisites
 
@@ -468,16 +504,44 @@ Azure AD:
 
 ---
 
+## Code signing (SmartScreen warning)
+
+The v1.7.0 Windows installer is **unsigned by design** — purchased code-signing
+certificates run $200–$500+/year and EntraChecks is a free tool. On first
+install Windows SmartScreen will show "Windows protected your PC"; click
+**More info → Run anyway** and you're through. The warning gradually fades as
+the installer's download reputation builds with Microsoft.
+
+If you ever want signed builds, the CI is already wired for it:
+
+- Add a `SIGN_CERT_THUMBPRINT` repository secret.
+- The next push to `main` (or a `v*` tag) will produce a signed NSIS installer
+  with zero code changes required.
+
+Realistic free paths to a real cert: [SignPath
+Foundation](https://signpath.org/) (free OV-equivalent for established
+open-source projects — application process), or [Azure Trusted
+Signing](https://learn.microsoft.com/en-us/azure/trusted-signing/overview)
+(~$120/yr, requires verified individual or D&B-registered organisation).
+
+See [docs/Release-Signing-Guide.md](docs/Release-Signing-Guide.md) for the
+full signing pipeline details.
+
+---
+
 ## Documentation
 
 For detailed documentation, see the `docs/` folder:
 
 - [Getting Started](docs/GETTING-STARTED.md) — Beginner's guide
 - [User Guide](docs/USER-GUIDE.md) — Complete reference
+- [Cockpit Report Guide](docs/Cockpit-Report-Guide.md) — Walks through the analyst cockpit (sections, filters, accordions, deep-dive hub states)
+- [Finding Schema Guide](docs/Finding-Schema-Guide.md) — v2 finding schema, FindingId derivation, ControlMappings / Evidence shape
 - [SOC 2 Guide](docs/SOC2-Guide.md) — TSC coverage, redaction, evidence bundle, Type 2 period coverage
 - [Active Directory Guide](docs/ActiveDirectory-Guide.md) — on-prem AD checks, permission model, all 33 checks with framework mappings
 - [Hybrid Analysis Guide](docs/Hybrid-Analysis-Guide.md) — cloud + on-prem correlation, Confidence flags, report layout
 - [Configuration Guide](docs/Configuration-Guide.md) — Config file reference
+- [Release Signing Guide](docs/Release-Signing-Guide.md) — Signing the desktop installer (when you eventually have a cert)
 - [Troubleshooting](docs/TROUBLESHOOTING.md) — Extended problem solving
 - [API Reference](docs/API-REFERENCE.md) — Function reference
 - [Code Quality Guide](docs/CodeQuality-Guide.md) — Quality standards
