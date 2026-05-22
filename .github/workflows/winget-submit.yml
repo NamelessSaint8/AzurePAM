@@ -1,22 +1,22 @@
 # Submit a WinGet manifest PR to microsoft/winget-pkgs on every release.
 #
 # Fires on `release: published` (the moment you click Publish on a GitHub
-# release). The vedantmgoyal9/winget-releaser action runs wingetcreate,
-# pulls the installer asset off the release, computes its SHA256, builds
-# the three required YAML manifests (Stells.EntraChecks.installer.yaml,
+# release). Uses Microsoft's own `wingetcreate` CLI directly so it handles
+# both first-time submissions (`new`) and subsequent updates (`update`)
+# without needing a separate workflow per case. Builds the three required
+# YAML manifests (Stells.EntraChecks.installer.yaml,
 # Stells.EntraChecks.locale.en-US.yaml, Stells.EntraChecks.yaml), forks
 # microsoft/winget-pkgs into the account behind WINGET_TOKEN, pushes a
 # branch, and opens a PR against microsoft/winget-pkgs.
 #
-# Setup needed once: create a repo secret `WINGET_TOKEN` containing a
-# fine-grained GitHub PAT with `Contents: write` and `Pull requests:
-# write` on a user (or org) account that's been authorised to fork
-# microsoft/winget-pkgs. Without that secret the job is a no-op (it logs
-# a friendly explanation and exits). See README "Code signing
-# (SmartScreen warning)" / "Packaging" for the wider context.
+# Setup needed once: create a repo secret WINGET_TOKEN containing a
+# classic GitHub PAT with the `public_repo` scope (on a user account
+# that's authorised to fork microsoft/winget-pkgs - any GitHub user is).
+# Without that secret the job is a no-op (logs a friendly explanation
+# and exits). See README "Packaging" for the wider context.
 #
 # The very first submission gets human review by the WinGet maintainers
-# (typically 1-3 days). After it's merged, future tag pushes auto-submit
+# (typically 1-3 days). After that's merged, future tag pushes auto-submit
 # updates against the established Stells.EntraChecks identifier.
 
 name: WinGet submission
@@ -43,23 +43,78 @@ jobs:
         run: |
           if ([string]::IsNullOrWhiteSpace($env:TOKEN)) {
             Write-Host "::warning::WINGET_TOKEN secret is not set; skipping submission."
-            Write-Host "To enable: create a fine-grained PAT (Contents: write + Pull requests: write)"
-            Write-Host "and add it as a repo secret named WINGET_TOKEN."
+            Write-Host "To enable: create a classic GitHub PAT with the 'public_repo'"
+            Write-Host "scope and add it as a repo secret named WINGET_TOKEN."
             "submit=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           } else {
             "submit=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           }
 
-      - name: Submit manifest
+      - name: Resolve target tag + version + installer URL
         if: steps.gate.outputs.submit == 'true'
-        uses: vedantmgoyal9/winget-releaser@main
-        with:
-          identifier: Stells.EntraChecks
-          # The exact installer asset name pattern Tauri's NSIS bundler
-          # produces (matches EntraChecks_<version>_x64-setup.exe on the
-          # release Assets list).
-          installers-regex: 'EntraChecks_.*_x64-setup\.exe$'
-          token: ${{ secrets.WINGET_TOKEN }}
-          # If triggered via workflow_dispatch with an explicit tag,
-          # override the action's default (which reads the release event).
-          release-tag: ${{ inputs.tag || github.event.release.tag_name }}
+        id: target
+        shell: pwsh
+        run: |
+          $tag = if ("${{ inputs.tag }}") { "${{ inputs.tag }}" } else { "${{ github.event.release.tag_name }}" }
+          $version = $tag -replace '^v',''
+          $url = "https://github.com/${{ github.repository }}/releases/download/$tag/EntraChecks_${version}_x64-setup.exe"
+          "tag=$tag"         | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "url=$url"         | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Target: $tag (version $version)"
+          Write-Host "Installer URL: $url"
+
+      - name: Install wingetcreate
+        if: steps.gate.outputs.submit == 'true'
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri https://aka.ms/wingetcreate/latest -OutFile wingetcreate.exe
+          .\wingetcreate.exe --version
+
+      - name: Submit manifest (new for first submission, update otherwise)
+        if: steps.gate.outputs.submit == 'true'
+        shell: pwsh
+        env:
+          TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          $url = "${{ steps.target.outputs.url }}"
+          $version = "${{ steps.target.outputs.version }}"
+          $identifier = "Stells.EntraChecks"
+
+          # Probe microsoft/winget-pkgs to see whether the package already
+          # exists. The folder path is deterministic from the identifier;
+          # a 200 means at least one version is on file, a 404 means we
+          # need 'new'. Avoids the wingetcreate-update-fails-with-cryptic-
+          # error path the previous action ran into.
+          $probeUrl = "https://api.github.com/repos/microsoft/winget-pkgs/contents/manifests/s/Stells/EntraChecks"
+          $exists = $false
+          try {
+              $resp = Invoke-WebRequest -Uri $probeUrl -Method Get -Headers @{ 'User-Agent' = 'winget-submit-action' } -ErrorAction Stop
+              if ($resp.StatusCode -eq 200) { $exists = $true }
+          } catch {
+              if ($_.Exception.Response.StatusCode.value__ -ne 404) {
+                  Write-Host "::warning::Unexpected response probing winget-pkgs: $($_.Exception.Message). Falling back to 'new'."
+              }
+          }
+
+          if ($exists) {
+              Write-Host "Package $identifier already exists in winget-pkgs; using 'update'."
+              .\wingetcreate.exe update $identifier `
+                  --version $version `
+                  --urls $url `
+                  --token $env:TOKEN `
+                  --submit
+          } else {
+              Write-Host "Package $identifier is not yet in winget-pkgs; using 'new'."
+              .\wingetcreate.exe new `
+                  --urls $url `
+                  --version $version `
+                  --package-identifier $identifier `
+                  --token $env:TOKEN `
+                  --submit
+          }
+
+          if ($LASTEXITCODE -ne 0) {
+              Write-Host "::error::wingetcreate exited with code $LASTEXITCODE"
+              exit $LASTEXITCODE
+          }
