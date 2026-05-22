@@ -1,13 +1,20 @@
 # Submit a WinGet manifest PR to microsoft/winget-pkgs on every release.
 #
 # Fires on `release: published` (the moment you click Publish on a GitHub
-# release). Uses Microsoft's own `wingetcreate` CLI directly so it handles
-# both first-time submissions (`new`) and subsequent updates (`update`)
-# without needing a separate workflow per case. Builds the three required
-# YAML manifests (Stells.EntraChecks.installer.yaml,
-# Stells.EntraChecks.locale.en-US.yaml, Stells.EntraChecks.yaml), forks
-# microsoft/winget-pkgs into the account behind WINGET_TOKEN, pushes a
-# branch, and opens a PR against microsoft/winget-pkgs.
+# release). Uses Microsoft's own `wingetcreate` CLI so it handles both the
+# first-time submission and subsequent updates, but the two paths use
+# different commands:
+#
+#  - First-time submission: hand-author the three YAML manifests
+#    (PackageIdentifier metadata, locale strings, installer) and submit
+#    them via `wingetcreate submit`. `wingetcreate new` is not usable
+#    non-interactively for first-time submissions because the package
+#    identifier is an interactive-only prompt.
+#
+#  - Subsequent submissions: `wingetcreate update Stells.EntraChecks
+#    --urls <new installer url> --version <new version> --submit`. The
+#    package identifier is already known, so wingetcreate can pull the
+#    previous manifest from microsoft/winget-pkgs and just bump it.
 #
 # Setup needed once: create a repo secret WINGET_TOKEN containing a
 # classic GitHub PAT with the `public_repo` scope (on a user account
@@ -71,21 +78,15 @@ jobs:
           Invoke-WebRequest -Uri https://aka.ms/wingetcreate/latest -OutFile wingetcreate.exe
           .\wingetcreate.exe --version
 
-      - name: Submit manifest (new for first submission, update otherwise)
+      - name: Detect whether package already exists in winget-pkgs
         if: steps.gate.outputs.submit == 'true'
+        id: probe
         shell: pwsh
-        env:
-          TOKEN: ${{ secrets.WINGET_TOKEN }}
         run: |
-          $url = "${{ steps.target.outputs.url }}"
-          $version = "${{ steps.target.outputs.version }}"
-          $identifier = "Stells.EntraChecks"
-
-          # Probe microsoft/winget-pkgs to see whether the package already
-          # exists. The folder path is deterministic from the identifier;
-          # a 200 means at least one version is on file, a 404 means we
-          # need 'new'. Avoids the wingetcreate-update-fails-with-cryptic-
-          # error path the previous action ran into.
+          # The path is deterministic from the identifier; a 200 means at
+          # least one version of Stells.EntraChecks is on file, a 404
+          # means this is the first-ever submission and we need to
+          # hand-author the manifest set.
           $probeUrl = "https://api.github.com/repos/microsoft/winget-pkgs/contents/manifests/s/Stells/EntraChecks"
           $exists = $false
           try {
@@ -93,28 +94,122 @@ jobs:
               if ($resp.StatusCode -eq 200) { $exists = $true }
           } catch {
               if ($_.Exception.Response.StatusCode.value__ -ne 404) {
-                  Write-Host "::warning::Unexpected response probing winget-pkgs: $($_.Exception.Message). Falling back to 'new'."
+                  Write-Host "::warning::Unexpected response probing winget-pkgs: $($_.Exception.Message). Treating as first-time submission."
               }
           }
+          Write-Host "Package already exists in winget-pkgs: $exists"
+          "exists=$exists" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
-          if ($exists) {
-              Write-Host "Package $identifier already exists in winget-pkgs; using 'update'."
-              .\wingetcreate.exe update $identifier `
-                  --version $version `
-                  --urls $url `
-                  --token $env:TOKEN `
-                  --submit
-          } else {
-              Write-Host "Package $identifier is not yet in winget-pkgs; using 'new'."
-              .\wingetcreate.exe new `
-                  --urls $url `
-                  --version $version `
-                  --package-identifier $identifier `
-                  --token $env:TOKEN `
-                  --submit
+      - name: Update existing manifest (release N+1)
+        if: steps.gate.outputs.submit == 'true' && steps.probe.outputs.exists == 'True'
+        shell: pwsh
+        env:
+          TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          .\wingetcreate.exe update Stells.EntraChecks `
+              --version "${{ steps.target.outputs.version }}" `
+              --urls "${{ steps.target.outputs.url }}" `
+              --token "$env:TOKEN" `
+              --submit
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Author + submit first-time manifest set
+        if: steps.gate.outputs.submit == 'true' && steps.probe.outputs.exists == 'False'
+        shell: pwsh
+        env:
+          TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          $version = "${{ steps.target.outputs.version }}"
+          $url     = "${{ steps.target.outputs.url }}"
+
+          # SHA256 has to be uppercase per WinGet schema and has to match
+          # the installer we're pointing at. Hash it from the live URL so
+          # the workflow is self-consistent (no risk of a stale hash from
+          # a prior copy/paste).
+          Write-Host "Downloading installer to hash..."
+          $tmp = New-TemporaryFile
+          Invoke-WebRequest -Uri $url -OutFile $tmp.FullName
+          $sha = (Get-FileHash -Path $tmp.FullName -Algorithm SHA256).Hash.ToUpper()
+          Remove-Item $tmp.FullName -Force
+          Write-Host "SHA256: $sha"
+
+          $manifestDir = "manifests-out/s/Stells/EntraChecks/$version"
+          New-Item -ItemType Directory -Force -Path $manifestDir | Out-Null
+
+          # Build each manifest as an array of lines so the embedded YAML
+          # doesn't fight the GitHub Actions YAML parser (here-strings need
+          # flush-left content, which breaks the run-block-scalar).
+          $LF = [char]0x0A
+
+          $versionManifest = @(
+              "# yaml-language-server: `$schema=https://aka.ms/winget-manifest.version.1.6.0.schema.json",
+              "PackageIdentifier: Stells.EntraChecks",
+              "PackageVersion: $version",
+              "DefaultLocale: en-US",
+              "ManifestType: version",
+              "ManifestVersion: 1.6.0"
+          ) -join $LF
+          Set-Content -Path "$manifestDir/Stells.EntraChecks.yaml" -Value $versionManifest -Encoding utf8
+
+          $description = "EntraChecks runs read-only security and compliance checks across Microsoft 365 and Azure environments, then produces analyst-friendly HTML, CSV, JSON, and Excel reports. Modules cover Conditional Access, MFA, Identity Protection, Intune, Microsoft Secure Score, Defender for Cloud regulatory compliance, Azure Policy, Microsoft Purview Compliance Manager, on-premises Active Directory, hybrid identity correlation, and SOC 2 readiness. The desktop app is a thin Tauri shell over the same PowerShell engine the CLI uses; all checks are read-only and never modify your tenant."
+          $localeManifest = @(
+              "# yaml-language-server: `$schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json",
+              "PackageIdentifier: Stells.EntraChecks",
+              "PackageVersion: $version",
+              "PackageLocale: en-US",
+              "Publisher: David Stells",
+              "PublisherUrl: https://github.com/f8l124",
+              "PublisherSupportUrl: https://github.com/f8l124/AzurePAM/issues",
+              "Author: David Stells",
+              "PackageName: EntraChecks",
+              "PackageUrl: https://github.com/f8l124/AzurePAM",
+              "License: MIT",
+              "LicenseUrl: https://github.com/f8l124/AzurePAM/blob/main/LICENSE",
+              "Copyright: Copyright (c) David Stells",
+              "ShortDescription: Read-only Microsoft Cloud (Entra/Azure/M365) compliance assessment toolkit.",
+              "Description: $description",
+              "Moniker: entrachecks",
+              "Tags:",
+              "- security",
+              "- compliance",
+              "- azure",
+              "- entra",
+              "- m365",
+              "- microsoft365",
+              "- soc2",
+              "- audit",
+              "- powershell",
+              "ReleaseNotesUrl: https://github.com/f8l124/AzurePAM/releases/tag/v$version",
+              "ManifestType: defaultLocale",
+              "ManifestVersion: 1.6.0"
+          ) -join $LF
+          Set-Content -Path "$manifestDir/Stells.EntraChecks.locale.en-US.yaml" -Value $localeManifest -Encoding utf8
+
+          $installerManifest = @(
+              "# yaml-language-server: `$schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json",
+              "PackageIdentifier: Stells.EntraChecks",
+              "PackageVersion: $version",
+              "InstallerLocale: en-US",
+              "InstallerType: nullsoft",
+              "Scope: machine",
+              "InstallerSwitches:",
+              "  Silent: /S",
+              "  SilentWithProgress: /S",
+              "Installers:",
+              "- Architecture: x64",
+              "  InstallerUrl: $url",
+              "  InstallerSha256: $sha",
+              "ManifestType: installer",
+              "ManifestVersion: 1.6.0"
+          ) -join $LF
+          Set-Content -Path "$manifestDir/Stells.EntraChecks.installer.yaml" -Value $installerManifest -Encoding utf8
+
+          Write-Host "--- manifests ---"
+          Get-ChildItem $manifestDir | ForEach-Object {
+              Write-Host "## $($_.Name) ##"
+              Get-Content $_.FullName | Write-Host
           }
 
-          if ($LASTEXITCODE -ne 0) {
-              Write-Host "::error::wingetcreate exited with code $LASTEXITCODE"
-              exit $LASTEXITCODE
-          }
+          Write-Host "Submitting via wingetcreate..."
+          .\wingetcreate.exe submit $manifestDir --token "$env:TOKEN"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
