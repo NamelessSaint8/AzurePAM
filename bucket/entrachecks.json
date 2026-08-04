@@ -1,53 +1,53 @@
 {
-    "version": "1.7.0",
-    "description": "Read-only Microsoft Cloud (Entra ID / Azure / M365) compliance assessment toolkit. Produces analyst-cockpit HTML, CSV, JSON, and Excel reports across Conditional Access, MFA, Identity Protection, Intune, Secure Score, Defender for Cloud, Azure Policy, Purview, SOC 2 readiness, and on-prem AD.",
-    "homepage": "https://github.com/f8l124/AzurePAM",
-    "license": "MIT",
-    "architecture": {
-        "64bit": {
-            "url": "https://github.com/f8l124/AzurePAM/releases/download/v1.7.0/EntraChecks_1.7.0_x64-setup.exe",
-            "hash": "06b7712bda49f1baac0da34b0ae0f80d23e7c6a531c14f4a3e17a304b3eec134"
-        }
-    },
-    "installer": {
-        "script": [
-            "Stop-Process -Name 'EntraChecks' -Force -ErrorAction SilentlyContinue",
-            "$installer = Join-Path $dir \"EntraChecks_$($manifest.version)_x64-setup.exe\"",
-            "Start-Process -FilePath $installer -ArgumentList '/S' -Wait"
-        ]
-    },
-    "uninstaller": {
-        "script": [
-            "Stop-Process -Name 'EntraChecks' -Force -ErrorAction SilentlyContinue",
-            "$roots = @(",
-            "    'HKLM:SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall',",
-            "    'HKLM:SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall',",
-            "    'HKCU:SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall'",
-            ")",
-            "$entry = $roots | ForEach-Object { Get-ChildItem -Path $_ -ErrorAction SilentlyContinue } |",
-            "    ForEach-Object { Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue } |",
-            "    Where-Object { $_.DisplayName -eq 'EntraChecks' -and $_.UninstallString } |",
-            "    Select-Object -First 1",
-            "if ($entry) {",
-            "    $cmd = $entry.UninstallString.Trim('\"')",
-            "    if (Test-Path $cmd) { Start-Process -FilePath $cmd -ArgumentList '/S' -Wait }",
-            "} else {",
-            "    Write-Host 'EntraChecks uninstall entry not found in registry; nothing to remove.'",
-            "}"
-        ]
-    },
-    "notes": [
-        "The installer needs admin rights (NSIS installs to Program Files). Run Scoop from an elevated shell, or use scoop install --global entrachecks.",
-        "First launch will run a Readiness check and offer to install missing PowerShell modules (Microsoft.Graph, Az.*, ImportExcel)."
-    ],
-    "checkver": {
-        "github": "https://github.com/f8l124/AzurePAM"
-    },
-    "autoupdate": {
-        "architecture": {
-            "64bit": {
-                "url": "https://github.com/f8l124/AzurePAM/releases/download/v$version/EntraChecks_$version_x64-setup.exe"
-            }
-        }
+  "version": "1.8.0",
+  "description": "Read-only Microsoft Cloud (Entra ID / Azure / M365) compliance assessment toolkit. Produces analyst-cockpit HTML, CSV, JSON, and Excel reports across Conditional Access, MFA, Identity Protection, Intune, Secure Score, Defender for Cloud, Azure Policy, Purview, SOC 2 readiness, and on-prem AD.",
+  "homepage": "https://github.com/f8l124/AzurePAM",
+  "license": "MIT",
+  "architecture": {
+    "64bit": {
+      "url": "https://github.com/f8l124/AzurePAM/releases/download/v1.8.0/EntraChecks_1.8.0_x64-setup.exe",
+      "hash": "4cb01e16236a66449d506af709e1ce6cae1cc860e3976b8e538a656ac186464d"
     }
+  },
+  "installer": {
+    "script": [
+      "Stop-Process -Name 'EntraChecks' -Force -ErrorAction SilentlyContinue",
+      "$installer = Join-Path $dir \"EntraChecks_$($manifest.version)_x64-setup.exe\"",
+      "Start-Process -FilePath $installer -ArgumentList '/S' -Wait"
+    ]
+  },
+  "uninstaller": {
+    "script": [
+      "Stop-Process -Name 'EntraChecks' -Force -ErrorAction SilentlyContinue",
+      "$roots = @(",
+      "    'HKLM:SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall',",
+      "    'HKLM:SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall',",
+      "    'HKCU:SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall'",
+      ")",
+      "$entry = $roots | ForEach-Object { Get-ChildItem -Path $_ -ErrorAction SilentlyContinue } |",
+      "    ForEach-Object { Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue } |",
+      "    Where-Object { $_.DisplayName -eq 'EntraChecks' -and $_.UninstallString } |",
+      "    Select-Object -First 1",
+      "if ($entry) {",
+      "    $cmd = $entry.UninstallString.Trim('\"')",
+      "    if (Test-Path $cmd) { Start-Process -FilePath $cmd -ArgumentList '/S' -Wait }",
+      "} else {",
+      "    Write-Host 'EntraChecks uninstall entry not found in registry; nothing to remove.'",
+      "}"
+    ]
+  },
+  "notes": [
+    "The installer needs admin rights (NSIS installs to Program Files). Run Scoop from an elevated shell, or use scoop install --global entrachecks.",
+    "First launch will run a Readiness check and offer to install missing PowerShell modules (Microsoft.Graph, Az.*, ImportExcel)."
+  ],
+  "checkver": {
+    "github": "https://github.com/f8l124/AzurePAM"
+  },
+  "autoupdate": {
+    "architecture": {
+      "64bit": {
+        "url": "https://github.com/f8l124/AzurePAM/releases/download/v$version/EntraChecks_$version_x64-setup.exe"
+      }
+    }
+  }
 }
