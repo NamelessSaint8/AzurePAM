@@ -211,6 +211,21 @@ evidence bundle with SHA-256 chain-of-custody and an optional ACL-locked
 identity-resolution map for re-resolving redacted hashes. See
 [docs/SOC2-Guide.md](docs/SOC2-Guide.md) for the full workflow.
 
+### Access Reviews (UAR)
+
+Menu option **[9] Access Review** runs periodic user-access-review campaigns —
+the evidence package SOC 2 (CC6.1–CC6.3) and PCI DSS v4.0 (7.2.4 / 7.2.5.1)
+assessors ask for. A campaign generates a system-generated roster of every
+user with their roles (administrators, disabled admins, and privileged
+service principals explicitly included), a review worksheet the reviewer
+completes in Excel, and — on close — a verification pass that flags revoked
+access that was never actually removed (`NOT_REMEDIATED`) and changes nobody
+decided on (`UNEXPLAINED_CHANGE`). Every artifact is covered by a SHA-256
+manifest, and a closed campaign is automatically cited as CC6.x evidence in
+the SOC 2 evidence matrix. See
+[docs/AccessReview-Guide.md](docs/AccessReview-Guide.md) for the quarterly
+runbook.
+
 ### Reducing Authentication Prompts
 
 A SOC 2-enabled run authenticates against **two distinct identity planes**

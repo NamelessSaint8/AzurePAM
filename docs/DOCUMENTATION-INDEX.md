@@ -20,6 +20,7 @@ We've created **6 comprehensive guides** totaling over **1,000 pages** of docume
 | **[Finding-Schema-Guide.md](Finding-Schema-Guide.md)** | Analysts / Auditors / Developers | 30-45 min | Central v2 finding schema, FindingId, analyst state file, disposition, security defaults |
 | **[Reporting-Guide.md](Reporting-Guide.md)** | All users | 20-40 min | Excel / HTML / CSV / JSON report formats, v2 schema surfacing |
 | **[Cockpit-Report-Guide.md](Cockpit-Report-Guide.md)** | Analysts / Auditors | 15-25 min | Analyst Cockpit HTML (the default since PR 4) — modes, sections, deep-dive routing, migration from pre-PR-4 layout |
+| **[AccessReview-Guide.md](AccessReview-Guide.md)** | Auditors / Compliance | 15-25 min | Quarterly User Access Review campaigns (menu [9]) — roster + worksheet + sign-off + verification, SOC 2 CC6.x / PCI DSS 7.2.4 evidence |
 | **[REPORTING-STATUS.md](REPORTING-STATUS.md)** | All users | 5-10 min | Current status |
 | **[Release-Signing-Guide.md](Release-Signing-Guide.md)** | Maintainers | 10-15 min | Authenticode signing for the desktop NSIS build — cert classes (OV/EV), three ways to flip on signing (local / CI overlay / post-build `signtool`), verification + SmartScreen reputation. |
 

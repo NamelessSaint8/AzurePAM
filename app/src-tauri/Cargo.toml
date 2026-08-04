@@ -1,6 +1,6 @@
 [package]
 name = "entrachecks-desktop"
-version = "1.7.0"
+version = "1.8.0"
 description = "EntraChecks desktop shell — Tauri GUI client of the headless assessment core (Native App Phase 4)"
 authors = ["EntraChecks Project"]
 edition = "2021"
