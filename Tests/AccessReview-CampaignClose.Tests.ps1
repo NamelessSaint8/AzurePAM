@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Pester 5 test suite for access-review campaign close
     (PR 2 of the Access Review plan: worksheet ingest + verification delta).

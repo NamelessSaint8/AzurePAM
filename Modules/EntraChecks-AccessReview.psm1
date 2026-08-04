@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     User Access Review (UAR) campaign module — roster generation and
     campaign open (PR 1 of the Access Review plan).

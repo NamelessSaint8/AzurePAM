@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Define global-scope stubs for Microsoft.Graph and Az cmdlets so that
     Pester's `Mock -ModuleName ...` can intercept them on machines where

@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Pester 5 test suite for the access-review report renderer and the
     SOC 2 evidence-matrix reference (PR 3 of the Access Review plan).

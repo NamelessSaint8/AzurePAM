@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Access-review report rendering (PR 3 of the Access Review plan).
 
