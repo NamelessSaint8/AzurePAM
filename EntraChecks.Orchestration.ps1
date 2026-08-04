@@ -142,6 +142,7 @@ function Show-MainMenu {
     Write-Host "  │   [6] SOC 2 Readiness       - Internal SOC 2 TSC assessment   │" -ForegroundColor Yellow
     Write-Host "  │   [7] SOC 2 Type 2          - Period coverage from snapshots  │" -ForegroundColor Yellow
     Write-Host "  │   [8] Active Directory      - On-premises AD security audit  │" -ForegroundColor Yellow
+    Write-Host "  │   [9] Access Review         - UAR campaigns (SOC 2 / PCI)    │" -ForegroundColor Yellow
     Write-Host "  │   [Y] Hybrid Analysis       - Cloud + on-prem + correlation  │" -ForegroundColor Yellow
     Write-Host "  │                                                                 │" -ForegroundColor Gray
     Write-Host "  │   [A] Authentication        - Connect to Graph and Azure       │" -ForegroundColor Cyan
@@ -1321,14 +1322,23 @@ function Invoke-SOC2ReadinessFromMenu {
 
     # Load SOC 2 config (fall back to defaults)
     $soc2Cfg = $null
+    $accessReviewDir = '.\Output\AccessReview'
     $configPath = Join-Path $PSScriptRoot "config\entrachecks.config.json"
     if (Test-Path $configPath) {
         try {
             $cfg = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
             if ($cfg.SOC2) { $soc2Cfg = $cfg.SOC2 }
+            if ($cfg.AccessReview -and $cfg.AccessReview.OutputDirectory) {
+                $accessReviewDir = [string]$cfg.AccessReview.OutputDirectory
+            }
         } catch {
             Write-Host "  [!] Could not parse config; using SOC 2 defaults." -ForegroundColor Yellow
         }
+    }
+    # Reference-if-present: a closed access-review campaign under this
+    # directory is cited as CC6.x evidence in the SOC 2 evidence matrix.
+    if (-not [System.IO.Path]::IsPathRooted($accessReviewDir)) {
+        $accessReviewDir = Join-Path $PSScriptRoot $accessReviewDir
     }
 
     # Ensure we have findings to map. If the current session's $script:Findings
@@ -1475,8 +1485,8 @@ function Invoke-SOC2ReadinessFromMenu {
     $htmlPath = Join-Path $soc2Output 'SOC2-Report.html'
     $xlsxPath = Join-Path $soc2Output 'SOC2-Workbook.xlsx'
 
-    $null = New-SOC2AuditReport -AssessmentResult $result -OutputPath $htmlPath -Branding $branding -IdentityResolutionMapPath $result.IdentityMapPath
-    $null = New-SOC2AuditWorkbook -AssessmentResult $result -OutputPath $xlsxPath
+    $null = New-SOC2AuditReport -AssessmentResult $result -OutputPath $htmlPath -Branding $branding -IdentityResolutionMapPath $result.IdentityMapPath -AccessReviewDirectory $accessReviewDir
+    $null = New-SOC2AuditWorkbook -AssessmentResult $result -OutputPath $xlsxPath -AccessReviewDirectory $accessReviewDir
 
     Write-Host "`n  [OK] SOC 2 assessment complete." -ForegroundColor Green
     Write-Host "      Findings:        $($result.Findings.Count)" -ForegroundColor White
@@ -1742,6 +1752,142 @@ function Invoke-SOC2TypeTwoFromMenu {
         Start-Process $htmlPath
     } catch {
         Write-Host "  [!] Could not open HTML report automatically: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+}
+
+function Invoke-AccessReviewFromMenu {
+    <#
+    .SYNOPSIS
+        Menu handler for Access Review campaigns (option [9]).
+
+    .DESCRIPTION
+        Submenu over the EntraChecks-AccessReview / -AccessReviewReport
+        modules: open a campaign (roster + worksheet), close a campaign
+        (worksheet ingest + verification + report), list campaigns, or
+        regenerate a report (Open campaigns render as DRAFT). Defaults come
+        from the AccessReview block in config/entrachecks.config.json.
+        See docs/AccessReview-Guide.md for the quarterly runbook.
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$TenantName
+    )
+
+    $arModule = Join-Path $script:ModulesPath 'EntraChecks-AccessReview.psm1'
+    $arReportModule = Join-Path $script:ModulesPath 'EntraChecks-AccessReviewReport.psm1'
+    foreach ($m in @($arModule, $arReportModule)) {
+        if (-not (Test-Path $m)) {
+            Write-Host "  [!] Missing required module: $m" -ForegroundColor Red
+            return
+        }
+        Import-Module $m -Force -DisableNameChecking
+    }
+
+    # Defaults + config overrides (AccessReview block)
+    $arDir = '.\Output\AccessReview'
+    $includeGuests = $true
+    $periodLabel = ''
+    $configPath = Join-Path $PSScriptRoot "config\entrachecks.config.json"
+    if (Test-Path $configPath) {
+        try {
+            $cfgRoot = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+            if ($cfgRoot.AccessReview) {
+                if ($cfgRoot.AccessReview.OutputDirectory) { $arDir = [string]$cfgRoot.AccessReview.OutputDirectory }
+                if ($null -ne $cfgRoot.AccessReview.IncludeGuests) { $includeGuests = [bool]$cfgRoot.AccessReview.IncludeGuests }
+                if ($cfgRoot.AccessReview.PeriodLabel) { $periodLabel = [string]$cfgRoot.AccessReview.PeriodLabel }
+            }
+        } catch {
+            Write-Host "  [!] Could not parse config; using access-review defaults." -ForegroundColor Yellow
+        }
+    }
+    if (-not [System.IO.Path]::IsPathRooted($arDir)) { $arDir = Join-Path $PSScriptRoot $arDir }
+
+    while ($true) {
+        Write-Host "`n ===== Access Review Campaigns =====" -ForegroundColor Cyan
+        Write-Host "  Campaign directory: $arDir" -ForegroundColor Gray
+        Write-Host "  [1] Open new campaign   - Generate roster + review worksheet" -ForegroundColor Yellow
+        Write-Host "  [2] Close campaign      - Ingest worksheet, verify, render report" -ForegroundColor Yellow
+        Write-Host "  [3] List campaigns" -ForegroundColor Yellow
+        Write-Host "  [4] Regenerate report   - Open campaigns render as DRAFT" -ForegroundColor Yellow
+        Write-Host "  [B] Back" -ForegroundColor Gray
+        $choice = (Read-Host "`n  Select an option").Trim().ToUpper()
+
+        switch ($choice) {
+            '1' {
+                if (-not $TenantName) { $TenantName = Read-Host "  Enter tenant name" }
+                $r = New-AccessReviewCampaign -OutputDirectory $arDir -TenantName $TenantName -PeriodLabel $periodLabel -IncludeGuests $includeGuests
+                if ($r.Success) {
+                    Write-Host "  [OK] Campaign $($r.CampaignId) opened." -ForegroundColor Green
+                    Write-Host "      Worksheet: $($r.WorksheetPath)" -ForegroundColor White
+                    Write-Host "      Next: reviewer fills Decision/Notes + sign-off rows, then use [2] to close." -ForegroundColor Gray
+                } else {
+                    Write-Host "  [!] $($r.FailureReason)" -ForegroundColor Red
+                }
+            }
+            '2' {
+                $open = @(Get-AccessReviewCampaign -OutputDirectory $arDir | Where-Object { $_.Status -eq 'Open' })
+                if ($open.Count -eq 0) {
+                    Write-Host "  [i] No open campaigns in $arDir" -ForegroundColor Gray
+                    continue
+                }
+                for ($i = 0; $i -lt $open.Count; $i++) {
+                    Write-Host "    [$($i + 1)] $($open[$i].CampaignId)" -ForegroundColor White
+                }
+                $idx = 0
+                if (-not [int]::TryParse((Read-Host "  Select campaign"), [ref]$idx) -or $idx -lt 1 -or $idx -gt $open.Count) {
+                    Write-Host "  [!] Invalid selection." -ForegroundColor Red
+                    continue
+                }
+                $r = Complete-AccessReviewCampaign -CampaignDirectory $open[$idx - 1].Directory
+                if ($r.Success) {
+                    Write-Host "  [OK] Campaign $($r.CampaignId) closed." -ForegroundColor Green
+                    Write-Host "      Certified=$($r.Summary.Certified) Revoked=$($r.Summary.Revoked) Modified=$($r.Summary.Modified) Investigate=$($r.Summary.Investigated)" -ForegroundColor White
+                    Write-Host "      Changes=$($r.Summary.TotalChanges) NotRemediated=$($r.Summary.NotRemediated) Unexplained=$($r.Summary.UnexplainedChanges)" -ForegroundColor White
+                    foreach ($f in @($r.Flags)) {
+                        Write-Host "      [$($f.Flag)] $($f.DisplayName): $($f.Detail)" -ForegroundColor Yellow
+                    }
+                    $rep = New-AccessReviewReport -CampaignDirectory $open[$idx - 1].Directory
+                    if ($rep.Success) {
+                        Write-Host "      Report: $($rep.ReportPath)" -ForegroundColor White
+                    }
+                } else {
+                    Write-Host "  [!] $($r.FailureReason)" -ForegroundColor Red
+                }
+            }
+            '3' {
+                $all = @(Get-AccessReviewCampaign -OutputDirectory $arDir)
+                if ($all.Count -eq 0) {
+                    Write-Host "  [i] No campaigns in $arDir" -ForegroundColor Gray
+                }
+                foreach ($c in $all) {
+                    Write-Host "    $($c.GeneratedAtUtc) | $(([string]$c.Status).PadRight(6)) | $($c.CampaignId)" -ForegroundColor White
+                }
+            }
+            '4' {
+                $all = @(Get-AccessReviewCampaign -OutputDirectory $arDir)
+                if ($all.Count -eq 0) {
+                    Write-Host "  [i] No campaigns in $arDir" -ForegroundColor Gray
+                    continue
+                }
+                for ($i = 0; $i -lt $all.Count; $i++) {
+                    Write-Host "    [$($i + 1)] $(([string]$all[$i].Status).PadRight(6)) $($all[$i].CampaignId)" -ForegroundColor White
+                }
+                $idx = 0
+                if (-not [int]::TryParse((Read-Host "  Select campaign"), [ref]$idx) -or $idx -lt 1 -or $idx -gt $all.Count) {
+                    Write-Host "  [!] Invalid selection." -ForegroundColor Red
+                    continue
+                }
+                $rep = New-AccessReviewReport -CampaignDirectory $all[$idx - 1].Directory
+                if ($rep.Success) {
+                    $draftNote = if ($rep.IsDraft) { ' (DRAFT)' } else { '' }
+                    Write-Host "  [OK] Report$draftNote : $($rep.ReportPath)" -ForegroundColor Green
+                } else {
+                    Write-Host "  [!] $($rep.FailureReason)" -ForegroundColor Red
+                }
+            }
+            'B' { return }
+            default { Write-Host "  [!] Invalid option." -ForegroundColor Red }
+        }
     }
 }
 
@@ -2398,6 +2544,12 @@ function Start-InteractiveMode {
                 if ($results) {
                     Write-Host "`n  AD assessment complete. Findings will appear in the next report generation." -ForegroundColor Green
                 }
+                Read-Host "`n  Press Enter to continue"
+            }
+
+            "9" {
+                # Access Review campaigns (UAR evidence for SOC 2 / PCI)
+                Invoke-AccessReviewFromMenu -TenantName $tenantName
                 Read-Host "`n  Press Enter to continue"
             }
 

@@ -105,6 +105,13 @@
     ],
     "CustomBenchmarks": []
   },
+  "AccessReview": {
+    "_comment": "User Access Review campaigns (menu option [9]). See docs/AccessReview-Guide.md. Quarterly cadence per the stricter-of rule (SOC 2 convention vs PCI DSS 7.2.4). PeriodLabel empty = auto (current quarter, e.g. 2026-Q3).",
+    "Enabled": false,
+    "OutputDirectory": ".\\Output\\AccessReview",
+    "IncludeGuests": true,
+    "PeriodLabel": ""
+  },
   "SOC2": {
     "_comment": "SOC 2 internal readiness assessment. See docs/SOC2-Guide.md. Disabled by default.",
     "Enabled": false,

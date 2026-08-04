@@ -613,7 +613,8 @@ function Get-SOC2EvidenceMatrix {
         [AllowNull()][pscustomobject]$EvidenceBundle,
         [Parameter(Mandatory)][object[]]$ControlCatalog,
         [AllowNull()][AllowEmptyString()][string]$IdentityMapPath,
-        [datetime]$AsOf = ([datetime]::UtcNow)
+        [datetime]$AsOf = ([datetime]::UtcNow),
+        [AllowEmptyString()][string]$AccessReviewDirectory = ''
     )
 
     $rows = New-Object System.Collections.Generic.List[object]
@@ -695,6 +696,13 @@ function Get-SOC2EvidenceMatrix {
         $rows.Add($row) | Out-Null
     }
 
+    # Reference-if-present: the latest CLOSED access-review campaign is
+    # cited as CC6.1-CC6.3 evidence; its absence changes nothing
+    # (plans/Access-Review-Report-Plan.md, decision 5).
+    foreach ($r in (Get-SOC2AccessReviewEvidenceRows -AccessReviewDirectory $AccessReviewDirectory -AsOf $AsOf)) {
+        $rows.Add($r) | Out-Null
+    }
+
     # Stable order: TscFamily, then ControlId, then artifact path.
     $byFamily = @{ Expression = { [string]$_.TscFamily } }
     $byControl = @{ Expression = { [string]$_.ControlId } }
@@ -702,6 +710,67 @@ function Get-SOC2EvidenceMatrix {
     $sorted = $rows.ToArray() | Sort-Object -Property $byFamily, $byControl, $byArtifact
 
     return , @($sorted)
+}
+
+function Get-SOC2AccessReviewEvidenceRows {
+    <#
+    .SYNOPSIS
+        Evidence-matrix rows for the latest closed access-review campaign
+        (one row per CC6.1/CC6.2/CC6.3), or an empty array when no closed
+        campaign exists. Reads campaign.json/manifest.json directly so
+        this module takes no dependency on EntraChecks-AccessReview.psm1.
+    #>
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [AllowEmptyString()][string]$AccessReviewDirectory = '',
+        [datetime]$AsOf = ([datetime]::UtcNow)
+    )
+
+    if (-not $AccessReviewDirectory -or -not (Test-Path -LiteralPath $AccessReviewDirectory)) {
+        return , @()
+    }
+
+    $latest = $null
+    foreach ($dir in @(Get-ChildItem -LiteralPath $AccessReviewDirectory -Directory -ErrorAction SilentlyContinue)) {
+        $metaPath = Join-Path $dir.FullName 'campaign.json'
+        if (-not (Test-Path -LiteralPath $metaPath)) { continue }
+        try {
+            $meta = Get-Content -LiteralPath $metaPath -Raw | ConvertFrom-Json
+        } catch { continue }
+        if ($meta.Status -ne 'Closed') { continue }
+        if (-not $latest -or ([string]$meta.ClosedAtUtc) -gt ([string]$latest.Meta.ClosedAtUtc)) {
+            $latest = @{ Meta = $meta; Directory = $dir.FullName }
+        }
+    }
+    if (-not $latest) { return , @() }
+
+    $bundleHash = ''
+    $manifestPath = Join-Path $latest.Directory 'manifest.json'
+    if (Test-Path -LiteralPath $manifestPath) {
+        try {
+            $bundleHash = [string]((Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json).BundleHash)
+        } catch { $bundleHash = '' }
+    }
+
+    $closedAt = [string]$latest.Meta.ClosedAtUtc
+    $freshness = Get-SOC2EvidenceFreshness -CollectionTime $closedAt -AsOf $AsOf
+    $hashPrefix = if ($bundleHash) { $bundleHash.Substring(0, [Math]::Min(12, $bundleHash.Length)) } else { 'nohash' }
+
+    $rows = foreach ($controlId in 'CC6.1', 'CC6.2', 'CC6.3') {
+        [pscustomobject]@{
+            ControlId = $controlId
+            TscFamily = 'CC6'
+            EvidenceArtifact = (Join-Path $latest.Directory 'AccessReview-Report.html')
+            Source = "Access review campaign $($latest.Meta.CampaignId)"
+            CollectionTime = $closedAt
+            Hash = $bundleHash
+            RedactionStatus = 'Not redacted'
+            Freshness = $freshness
+            AnchorId = ('soc2-evidence-uar-' + $hashPrefix + '-' + $controlId.Replace('.', ''))
+        }
+    }
+    return , @($rows)
 }
 
 #endregion
@@ -1200,7 +1269,9 @@ function New-SOC2AuditReport {
 
         [pscustomobject]$Branding,
 
-        [string]$IdentityResolutionMapPath
+        [string]$IdentityResolutionMapPath,
+
+        [AllowEmptyString()][string]$AccessReviewDirectory = ''
     )
 
     if (-not $Branding) {
@@ -1695,7 +1766,7 @@ table.manual-attestation a { color: inherit; }
     # Freshness / RedactionStatus) use a small self-contained inline script
     # scoped to this section — the SOC 2 report is otherwise static and
     # importing the whole cockpit JS module would couple the two reports.
-    $evidenceMatrixRows = Get-SOC2EvidenceMatrix -EvidenceBundle $evidence -ControlCatalog $catalog -IdentityMapPath $IdentityResolutionMapPath
+    $evidenceMatrixRows = Get-SOC2EvidenceMatrix -EvidenceBundle $evidence -ControlCatalog $catalog -IdentityMapPath $IdentityResolutionMapPath -AccessReviewDirectory $AccessReviewDirectory
     $evidenceMatrixRows = @($evidenceMatrixRows)
     if ($evidenceMatrixRows.Count -gt 0) {
         $emFamilies = @($evidenceMatrixRows | ForEach-Object { $_.TscFamily } | Where-Object { $_ } | Sort-Object -Unique)
@@ -2052,7 +2123,9 @@ function New-SOC2AuditWorkbook {
         [pscustomobject]$AssessmentResult,
 
         [Parameter(Mandatory)]
-        [string]$OutputPath
+        [string]$OutputPath,
+
+        [AllowEmptyString()][string]$AccessReviewDirectory = ''
     )
 
     $catalog = $AssessmentResult.Catalog
@@ -2084,7 +2157,7 @@ function New-SOC2AuditWorkbook {
     $remediationRows = Get-SOC2RemediationPlan -Register $conclusionRows
     $remediationRows = @($remediationRows)
     # PR 3 §10.2 — per-control evidence pivot from the bundle manifest.
-    $evidenceMatrixRows = Get-SOC2EvidenceMatrix -EvidenceBundle $evidence -ControlCatalog $catalog -IdentityMapPath $identityMapPath
+    $evidenceMatrixRows = Get-SOC2EvidenceMatrix -EvidenceBundle $evidence -ControlCatalog $catalog -IdentityMapPath $identityMapPath -AccessReviewDirectory $AccessReviewDirectory
     $evidenceMatrixRows = @($evidenceMatrixRows)
     $familyPreds = Get-SOC2FamilyPredicates
     $licensingRows = Get-SOC2LicensingGapRows -Summary $summary
