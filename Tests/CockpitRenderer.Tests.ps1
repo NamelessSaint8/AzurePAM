@@ -122,8 +122,10 @@ Describe 'New-EntraChecksAnalystHtmlReport — end-to-end with v2 findings' {
         $script:Html | Should -Match 'Deep Dive Hub'
         # AzurePolicy was passed in DeepDives — should be generated card.
         $script:Html | Should -Match 'deep-dive-card generated[^"]*">\s*<h4>Azure Policy Initiatives</h4>'
-        # SecureScore was NOT in DeepDives — should be pending card.
-        $script:Html | Should -Match 'deep-dive-card pending[^"]*">\s*<h4>Microsoft Secure Score</h4>'
+        # SecureScore was NOT in DeepDives and not in RequestedDeepDives —
+        # the four-state hub (Cockpit-Polish redesign) renders it as a
+        # not-selected card ("Skipped — not requested").
+        $script:Html | Should -Match 'deep-dive-card not-selected[^"]*">\s*<h4>Microsoft Secure Score</h4>'
     }
 
     It 'writes the integrity sidecar alongside the HTML' {
@@ -136,10 +138,13 @@ Describe 'New-EntraChecksAnalystHtmlReport — end-to-end with v2 findings' {
         $result.IsValid | Should -BeTrue
     }
 
-    It 'header surfaces tenant name + ID + Cockpit mode' {
+    It 'header surfaces tenant name + ID + Cockpit product title' {
         $script:Html | Should -Match 'PR2-Test'
         $script:Html | Should -Match '00000000-0000-0000-0000-000000000001'
-        $script:Html | Should -Match 'Report Mode:</strong> Cockpit'
+        # Cockpit-Polish redesign: the hero header replaced the old
+        # "Report Mode:" label with the product title + tenant block.
+        $script:Html | Should -Match 'class="cockpit-hero"'
+        $script:Html | Should -Match 'EntraChecks Analyst Cockpit'
     }
 
     # ========================================================================

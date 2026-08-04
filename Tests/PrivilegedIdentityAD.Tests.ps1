@@ -24,6 +24,22 @@
 
 BeforeAll {
     $repoRoot = Split-Path -Parent $PSScriptRoot
+
+    # Global AD cmdlet shims so Pester can Mock them on machines without
+    # RSAT. Without a resolvable command, Mock -ModuleName ... Get-ADGroup
+    # fails with "Could not find Command" and the whole Describe aborts.
+    # The shims declare REAL parameter names (not just $args): Pester mock
+    # proxies mirror the shim's signature, so a $args-only shim leaves
+    # $Identity/$Filter unbound inside mock bodies and every switch falls
+    # through to its default (see the Invoke-MgGraphRequest stub note in
+    # Helpers/Stub-CloudCmdlets.ps1 for the same defect).
+    function Global:Get-ADDomain { [CmdletBinding()] param($Identity, [string]$Server) }
+    function Global:Get-ADGroup { [CmdletBinding()] param($Identity, $Filter, [string[]]$Properties, [string]$Server) }
+    function Global:Get-ADGroupMember { [CmdletBinding()] param($Identity, [switch]$Recursive, [string]$Server) }
+    function Global:Get-ADUser { [CmdletBinding()] param($Identity, $Filter, [string[]]$Properties, [string]$Server) }
+    function Global:Get-ADComputer { [CmdletBinding()] param($Identity, $Filter, [string[]]$Properties, [string]$Server) }
+    function Global:Get-ADObject { [CmdletBinding()] param($Filter, $Identity, [string[]]$Properties, [string]$SearchBase, [string]$Server, [switch]$IncludeDeletedObjects) }
+
     Import-Module (Join-Path $repoRoot 'Modules/EntraChecks-PrivilegeCatalog.psm1') -Force -DisableNameChecking
     Import-Module (Join-Path $repoRoot 'Modules/EntraChecks-PrivilegedIdentityAD.psm1') -Force -DisableNameChecking
 
@@ -134,8 +150,8 @@ Describe 'Get-PrivilegedIdentityRosterAD — direct and nested membership' -Tag 
             switch ($Identity) {
                 'S-1-5-21-1-1-1001' { & $script:NewMockUser -Sid 'S-1-5-21-1-1-1001' -Sam 'jdoe' -DisplayName 'John Doe' }
                 'S-1-5-21-1-1-1002' { & $script:NewMockUser -Sid 'S-1-5-21-1-1-1002' -Sam 'rsmith' -DisplayName 'Rachel Smith' }
-                'krbtgt'            { & $script:NewMockUser -Sid 'S-1-5-21-1-1-502' -Sam 'krbtgt' -DisplayName 'krbtgt' -Enabled $false -LastLogonDate (Get-Date '2020-01-01') }
-                default             { throw "Mocked Get-ADUser: no match for $Identity" }
+                'krbtgt' { & $script:NewMockUser -Sid 'S-1-5-21-1-1-502' -Sam 'krbtgt' -DisplayName 'krbtgt' -Enabled $false -LastLogonDate (Get-Date '2020-01-01') }
+                default { throw "Mocked Get-ADUser: no match for $Identity" }
             }
         }
 
