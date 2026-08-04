@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Define global-scope stubs for Microsoft.Graph and Az cmdlets so that
     Pester's `Mock -ModuleName ...` can intercept them on machines where
@@ -62,8 +62,26 @@ function script:Install-StubIfMissing {
 # ---------------------------------------------------------------
 # Microsoft.Graph
 # ---------------------------------------------------------------
+
+# Invoke-MgGraphRequest gets a real param block: Pester mock proxies mirror
+# the mocked command's signature, so a param-less stub means $Uri/$Method
+# never bind inside Mock bodies on stubbed (CI) machines — mocks that
+# discriminate by URI silently take the wrong branch (see the
+# KnownAssertionDrift tag in SOC2-Phase2.Tests.ps1).
+Install-StubIfMissing -Name 'Invoke-MgGraphRequest' -Body {
+    [CmdletBinding()]
+    param(
+        [string]$Method,
+        [string]$Uri,
+        $Body,
+        [hashtable]$Headers,
+        [string]$ContentType,
+        [string]$OutputType
+    )
+    $null
+}
+
 foreach ($n in @(
-        'Invoke-MgGraphRequest'
         'Connect-MgGraph'
         'Disconnect-MgGraph'
         'Get-MgContext'

@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     EntraChecks-PrivilegedIdentityEntra.psm1
     Walks every Entra ID privilege source defined in the privilege catalog
