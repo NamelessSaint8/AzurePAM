@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Pester 5 test suite for the access-review campaign module
     (PR 1 of the Access Review plan: roster generation + campaign open).
