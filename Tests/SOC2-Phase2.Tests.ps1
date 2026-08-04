@@ -295,14 +295,13 @@ Describe 'Test-SOC2MalwareProtection' {
     }
 }
 
-# TODO(test-drift): These tests Mock Invoke-MgGraphRequest with -ModuleName
-# but the production code's $rolesResp.value path returns $null in the
-# stubbed cross-platform run — looks like a JSON-conversion / ConvertFrom-Json
-# difference between Windows PowerShell and PS 7 on macOS. The check
-# falls through to the "GA role not found" INFO branch. Pre-existing
-# failure; needs a Windows reproduction + fixture rework. Tagging so the
-# cross-platform runner skips and the Windows lane still exercises.
-Describe 'Test-SOC2BreakGlassAccountsConfigured' -Tag 'KnownAssertionDrift' {
+# Drift resolved: these tests failed on stubbed (no-Graph) machines because
+# the param-less Invoke-MgGraphRequest stub meant $Uri never bound inside the
+# Mock bodies, so every fixture branch fell through to $null and the check
+# hit the "GA role not found" INFO path. The stub now declares a real
+# parameter block (Tests/Helpers/Stub-CloudCmdlets.ps1), so the URI
+# discrimination works everywhere and the KnownAssertionDrift tag is gone.
+Describe 'Test-SOC2BreakGlassAccountsConfigured' {
 
     Context 'When there is only one Global Administrator' {
         BeforeEach {
