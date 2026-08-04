@@ -66,8 +66,9 @@ function script:Install-StubIfMissing {
 # Invoke-MgGraphRequest gets a real param block: Pester mock proxies mirror
 # the mocked command's signature, so a param-less stub means $Uri/$Method
 # never bind inside Mock bodies on stubbed (CI) machines — mocks that
-# discriminate by URI silently take the wrong branch (see the
-# KnownAssertionDrift tag in SOC2-Phase2.Tests.ps1).
+# discriminate by URI silently take the wrong branch (this defect was
+# behind the since-removed KnownAssertionDrift tag on the SOC2-Phase2
+# break-glass suite).
 Install-StubIfMissing -Name 'Invoke-MgGraphRequest' -Body {
     [CmdletBinding()]
     param(
