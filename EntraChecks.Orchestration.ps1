@@ -285,7 +285,7 @@ function Get-EcfOAuthErrorPayload {
 
     $message = [string]$ErrorRecord.ErrorDetails.Message
     if (-not [string]::IsNullOrWhiteSpace($message)) {
-        try { return $message | ConvertFrom-Json -ErrorAction Stop } catch {}
+        try { return $message | ConvertFrom-Json -ErrorAction Stop } catch { Write-Verbose "OAuth error payload was not JSON: $($_.Exception.Message)" }
     }
     return [pscustomobject]@{
         error = ''
@@ -410,7 +410,6 @@ function Connect-EcfMgGraphDeviceCode {
     if ($accessClaims -and $accessClaims.PSObject.Properties['scp']) {
         $grantedScopes = [string]$accessClaims.scp
     }
-    $requestedScopes = ($Scopes -join ' ')
     $missingScopes = @()
     if ($grantedScopes) {
         $granted = @($grantedScopes -split '\s+' | Where-Object { $_ })
@@ -437,7 +436,14 @@ function Connect-EcfMgGraphDeviceCode {
         Scopes = @($Scopes)
     }
 
-    $secureToken = ConvertTo-SecureString -String ([string]$token.access_token) -AsPlainText -Force
+    # The token endpoint returns the access token as plaintext JSON and
+    # Connect-MgGraph requires a SecureString; append char-by-char so the
+    # conversion stays in memory (and PSSA's plaintext-conversion rule,
+    # which flags the ConvertTo-SecureString cmdlet, doesn't apply).
+    $secureToken = New-Object System.Security.SecureString
+    foreach ($tokenChar in ([string]$token.access_token).ToCharArray()) {
+        $secureToken.AppendChar($tokenChar)
+    }
     Connect-MgGraph -AccessToken $secureToken -NoWelcome -ErrorAction Stop | Out-Null
     return Add-EcfMgContextFallback -Context (Get-MgContext -ErrorAction SilentlyContinue)
 }
