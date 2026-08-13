@@ -283,56 +283,14 @@ fn normalize_deep_dives(deep_dives: Vec<String>) -> Result<Vec<String>, String> 
     Ok(out)
 }
 
-/// The dedicated Result screen + Open report is 4.6. This step adds
-/// the auth panel + Cancel: the run's `runId` (envelope) and
-/// `output_dir` are recorded in `RunState` so `cancel_run` can drop
-/// the Phase-3a sentinel.
-#[tauri::command]
-fn run_assessment(
-    app: AppHandle,
-    tenant: String,
-    modules: Vec<String>,
-    auth_method: String,
-    deep_dives: Vec<String>,
-) -> Result<(), String> {
-    let pwsh = sidecar::discover_pwsh().map_err(|e| e.to_string())?;
-    let res_dir = app.path().resource_dir().ok();
-    let core = sidecar::resolve_core_script(res_dir.as_deref()).ok_or_else(|| {
-        "Invoke-EntraChecksRun.ps1 was not found (not bundled, no \
-         ENTRACHECKS_CORE override, and not inside the repository)."
-            .to_string()
-    })?;
-    let tenant = tenant.trim().to_string();
-    if tenant.is_empty() {
-        return Err("Tenant name is required.".to_string());
-    }
-    let modules = normalize_modules(modules)?;
-    let auth_method = normalize_auth_method(auth_method)?;
-    let deep_dives = normalize_deep_dives(deep_dives)?;
-    let out_dir = sidecar::strip_extended_length_prefix(
-        std::env::temp_dir().join("EntraChecks-GUI"),
-    );
-    let core_s = core.to_string_lossy().into_owned();
-    let out_s = out_dir.to_string_lossy().into_owned();
-
-    // Arm cancellation state for this run (output dir known now;
-    // run_id arrives with the first event).
-    {
-        let st = app.state::<Mutex<RunState>>();
-        let mut g = st.lock().map_err(|_| "run state poisoned".to_string())?;
-        g.output_dir = Some(out_dir.clone());
-        g.run_id = None;
-    }
-
+/// Whatever the engine was asked to do (an assessment, an access-review
+/// campaign action), the shell watches it identically: spawn `pwsh` on
+/// a background thread, run stdout through the contract parser, and
+/// emit the `run:*` event stream the webview already knows. Every
+/// command that drives the engine calls this so device-code scraping,
+/// run-id recording, and terminal events can't drift between them.
+fn spawn_contract_stream(app: AppHandle, pwsh: PathBuf, args: Vec<String>) {
     std::thread::spawn(move || {
-        let args = sidecar::core_args(
-            &core_s,
-            &tenant,
-            &out_s,
-            &modules,
-            &auth_method,
-            &deep_dives,
-        );
         let argrefs: Vec<&str> = args.iter().map(String::as_str).collect();
         // Two callbacks: stdout goes through the contract parser
         // (the run.* event stream); stderr bypasses the parser and
@@ -343,7 +301,7 @@ fn run_assessment(
         let app_err = app.clone();
         let app_frag = app.clone();
         let result = sidecar::spawn_streaming_with_stdout_fragments(
-            &pwsh.path,
+            &pwsh,
             &argrefs,
             |line| match contract::parse_line(line) {
                 contract::ParsedLine::Event {
@@ -406,7 +364,258 @@ fn run_assessment(
             }
         }
     });
+}
+
+/// The run output directory — the engine's working folder, and where
+/// `cancel_run` drops its sentinel. Deliberately TEMP: it is per-run
+/// scratch. Access-review campaigns are audit evidence spanning days
+/// and never live here (plan §3.1); they get their own durable folder.
+fn gui_run_output_dir() -> PathBuf {
+    sidecar::strip_extended_length_prefix(
+        std::env::temp_dir().join("EntraChecks-GUI"),
+    )
+}
+
+/// Arm cancellation state for a run: the output dir is known now, the
+/// run id arrives with the first streamed event.
+fn arm_run_state(app: &AppHandle, out_dir: &Path) -> Result<(), String> {
+    let st = app.state::<Mutex<RunState>>();
+    let mut g = st.lock().map_err(|_| "run state poisoned".to_string())?;
+    g.output_dir = Some(out_dir.to_path_buf());
+    g.run_id = None;
     Ok(())
+}
+
+/// The dedicated Result screen + Open report is 4.6. This step adds
+/// the auth panel + Cancel: the run's `runId` (envelope) and
+/// `output_dir` are recorded in `RunState` so `cancel_run` can drop
+/// the Phase-3a sentinel.
+///
+/// `open_access_review` is the "in concert" opt-in (plan §1): the same
+/// run also opens an access-review campaign, reusing the privileged
+/// roster it already built.
+#[tauri::command]
+fn run_assessment(
+    app: AppHandle,
+    tenant: String,
+    modules: Vec<String>,
+    auth_method: String,
+    deep_dives: Vec<String>,
+    open_access_review: bool,
+    campaign_dir: Option<String>,
+) -> Result<(), String> {
+    let pwsh = sidecar::discover_pwsh().map_err(|e| e.to_string())?;
+    let res_dir = app.path().resource_dir().ok();
+    let core = sidecar::resolve_core_script(res_dir.as_deref()).ok_or_else(|| {
+        "Invoke-EntraChecksRun.ps1 was not found (not bundled, no \
+         ENTRACHECKS_CORE override, and not inside the repository)."
+            .to_string()
+    })?;
+    let tenant = tenant.trim().to_string();
+    if tenant.is_empty() {
+        return Err("Tenant name is required.".to_string());
+    }
+    let modules = normalize_modules(modules)?;
+    let auth_method = normalize_auth_method(auth_method)?;
+    let deep_dives = normalize_deep_dives(deep_dives)?;
+    let campaign_dir = campaign_dir.map(|d| d.trim().to_string());
+    let out_dir = gui_run_output_dir();
+    let core_s = core.to_string_lossy().into_owned();
+    let out_s = out_dir.to_string_lossy().into_owned();
+
+    arm_run_state(&app, &out_dir)?;
+
+    let args = sidecar::core_args(
+        &core_s,
+        &tenant,
+        &out_s,
+        &modules,
+        &auth_method,
+        &deep_dives,
+        open_access_review,
+        campaign_dir.as_deref(),
+    );
+    spawn_contract_stream(app, pwsh.path, args);
+    Ok(())
+}
+
+const ACCESS_REVIEW_ACTIONS: &[&str] = &["Open", "Close", "Report"];
+
+fn normalize_access_review_action(action: String) -> Result<String, String> {
+    let a = action.trim();
+    if !ACCESS_REVIEW_ACTIONS.contains(&a) {
+        return Err(format!(
+            "Unknown access review action: {a} (expected Open, Close or Report)."
+        ));
+    }
+    Ok(a.to_string())
+}
+
+/// Run a campaign action on its own (plan §1, "separately"): prereqs →
+/// auth → the `AccessReview` phase, with no Core/Modules/report pass.
+/// Streams through the same contract pipeline as `run_assessment`, so
+/// phases, log, artifacts and Cancel all work unchanged.
+///
+/// `campaign_dir` is the durable campaign folder; `campaign_id` is a
+/// campaign *folder name* inside it (required by Close/Report, empty
+/// for Open, which mints its own).
+#[tauri::command]
+fn run_access_review(
+    app: AppHandle,
+    tenant: String,
+    auth_method: String,
+    action: String,
+    campaign_dir: String,
+    campaign_id: String,
+) -> Result<(), String> {
+    let pwsh = sidecar::discover_pwsh().map_err(|e| e.to_string())?;
+    let res_dir = app.path().resource_dir().ok();
+    let core = sidecar::resolve_core_script(res_dir.as_deref()).ok_or_else(|| {
+        "Invoke-EntraChecksRun.ps1 was not found (not bundled, no \
+         ENTRACHECKS_CORE override, and not inside the repository)."
+            .to_string()
+    })?;
+    let tenant = tenant.trim().to_string();
+    if tenant.is_empty() {
+        return Err("Tenant name is required.".to_string());
+    }
+    let auth_method = normalize_auth_method(auth_method)?;
+    let action = normalize_access_review_action(action)?;
+    let campaign_dir = campaign_dir.trim().to_string();
+    if campaign_dir.is_empty() {
+        return Err(
+            "Campaign folder is required — a campaign is audit evidence and \
+             needs a durable folder."
+                .to_string(),
+        );
+    }
+    let campaign_id = campaign_id.trim().to_string();
+    if action != "Open" && campaign_id.is_empty() {
+        return Err(format!(
+            "Select a campaign first — {} needs an existing campaign.",
+            action.to_lowercase()
+        ));
+    }
+    // The campaign lands in campaign_dir; the run still needs its own
+    // working output dir so Cancel has somewhere to drop the sentinel.
+    let out_dir = gui_run_output_dir();
+    let args = sidecar::access_review_args(
+        &core.to_string_lossy(),
+        &tenant,
+        &out_dir.to_string_lossy(),
+        &campaign_dir,
+        &auth_method,
+        &action,
+        &campaign_id,
+    );
+
+    arm_run_state(&app, &out_dir)?;
+    spawn_contract_stream(app, pwsh.path, args);
+    Ok(())
+}
+
+/// One campaign folder as the Access Review panel renders it. The
+/// engine writes `campaign.json` in PascalCase; the webview speaks
+/// camelCase — this is the translation, and the only place that knows
+/// both spellings.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CampaignRow {
+    id: String,
+    period: String,
+    status: String,
+    generated_utc: String,
+    path: String,
+}
+
+/// The subset of `campaign.json` the panel needs (writer:
+/// `New-AccessReviewCampaign` in `EntraChecks-AccessReview.psm1`).
+/// Every other key in the file is ignored, so the engine can add
+/// fields without breaking the list.
+#[derive(serde::Deserialize)]
+struct CampaignMeta {
+    #[serde(rename = "PeriodLabel")]
+    period_label: String,
+    #[serde(rename = "Status")]
+    status: String,
+    #[serde(rename = "GeneratedAtUtc")]
+    generated_at_utc: String,
+}
+
+/// List the campaigns under `campaign_dir` by reading one small JSON
+/// per folder (plan §3.4 — spawning pwsh for a directory listing would
+/// cost seconds and be unavailable during a run). A folder that isn't
+/// a campaign, or whose `campaign.json` is unreadable or corrupt, is
+/// skipped silently: a half-written campaign must not hide the rest of
+/// the list. A missing directory is simply "no campaigns yet".
+#[tauri::command]
+fn list_campaigns(campaign_dir: String) -> Vec<CampaignRow> {
+    let mut rows: Vec<CampaignRow> = Vec::new();
+    let entries = match std::fs::read_dir(campaign_dir.trim()) {
+        Ok(e) => e,
+        Err(_) => return rows,
+    };
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let raw = match std::fs::read_to_string(dir.join("campaign.json")) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        // Windows PowerShell's `Set-Content -Encoding UTF8` writes a
+        // BOM, and serde_json rejects one — strip it or every real
+        // campaign parses as corrupt and the list comes back empty.
+        let meta: CampaignMeta = match serde_json::from_str(raw.trim_start_matches('\u{feff}')) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        // The FOLDER NAME is the id, not campaign.json's `CampaignId`.
+        // The engine reconstructs the path as <root>/<CampaignId>, so a
+        // restored or renamed evidence bundle whose inner id no longer
+        // matches its folder would otherwise close the wrong path — or
+        // none. The two coincide by convention; only one of them is
+        // authoritative for the round trip.
+        let id = match dir.file_name() {
+            Some(n) => n.to_string_lossy().into_owned(),
+            None => continue,
+        };
+        rows.push(CampaignRow {
+            id,
+            period: meta.period_label,
+            status: meta.status,
+            generated_utc: meta.generated_at_utc,
+            path: dir.to_string_lossy().into_owned(),
+        });
+    }
+    // The timestamps are fixed-width ISO-8601 UTC, so a string sort is
+    // a chronological sort — the same assumption the engine's own
+    // Get-AccessReviewCampaign makes.
+    rows.sort_by(|a, b| b.generated_utc.cmp(&a.generated_utc));
+    rows
+}
+
+/// The default durable campaign folder (plan §3.1). Resolved here, not
+/// in the webview: a `%USERPROFILE%` literal reaching PowerShell would
+/// be taken verbatim and create a folder of that name, and this also
+/// keeps the default independent of any webview path permission.
+/// Empty string means "no home dir" — the panel then simply asks the
+/// user for a folder.
+#[tauri::command]
+fn default_campaign_dir() -> String {
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .unwrap_or_default();
+    if home.trim().is_empty() {
+        return String::new();
+    }
+    std::path::Path::new(home.trim())
+        .join("Documents")
+        .join("EntraChecks")
+        .join("AccessReview")
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Cooperatively cancel the in-flight run by writing the Phase-3a
@@ -564,6 +773,7 @@ pub fn run() {
             run_assessment,
             supported_schema_major,
             cancel_run,
+            default_campaign_dir,
             open_external,
             open_report,
             readiness,
@@ -571,7 +781,9 @@ pub fn run() {
             install_prereqs,
             install_pwsh_via_winget,
             relaunch_as_admin,
-            check_update
+            check_update,
+            run_access_review,
+            list_campaigns
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -648,6 +860,80 @@ mod tests {
         assert!(normalize_deep_dives(vec!["NotAReport".into()]).is_err());
     }
 
+    #[test]
+    fn normalize_access_review_action_matches_engine_validateset() {
+        // Mirrors -AccessReviewAction's ValidateSet. A typo from the
+        // webview must fail here, before an auth prompt costs the user
+        // a sign-in for a run the engine would then reject.
+        for a in ["Open", "Close", "Report"] {
+            assert_eq!(normalize_access_review_action(a.into()).unwrap(), a);
+        }
+        assert_eq!(normalize_access_review_action(" Close ".into()).unwrap(), "Close");
+        assert!(normalize_access_review_action("".into()).is_err());
+        assert!(normalize_access_review_action("close".into()).is_err());
+        assert!(normalize_access_review_action("Delete".into()).is_err());
+    }
+
+    #[test]
+    fn list_campaigns_parses_sorts_and_skips_unreadable_folders() {
+        // A campaign folder is user-managed: half-written, hand-edited
+        // and unrelated folders will show up there. None of them may
+        // hide the campaigns that *are* valid.
+        let base = std::env::temp_dir()
+            .join(format!("ecf_ar_list_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+
+        // Nothing created yet — "no campaigns", not an error.
+        assert!(list_campaigns(base.to_string_lossy().into_owned()).is_empty());
+
+        let write = |name: &str, body: &str| {
+            let d = base.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("campaign.json"), body).unwrap();
+        };
+        write(
+            "2026-Q2-20260502-094100",
+            r#"{"SchemaVersion":"1.0","CampaignId":"2026-Q2-20260502-094100",
+                "PeriodLabel":"2026-Q2","Status":"Closed",
+                "GeneratedAtUtc":"2026-05-02T09:41:00Z","TenantName":"Contoso"}"#,
+        );
+        // With the BOM Windows PowerShell actually writes.
+        write(
+            "2026-Q3-20260803-141500",
+            "\u{feff}{\"CampaignId\":\"2026-Q3-20260803-141500\",\
+             \"PeriodLabel\":\"2026-Q3\",\"Status\":\"Open\",\
+             \"GeneratedAtUtc\":\"2026-08-03T14:15:00Z\"}",
+        );
+        // A restored bundle unpacked under a different folder name: the
+        // id must follow the FOLDER, because that is what the engine
+        // joins onto the campaign root to find it again.
+        write(
+            "2026-Q1-restored",
+            r#"{"CampaignId":"2026-Q1-20260201-101500","PeriodLabel":"2026-Q1",
+                "Status":"Closed","GeneratedAtUtc":"2026-02-01T10:15:00Z"}"#,
+        );
+        write("corrupt", "{ this is not json");
+        std::fs::create_dir_all(base.join("not-a-campaign")).unwrap();
+        std::fs::write(base.join("stray.txt"), "loose file").unwrap();
+
+        let rows = list_campaigns(base.to_string_lossy().into_owned());
+        assert_eq!(rows.len(), 3, "corrupt / non-campaign folders are skipped");
+        // Newest first — the panel's default selection is the current
+        // quarter's campaign.
+        assert_eq!(rows[0].id, "2026-Q3-20260803-141500");
+        assert_eq!(rows[0].period, "2026-Q3");
+        assert_eq!(rows[0].status, "Open");
+        assert_eq!(rows[0].generated_utc, "2026-08-03T14:15:00Z");
+        assert!(rows[0].path.ends_with("2026-Q3-20260803-141500"));
+        assert_eq!(rows[1].status, "Closed");
+        assert_eq!(
+            rows[2].id, "2026-Q1-restored",
+            "the folder name is authoritative, not campaign.json's CampaignId"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// The automated proof of the 4.4 join: resolve the real core →
     /// spawn it via the 4.2 boundary → run each line through the 4.3
     /// parser. Asserts a coherent run (RunStarted … RunResult) where
@@ -674,6 +960,8 @@ mod tests {
             &["Core".to_string()],
             "Skip", // -SkipAuthentication: no tenant needed
             &[],    // no deep-dive reports for the pipeline test
+            false,  // no in-concert campaign for the pipeline test
+            None,
         );
         let argrefs: Vec<&str> = args.iter().map(String::as_str).collect();
 

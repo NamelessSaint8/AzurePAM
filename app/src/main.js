@@ -17,6 +17,15 @@ let authVerificationUri = "";
 let authRawBuffer = "";
 let shownDeviceCode = "";
 
+// Access Review (UAR) — plan §4.3. The campaign folder is durable audit
+// evidence spanning days, so it is never the run's TEMP output dir; the
+// webview owns the remembered value (no Rust settings store needed).
+const AR_DIR_KEY = "entrachecks.accessReview.dir";
+const AR_DIR_UNSET = "not set — choose a campaign folder";
+const AR_MAX_ROWS = 50;
+let arCampaigns = [];
+let arSelectedId = "";
+
 function escapeHtml(s) {
   return String(s == null ? "" : s).replace(
     /[&<>"']/g,
@@ -60,6 +69,7 @@ function resetView() {
   els.resultSoc2.innerHTML = "";
   els.resultArtifacts.innerHTML = "";
   els.resultErrors.innerHTML = "";
+  setArStatus("");
 }
 
 function metric(label, value, cls) {
@@ -159,6 +169,249 @@ function setDeepDiveSelection(mode) {
   });
 }
 
+// --- Access Review (UAR) ---------------------------------------------
+//
+// Campaign lifecycle only: Open mints the folder + worksheet, a human
+// fills the CSV in Excel outside the app, Close verifies it and renders
+// the report. Every action rides the same run:event stream an assessment
+// does, so phases / log / artifacts / cancel need no special casing.
+
+function joinWinPath(base, leaf) {
+  return String(base == null ? "" : base).replace(/[\\/]+$/, "") + "\\" + leaf;
+}
+
+function loadCampaignDir() {
+  try {
+    return localStorage.getItem(AR_DIR_KEY) || "";
+  } catch (_) {
+    return "";
+  }
+}
+
+function saveCampaignDir(dir) {
+  try {
+    localStorage.setItem(AR_DIR_KEY, dir);
+  } catch (_) {
+    /* storage unavailable — the field still works for this session */
+  }
+}
+
+async function defaultCampaignDir() {
+  // Resolved in Rust (std::env), never composed here: a `%USERPROFILE%`
+  // literal would reach PowerShell verbatim and create a folder of that
+  // name. "" means "no home dir" — the panel then just asks for one.
+  try {
+    return (await invoke("default_campaign_dir")) || "";
+  } catch (_) {
+    return "";
+  }
+}
+
+function campaignDir() {
+  return els.arDir ? els.arDir.value.trim() : "";
+}
+
+function updateCampaignDirHint() {
+  if (!els.arDirHint) return;
+  els.arDirHint.textContent = campaignDir() || AR_DIR_UNSET;
+}
+
+function setArStatus(text, cls) {
+  if (!els.arStatus) return;
+  els.arStatus.textContent = text;
+  els.arStatus.className = "run-status" + (cls ? " " + cls : "");
+}
+
+function selectedCampaign() {
+  return arCampaigns.find((c) => c.id === arSelectedId) || null;
+}
+
+function syncAccessReviewButtons() {
+  if (!els.arOpen) return;
+  // Same run-in-flight signal the Run button uses: Cancel is visible
+  // exactly while an engine process is alive. Kept in one helper so
+  // setRunning() and renderReadiness() can't disagree about it.
+  // A dependency install is also a busy pwsh — starting a campaign
+  // underneath one would fight it for the module state it is writing.
+  const busy = !els.cancel.classList.contains("hidden") || installing;
+  const sel = selectedCampaign();
+  els.arRefresh.disabled = busy;
+  els.arFolder.disabled = busy;
+  els.arOpen.disabled = busy || !appReady;
+  els.arWorksheet.disabled = busy || !sel;
+  els.arClose.disabled = busy || !appReady || !sel || sel.status !== "Open";
+  els.arReport.disabled = busy || !appReady || !sel;
+}
+
+function fmtCampaignOpened(utc) {
+  // `new Date(null)` is epoch 0 — a campaign.json with no timestamp
+  // would otherwise render as 1969 in what is audit evidence.
+  if (!utc) return "";
+  const d = new Date(utc);
+  if (isNaN(d.getTime())) return String(utc);
+  return d.toLocaleString(undefined, {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function renderCampaigns() {
+  const list = els.arList;
+  if (!list) return;
+  list.innerHTML = "";
+  if (!arCampaigns.length) {
+    const empty = document.createElement("li");
+    empty.className = "ar-empty muted";
+    empty.textContent =
+      "No campaigns in this folder yet. Open new campaign creates one " +
+      "(roster, worksheet, manifest) without running an assessment.";
+    list.appendChild(empty);
+    els.arCount.textContent = "";
+    syncAccessReviewButtons();
+    return;
+  }
+
+  const head = document.createElement("li");
+  head.className = "ar-row ar-head";
+  head.innerHTML =
+    `<span></span><span>Campaign</span><span>Period</span>` +
+    `<span>Status</span><span>Opened</span>`;
+  list.appendChild(head);
+
+  // Cap the rendered rows: a folder kept for years is a long list, and
+  // only the newest few are ever acted on (plan §7).
+  const shown = arCampaigns.slice(0, AR_MAX_ROWS);
+  shown.forEach((c) => {
+    const row = document.createElement("li");
+    row.className = "ar-row";
+    row.dataset.state = c.status === "Open" ? "open" : "closed";
+    row.innerHTML =
+      `<span class="ar-pick"><input type="radio" name="ar-pick" ` +
+      `value="${escapeHtml(c.id)}"` +
+      (c.id === arSelectedId ? " checked" : "") +
+      ` aria-label="Select campaign ${escapeHtml(c.id)}" /></span>` +
+      `<span class="ar-id" title="${escapeHtml(c.path)}">${escapeHtml(
+        c.id
+      )}</span>` +
+      `<span>${escapeHtml(c.period)}</span>` +
+      `<span>${escapeHtml(c.status)}</span>` +
+      `<span class="ar-opened">${escapeHtml(
+        fmtCampaignOpened(c.generatedUtc)
+      )}</span>`;
+    row.querySelector("input").addEventListener("change", () => {
+      arSelectedId = c.id;
+      syncAccessReviewButtons();
+    });
+    list.appendChild(row);
+  });
+
+  els.arCount.textContent =
+    arCampaigns.length > shown.length
+      ? `Showing ${shown.length} of ${arCampaigns.length} campaigns, newest first.`
+      : `${arCampaigns.length} campaign${
+          arCampaigns.length === 1 ? "" : "s"
+        }, newest first.`;
+  syncAccessReviewButtons();
+}
+
+async function refreshCampaigns() {
+  if (!els.arList) return;
+  const dir = campaignDir();
+  if (!dir) {
+    arCampaigns = [];
+    arSelectedId = "";
+    renderCampaigns();
+    setArStatus("Set a campaign folder to list campaigns.", "st-Failed");
+    return;
+  }
+  try {
+    arCampaigns = (await invoke("list_campaigns", { campaignDir: dir })) || [];
+    setArStatus("");
+  } catch (e) {
+    arCampaigns = [];
+    setArStatus(`Could not list campaigns: ${e}`, "st-Failed");
+  }
+  // A refreshed list may no longer contain the selected row.
+  if (!arCampaigns.some((c) => c.id === arSelectedId)) arSelectedId = "";
+  renderCampaigns();
+}
+
+async function runAccessReview(action) {
+  const dir = campaignDir();
+  const tenant = els.tenant.value.trim();
+  const sel = selectedCampaign();
+  if (!tenant) {
+    setArStatus(
+      "Enter a tenant name above before running a campaign action.",
+      "st-Failed"
+    );
+    return;
+  }
+  if (!dir) {
+    setArStatus(
+      "Set a campaign folder before running a campaign action.",
+      "st-Failed"
+    );
+    return;
+  }
+  if (action !== "Open" && !sel) {
+    setArStatus("Select a campaign row first.", "st-Failed");
+    return;
+  }
+  resetView();
+  hideAuth();
+  resetAuthCapture();
+  runHadResult = false;
+  processTail = [];
+  lastRunModules = [];
+  setRunning(true);
+  setArStatus(`${action} — starting…`);
+  els.runStatus.textContent = "Starting…";
+  startOp(`Access review — ${action}`, {
+    sub: "Waiting for the first phase…",
+  });
+  try {
+    await invoke("run_access_review", {
+      tenant,
+      authMethod: els.authMode.value,
+      action,
+      campaignDir: dir,
+      campaignId: action === "Open" ? "" : sel.id,
+    });
+  } catch (e) {
+    setArStatus(`Could not start: ${e}`, "st-Failed");
+    els.runStatus.textContent = `Could not start: ${e}`;
+    els.runStatus.classList.add("st-Failed");
+    setRunning(false);
+    endOp();
+  }
+}
+
+function openWorksheet() {
+  const sel = selectedCampaign();
+  if (!sel) return;
+  // Phase B of a campaign happens in Excel, outside this app.
+  invoke("open_report", {
+    path: joinWinPath(sel.path, "review-worksheet.csv"),
+  }).catch((e) =>
+    setArStatus(`Could not open the worksheet: ${e}`, "st-Failed")
+  );
+}
+
+function openCampaignFolder() {
+  const dir = campaignDir();
+  if (!dir) {
+    setArStatus("Set a campaign folder first.", "st-Failed");
+    return;
+  }
+  invoke("open_external", { target: dir }).catch((e) =>
+    setArStatus(`Could not open the folder: ${e}`, "st-Failed")
+  );
+}
+
 function synthesizeFailedResult(code, message, remediation) {
   if (runHadResult) return;
   runHadResult = true;
@@ -209,6 +462,11 @@ function setPhase(name, state, info) {
 function showAuth(html) {
   els.authBody.innerHTML = html;
   els.authPanel.classList.remove("hidden");
+  // The panel sits above the Access Review card, so an action triggered
+  // from down there reveals the sign-in code off-screen — which reads as
+  // "it never prompted". Fixed here rather than at the call sites so
+  // every auth path (browser, device code, failure) is covered.
+  els.authPanel.scrollIntoView({ behavior: "smooth", block: "center" });
 }
 function hideAuth() {
   els.authPanel.classList.add("hidden");
@@ -334,9 +592,18 @@ function setRunning(on) {
   els.run.disabled = on || !appReady;
   els.cancel.classList.toggle("hidden", !on);
   els.cancel.disabled = false;
+  syncAccessReviewButtons();
 }
 
 let installing = false;
+
+// Always flip the flag through here: an install is a busy pwsh, and the
+// Access Review buttons have to disable the moment it starts, not at the
+// next readiness render.
+function setInstalling(on) {
+  installing = on;
+  syncAccessReviewButtons();
+}
 let wingetOk = false;
 
 // --- op-banner: determinate progress for long-running operations -----
@@ -427,13 +694,13 @@ async function installPwshClick() {
     )
   )
     return;
-  installing = true;
+  setInstalling(true);
   logLine("[install] starting pwsh 7 via winget…");
   try {
     await invoke("install_pwsh_via_winget");
   } catch (e) {
     logLine(`[install] could not start: ${e}`, "error");
-    installing = false;
+    setInstalling(false);
   }
 }
 
@@ -459,7 +726,7 @@ async function installPrereqsClick(includeAzure) {
     )
   )
     return;
-  installing = true;
+  setInstalling(true);
   installTotal = null;
   installDone = 0;
   installCurrent = null;
@@ -477,7 +744,7 @@ async function installPrereqsClick(includeAzure) {
     await invoke("install_prereqs", { includeAzure });
   } catch (e) {
     logLine(`[install] could not start: ${e}`, "error");
-    installing = false;
+    setInstalling(false);
     endOp();
   }
 }
@@ -628,6 +895,7 @@ function renderReadiness(r) {
     : "Run is disabled until the required items above are installed.";
   els.run.disabled =
     !appReady || installing || !els.cancel.classList.contains("hidden");
+  syncAccessReviewButtons();
 }
 
 async function loadReadiness() {
@@ -644,6 +912,7 @@ async function loadReadiness() {
     els.readinessHint.textContent = `Readiness check failed: ${e}`;
     appReady = false;
     els.run.disabled = true;
+    syncAccessReviewButtons();
   } finally {
     endOp();
   }
@@ -766,6 +1035,9 @@ async function runAssessment() {
   const modules = selectedModules();
   const deepDives = selectedDeepDives();
   const authMethod = els.authMode.value;
+  // "In concert" (plan §1): the run additionally opens a campaign,
+  // reusing the privileged roster it already builds.
+  const openAccessReview = !!(els.inConcert && els.inConcert.checked);
   lastRunModules = modules;
   if (!tenant) {
     els.runStatus.textContent = "Enter a tenant name before running.";
@@ -791,6 +1063,8 @@ async function runAssessment() {
       modules,
       authMethod,
       deepDives,
+      openAccessReview,
+      campaignDir: campaignDir(),
     });
   } catch (e) {
     els.runStatus.textContent = `Could not start: ${e}`;
@@ -823,6 +1097,18 @@ window.addEventListener("DOMContentLoaded", async () => {
     readinessList: document.querySelector("#readiness-list"),
     readinessHint: document.querySelector("#readiness-hint"),
     readinessBtn: document.querySelector("#btn-readiness"),
+    inConcert: document.querySelector("#chk-access-review"),
+    arDirHint: document.querySelector("#ar-dir-hint"),
+    arDir: document.querySelector("#ar-dir"),
+    arList: document.querySelector("#ar-list"),
+    arCount: document.querySelector("#ar-count"),
+    arStatus: document.querySelector("#ar-status"),
+    arRefresh: document.querySelector("#btn-ar-refresh"),
+    arFolder: document.querySelector("#btn-ar-folder"),
+    arOpen: document.querySelector("#btn-ar-open"),
+    arWorksheet: document.querySelector("#btn-ar-worksheet"),
+    arClose: document.querySelector("#btn-ar-close"),
+    arReport: document.querySelector("#btn-ar-report"),
   };
   document.querySelector("#btn-run").addEventListener("click", runAssessment);
   document.querySelector("#btn-cancel").addEventListener("click", cancelRun);
@@ -841,6 +1127,31 @@ window.addEventListener("DOMContentLoaded", async () => {
   if (ddNoneBtn) {
     ddNoneBtn.addEventListener("click", () => setDeepDiveSelection("none"));
   }
+
+  if (els.arDir) {
+    els.arDir.value = loadCampaignDir() || (await defaultCampaignDir());
+    saveCampaignDir(els.arDir.value);
+    updateCampaignDirHint();
+    // `change` (not `input`): one write and one directory read per edit,
+    // not one per keystroke.
+    els.arDir.addEventListener("change", () => {
+      saveCampaignDir(campaignDir());
+      updateCampaignDirHint();
+      refreshCampaigns();
+    });
+  }
+  const arActions = [
+    ["#btn-ar-refresh", refreshCampaigns],
+    ["#btn-ar-folder", openCampaignFolder],
+    ["#btn-ar-open", () => runAccessReview("Open")],
+    ["#btn-ar-worksheet", openWorksheet],
+    ["#btn-ar-close", () => runAccessReview("Close")],
+    ["#btn-ar-report", () => runAccessReview("Report")],
+  ];
+  arActions.forEach(([sel, fn]) => {
+    const btn = document.querySelector(sel);
+    if (btn) btn.addEventListener("click", fn);
+  });
 
   try {
     supportedMajor = await invoke("supported_schema_major");
@@ -870,6 +1181,9 @@ window.addEventListener("DOMContentLoaded", async () => {
     }
     setRunning(false);
     endOp();
+    // A campaign action — or an in-concert assessment — may have just
+    // created or closed one, so re-read the folder either way.
+    refreshCampaigns();
   });
   listen("run:error", (e) => {
     logProcessLine(`[process error] ${e.payload}`, "error");
@@ -973,17 +1287,18 @@ window.addEventListener("DOMContentLoaded", async () => {
   });
   listen("install:exit", async (e) => {
     logLine(`[install] exited ${e.payload}`, e.payload === 0 ? "ok" : "warn");
-    installing = false;
+    setInstalling(false);
     endOp();
     await refreshWingetAvailability();
     await loadReadiness();
   });
   listen("install:error", (e) => {
     logLine(`[install] error: ${e.payload}`, "error");
-    installing = false;
+    setInstalling(false);
     endOp();
   });
 
   await refreshWingetAvailability();
   await loadReadiness();
+  await refreshCampaigns();
 });
