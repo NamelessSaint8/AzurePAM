@@ -241,6 +241,10 @@ function syncAccessReviewButtons() {
   els.arWorksheet.disabled = busy || !sel;
   els.arClose.disabled = busy || !appReady || !sel || sel.status !== "Open";
   els.arReport.disabled = busy || !appReady || !sel;
+  // Closed only: the generator reads the *decisions* of a finished
+  // campaign. An open one has none yet, so offering the button there
+  // would promise a script the engine cannot write.
+  els.arRemediate.disabled = busy || !appReady || !sel || sel.status !== "Closed";
 }
 
 function fmtCampaignOpened(utc) {
@@ -1109,6 +1113,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     arWorksheet: document.querySelector("#btn-ar-worksheet"),
     arClose: document.querySelector("#btn-ar-close"),
     arReport: document.querySelector("#btn-ar-report"),
+    arRemediate: document.querySelector("#btn-ar-remediate"),
   };
   document.querySelector("#btn-run").addEventListener("click", runAssessment);
   document.querySelector("#btn-cancel").addEventListener("click", cancelRun);
@@ -1147,6 +1152,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     ["#btn-ar-worksheet", openWorksheet],
     ["#btn-ar-close", () => runAccessReview("Close")],
     ["#btn-ar-report", () => runAccessReview("Report")],
+    ["#btn-ar-remediate", () => runAccessReview("Remediate")],
   ];
   arActions.forEach(([sel, fn]) => {
     const btn = document.querySelector(sel);

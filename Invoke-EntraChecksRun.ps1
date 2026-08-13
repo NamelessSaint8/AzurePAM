@@ -58,14 +58,17 @@
     run-history manifest is still written.
 
 .PARAMETER AccessReviewAction
-    Open | Close | Report. When supplied the run is campaign-only
-    (Mode=AccessReview): Auth then the AccessReview phase, no assessment.
+    Open | Close | Report | Remediate. When supplied the run is
+    campaign-only (Mode=AccessReview): Auth then the AccessReview phase, no
+    assessment. Remediate is offline — it reads a CLOSED campaign off disk
+    and writes a remediation script, so it runs with no Auth phase at all.
 
 .PARAMETER AccessReviewDirectory
     Campaign root folder. Overrides AccessReview.OutputDirectory in config.
 
 .PARAMETER CampaignId
-    Campaign FOLDER NAME (not a path). Required for Close / Report.
+    Campaign FOLDER NAME (not a path). Required for Close / Report /
+    Remediate.
 
 .PARAMETER OpenAccessReviewCampaign
     "In concert": keep the normal assessment run and also open a campaign,
@@ -121,7 +124,7 @@ param(
 
     [switch]$EmitEvents,
 
-    [ValidateSet('Open', 'Close', 'Report')]
+    [ValidateSet('Open', 'Close', 'Report', 'Remediate')]
     [string]$AccessReviewAction,
 
     [string]$AccessReviewDirectory,

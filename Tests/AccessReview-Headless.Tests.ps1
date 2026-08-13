@@ -20,6 +20,13 @@
     6. In concert: a normal run with -OpenAccessReviewCampaign emits the
        AccessReview phase between Modules and SOC2, reusing the privileged
        roster the run already built.
+    7. PR 2 of plans/Access-Review-Remediation-Script-Plan.md — the
+       Remediate action: phase + the two remediation artifacts, the
+       missing-CampaignId refusal, a generator refusal as a non-fatal
+       error, the action counts reaching the event path, and (the property
+       most likely to regress) a Remediate run that authenticates not at
+       all — and echoes that decision, not the Interactive default, into
+       run.started.
 
     Run: Invoke-Pester -Path Tests/AccessReview-Headless.Tests.ps1
 #>
@@ -36,6 +43,10 @@ BeforeAll {
     Import-Module (Join-Path $repoRoot 'Modules/EntraChecks-Runner.psm1') -Force
     Import-Module (Join-Path $repoRoot 'Modules/EntraChecks-AccessReview.psm1') -Force -DisableNameChecking
     Import-Module (Join-Path $repoRoot 'Modules/EntraChecks-AccessReviewReport.psm1') -Force -DisableNameChecking
+    # Imported here (not left to Invoke-AccessReviewPhase's lazy import) so
+    # New-AccessReviewRemediationScript exists to be mocked, and so the
+    # phase's `if (-not (Get-Module ...))` guard leaves the mock alone.
+    Import-Module (Join-Path $repoRoot 'Modules/EntraChecks-AccessReviewRemediation.psm1') -Force -DisableNameChecking
 
     # Dot-source the orchestration include so Invoke-AccessReviewPhase /
     # Invoke-EcfAssessmentSequence are defined here — mockable, callable —
@@ -520,6 +531,263 @@ Describe 'Campaign close — a report render fault does not invalidate the close
         # .Count direct: @() around an empty List[object] throws on pwsh 7.6.
         $ctx.Errors.Count | Should -Be 0
         @($ctx.Warnings | Where-Object { $_.code -eq 'accessReview.reportFailed' }).Count | Should -Be 1
+    }
+}
+
+Describe 'Invoke-AccessReviewPhase — Remediate' {
+
+    BeforeEach {
+        $script:RemRoot = Join-Path $TestDrive ("rem-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        $script:RemCamp = Join-Path $script:RemRoot 'camp-closed'
+        $null = New-Item -Path $script:RemCamp -ItemType Directory -Force
+
+        # What the generator produces: a SIBLING of the campaign folder, so
+        # the sealed bundle still verifies against its own manifest.
+        $remOut = Join-Path (Join-Path $script:RemRoot 'remediation') 'camp-closed'
+        $null = New-Item -Path $remOut -ItemType Directory -Force
+        $script:RemScript = Join-Path $remOut 'remediate-camp-closed.ps1'
+        $script:RemPlan = Join-Path $remOut 'remediation-plan.md'
+        Set-Content -LiteralPath $script:RemScript -Value '# generated' -Encoding UTF8
+        Set-Content -LiteralPath $script:RemPlan -Value '# plan' -Encoding UTF8
+
+        # The generator has its own 33-test suite; this file tests the wiring.
+        # The mock still binds against the real signature, so a wrong
+        # parameter name on the call site fails here.
+        Mock New-AccessReviewRemediationScript {
+            @{ Success = $true; FailureReason = $null; ScriptPath = $script:RemScript; PlanPath = $script:RemPlan; ActionCount = 3; ManualCount = 1; SkippedCount = 2 }
+        }
+    }
+
+    It 'runs the phase and records the script + plan artifacts' {
+        $ctx = & $script:MakeCtx 'ar-remediate' $script:RemRoot
+        $r = Invoke-AccessReviewPhase -Action 'Remediate' -CampaignDirectory $script:RemRoot `
+            -CampaignId 'camp-closed' -Context $ctx
+
+        $r.Success | Should -BeTrue -Because ($r.FailureReason)
+        $r.ActionCount | Should -Be 3
+        $r.ManualCount | Should -Be 1
+        Should -Invoke New-AccessReviewRemediationScript -Times 1 -Exactly `
+            -ParameterFilter { $CampaignDirectory -eq $script:RemCamp }
+
+        @($ctx.Events | Where-Object { $_.type -eq 'phase.started' -and $_.phase -eq 'AccessReview' }).Count |
+            Should -Be 1
+        $done = @($ctx.Events | Where-Object { $_.type -eq 'phase.completed' -and $_.phase -eq 'AccessReview' })
+        $done.Count | Should -Be 1
+        $done[0].status | Should -BeExactly 'ok'
+
+        $kinds = @($ctx.Artifacts | ForEach-Object { $_.kind })
+        $kinds | Should -Contain 'remediation-script'
+        $kinds | Should -Contain 'remediation-plan'
+        # Remediate produced neither of these — they belong to the campaign
+        # itself, and claiming them here would misreport what the run did.
+        $kinds | Should -Not -Contain 'worksheet'
+        $kinds | Should -Not -Contain 'manifest'
+
+        ($ctx.Artifacts | Where-Object { $_.kind -eq 'remediation-script' }).path |
+            Should -BeLike '*remediate-camp-closed.ps1'
+    }
+
+    It 'puts the action counts on the event path, not just the console' {
+        # A path alone does not say whether the script is a no-op or removes
+        # ten role assignments. The console menu prints the three counts;
+        # an event consumer (the GUI) must get them too.
+        $ctx = & $script:MakeCtx 'ar-counts' $script:RemRoot
+        $null = Invoke-AccessReviewPhase -Action 'Remediate' -CampaignDirectory $script:RemRoot `
+            -CampaignId 'camp-closed' -Context $ctx
+
+        $counts = @($ctx.Events | Where-Object { $_.type -eq 'log' -and $_.message -match 'Actions=' })
+        $counts.Count | Should -Be 1
+        $counts[0].message | Should -Match 'Actions=3'
+        $counts[0].message | Should -Match 'Manual=1'
+        $counts[0].message | Should -Match 'Skipped=2'
+    }
+
+    It 'rejects a missing -CampaignId before calling the generator' {
+        $r = Invoke-AccessReviewPhase -Action 'Remediate' -CampaignDirectory $script:RemRoot
+        $r.Success | Should -BeFalse
+        $r.FailureReason | Should -Match 'CampaignId'
+        Should -Invoke New-AccessReviewRemediationScript -Times 0 -Exactly
+    }
+
+    It 'Add-EcfArtifact accepts both remediation kinds' {
+        # i.e. the runner's ValidateSet was actually extended — without this
+        # the phase throws at runtime the first time it emits an artifact.
+        $ctx = & $script:MakeCtx 'ar-kinds' $script:RemRoot
+        { Add-EcfArtifact -Context $ctx -Kind 'remediation-script' -Path $script:RemScript } | Should -Not -Throw
+        { Add-EcfArtifact -Context $ctx -Kind 'remediation-plan' -Path $script:RemPlan } | Should -Not -Throw
+        $ctx.Artifacts.Count | Should -Be 2
+    }
+}
+
+Describe 'Remediate — a generator refusal is a non-fatal outcome' {
+
+    BeforeEach {
+        Mock Invoke-ModuleAssessment { [pscustomobject]@{ Duration = [timespan]::Zero; Errors = @(); Modules = @{} } }
+        Mock Export-AssessmentResult { $script:Tmp }
+        Mock Invoke-SOC2ReadinessIfEnabled { }
+        Mock New-AccessReviewRemediationScript {
+            @{ Success = $false; FailureReason = "Campaign 'camp-open' is Open, not Closed. Nothing generated." }
+        }
+
+        $script:Tmp = Join-Path $TestDrive ("remfail-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        $null = New-Item -Path $script:Tmp -ItemType Directory -Force
+        $script:CampaignRoot = Join-Path $script:Tmp 'campaigns'
+        $null = New-Item -Path (Join-Path $script:CampaignRoot 'camp-open') -ItemType Directory -Force
+        $script:Findings = @()
+        $script:AccessReviewEntraRoster = $null
+
+        $OutputDirectory = $script:Tmp
+        $AccessReviewAction = 'Remediate'
+        $AccessReviewDirectory = $script:CampaignRoot
+        $CampaignId = 'camp-open'
+        $OpenAccessReviewCampaign = $false
+        $null = $OutputDirectory, $AccessReviewAction, $AccessReviewDirectory, $CampaignId, $OpenAccessReviewCampaign
+    }
+
+    It 'carries the reason verbatim, fails the phase, and still reaches run.result' {
+        $seen = New-Object System.Collections.Generic.List[object]
+        $sink = { param($e) $seen.Add($e) | Out-Null }
+        $seq = Invoke-EcfAssessmentSequence -TenantNameValue 'Contoso' -ModuleSet @() -AccessReviewOnly `
+            -InvocationParams @{ TenantName = 'Contoso'; OutputDirectory = $script:Tmp } -EventSink $sink
+
+        $seq.Manifest | Should -Not -BeNullOrEmpty
+        $seq.Manifest.type | Should -BeExactly 'run.result'
+
+        $err = @($seq.Manifest.errors | Where-Object { $_.code -eq 'accessReview.failed' })
+        $err.Count | Should -Be 1
+        $err[0].fatal | Should -BeFalse
+        $err[0].message | Should -BeExactly "Campaign 'camp-open' is Open, not Closed. Nothing generated."
+
+        $done = @($seen | Where-Object { $_.type -eq 'phase.completed' -and $_.phase -eq 'AccessReview' })
+        $done.Count | Should -Be 1
+        $done[0].status | Should -BeExactly 'failed'
+        @($seq.Manifest.artifacts).Count | Should -Be 0
+    }
+}
+
+Describe 'Remediate — the run never authenticates' {
+
+    # The generator reads campaign files and touches no tenant, so producing
+    # a script must not cost a sign-in. Two halves: the auth options a
+    # Remediate run builds, and the run those options actually produce.
+
+    BeforeEach {
+        $script:Tmp = Join-Path $TestDrive ("noauth-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        $null = New-Item -Path $script:Tmp -ItemType Directory -Force
+        $script:CampaignRoot = Join-Path $script:Tmp 'campaigns'
+        $null = New-Item -Path (Join-Path $script:CampaignRoot 'camp-closed') -ItemType Directory -Force
+        $remOut = Join-Path (Join-Path $script:CampaignRoot 'remediation') 'camp-closed'
+        $null = New-Item -Path $remOut -ItemType Directory -Force
+        $script:RemScript = Join-Path $remOut 'remediate-camp-closed.ps1'
+        Set-Content -LiteralPath $script:RemScript -Value '# generated' -Encoding UTF8
+
+        Mock New-AccessReviewRemediationScript {
+            @{ Success = $true; FailureReason = $null; ScriptPath = $script:RemScript; PlanPath = ''; ActionCount = 1; ManualCount = 0; SkippedCount = 0 }
+        }
+        Mock Connect-EntraCheck { throw 'a Remediate run must never sign in' }
+        Mock Invoke-ModuleAssessment { [pscustomobject]@{ Duration = [timespan]::Zero; Errors = @(); Modules = @{} } }
+        Mock Export-AssessmentResult { $script:Tmp }
+        Mock Invoke-SOC2ReadinessIfEnabled { }
+        $script:Findings = @()
+        $script:AccessReviewEntraRoster = $null
+    }
+
+    It 'New-EcfAuthRunOptions hands back no auth action for Remediate' {
+        $SkipAuthentication = $false
+        $AuthMethod = 'Interactive'
+        $AccessReviewAction = 'Remediate'
+        $null = $SkipAuthentication, $AuthMethod, $AccessReviewAction
+
+        $opts = New-EcfAuthRunOptions
+        $opts.Action | Should -BeNullOrEmpty
+        $opts.Method | Should -BeExactly 'Skip'
+    }
+
+    It 'the very same settings DO produce an auth action for Report' {
+        # Keeps the assertion above honest: it is Remediate that suppresses
+        # auth, not an unset ambient parameter.
+        $SkipAuthentication = $false
+        $AuthMethod = 'Interactive'
+        $AccessReviewAction = 'Report'
+        $null = $SkipAuthentication, $AuthMethod, $AccessReviewAction
+
+        $opts = New-EcfAuthRunOptions
+        $opts.Action | Should -Not -BeNullOrEmpty
+        $opts.Method | Should -BeExactly 'Interactive'
+    }
+
+    It 'the echoed invocation params report the auth decision that ran' {
+        # These params become run.started + the run-history manifest. This
+        # is audit metadata about an auth decision, so it must not claim an
+        # Interactive sign-in for a run that never signed in.
+        $SkipAuthentication = $false
+        $AuthMethod = 'Interactive'
+        $AccessReviewAction = 'Remediate'
+        $null = $SkipAuthentication, $AuthMethod, $AccessReviewAction
+
+        $p = Get-EcfInvocationParams -ResolvedTenant 'Contoso'
+        $p.AuthMethod | Should -BeExactly 'Skip'
+        $p.SkipAuthentication | Should -BeTrue
+    }
+
+    It 'the same params still report Interactive for Report' {
+        # Keeps the assertion above honest: it is Remediate that rewrites
+        # the echoed pair, not a blanket 'Skip'.
+        $SkipAuthentication = $false
+        $AuthMethod = 'Interactive'
+        $AccessReviewAction = 'Report'
+        $null = $SkipAuthentication, $AuthMethod, $AccessReviewAction
+
+        $p = Get-EcfInvocationParams -ResolvedTenant 'Contoso'
+        $p.AuthMethod | Should -BeExactly 'Interactive'
+        $p.SkipAuthentication | Should -BeFalse
+    }
+
+    It 'a full -Mode AccessReview Remediate run emits no auth.* events, no Auth phase, and records Skip' {
+        $TenantName = 'Contoso'
+        $SkipAuthentication = $false
+        $AuthMethod = 'Interactive'
+        $EmitEvents = $true
+        $OutputDirectory = $script:Tmp
+        $AccessReviewAction = 'Remediate'
+        $AccessReviewDirectory = $script:CampaignRoot
+        $CampaignId = 'camp-closed'
+        $OpenAccessReviewCampaign = $false
+        $null = $TenantName, $SkipAuthentication, $AuthMethod, $EmitEvents, $OutputDirectory,
+        $AccessReviewAction, $AccessReviewDirectory, $CampaignId, $OpenAccessReviewCampaign
+
+        # The NDJSON contract is written to real stdout ([Console]::Out), not
+        # the PowerShell pipeline, so the console is redirected for the call.
+        $writer = New-Object System.IO.StringWriter
+        $prev = [Console]::Out
+        try {
+            [Console]::SetOut($writer)
+            Start-AccessReviewMode
+        }
+        finally {
+            [Console]::SetOut($prev)
+        }
+
+        $events = @($writer.ToString() -split "`r?`n" |
+                Where-Object { $_.Trim().StartsWith('{') } |
+                ForEach-Object { $_ | ConvertFrom-Json })
+
+        $events.Count | Should -BeGreaterThan 0
+        @($events | Where-Object { ([string]$_.type).StartsWith('auth.') }).Count |
+            Should -Be 0 -Because 'generating a script must not cost a sign-in'
+        @($events | Where-Object { $_.phase -eq 'Auth' }).Count | Should -Be 0
+        Should -Invoke Connect-EntraCheck -Times 0 -Exactly
+
+        # The permanent record of that decision, as a consumer reads it.
+        $started = @($events | Where-Object { $_.type -eq 'run.started' })
+        $started.Count | Should -Be 1
+        $started[0].params.AuthMethod | Should -BeExactly 'Skip'
+        $started[0].params.SkipAuthentication | Should -BeTrue
+
+        @($events | Where-Object { $_.type -eq 'phase.started' -and $_.phase -eq 'AccessReview' }).Count | Should -Be 1
+        $result = @($events | Where-Object { $_.type -eq 'run.result' })
+        $result.Count | Should -Be 1
+        @($result[0].artifacts | ForEach-Object { $_.kind }) | Should -Contain 'remediation-script'
     }
 }
 

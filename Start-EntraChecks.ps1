@@ -177,8 +177,10 @@ param(
     # lifecycle on its own (Auth -> AccessReview, no Core/Modules/Report/
     # Snapshot/SOC2); -OpenAccessReviewCampaign instead adds an AccessReview
     # phase to a normal run ("in concert"), reusing the privileged roster
-    # that run already built.
-    [ValidateSet('Open', 'Close', 'Report')]
+    # that run already built. Remediate is the offline action: it reads a
+    # CLOSED campaign off disk and writes a remediation script, so it never
+    # authenticates (see New-EcfAuthRunOptions).
+    [ValidateSet('Open', 'Close', 'Report', 'Remediate')]
     [string]$AccessReviewAction,
 
     # Campaign root. Overrides AccessReview.OutputDirectory from config.
@@ -186,7 +188,7 @@ param(
     [string]$AccessReviewDirectory,
 
     # Campaign FOLDER NAME (not a path), e.g. 2026-Q3-20260803-141500.
-    # Required for -AccessReviewAction Close / Report.
+    # Required for -AccessReviewAction Close / Report / Remediate.
     [string]$CampaignId,
 
     # "In concert": also open an access-review campaign during a normal run.

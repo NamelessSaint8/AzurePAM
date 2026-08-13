@@ -439,13 +439,13 @@ fn run_assessment(
     Ok(())
 }
 
-const ACCESS_REVIEW_ACTIONS: &[&str] = &["Open", "Close", "Report"];
+const ACCESS_REVIEW_ACTIONS: &[&str] = &["Open", "Close", "Report", "Remediate"];
 
 fn normalize_access_review_action(action: String) -> Result<String, String> {
     let a = action.trim();
     if !ACCESS_REVIEW_ACTIONS.contains(&a) {
         return Err(format!(
-            "Unknown access review action: {a} (expected Open, Close or Report)."
+            "Unknown access review action: {a} (expected Open, Close, Report or Remediate)."
         ));
     }
     Ok(a.to_string())
@@ -457,8 +457,10 @@ fn normalize_access_review_action(action: String) -> Result<String, String> {
 /// phases, log, artifacts and Cancel all work unchanged.
 ///
 /// `campaign_dir` is the durable campaign folder; `campaign_id` is a
-/// campaign *folder name* inside it (required by Close/Report, empty
-/// for Open, which mints its own).
+/// campaign *folder name* inside it (required by every action except
+/// Open, which mints its own). `Remediate` reads a closed campaign and
+/// writes a script for the operator to run — the engine skips auth for
+/// it, so it costs no sign-in.
 #[tauri::command]
 fn run_access_review(
     app: AppHandle,
@@ -755,8 +757,35 @@ fn install_pwsh_via_winget(app: AppHandle) -> Result<(), String> {
 /// recorded post-MVP polish (plan §10 / step-6 deviation), not a
 /// blocker — the configure→run→watch→open-report loop is complete
 /// with OS-open.
+/// Extensions we will never hand to the shell, because on a host where
+/// the association runs them instead of opening an editor, "open" means
+/// "execute". The remediation generator emits a `.ps1` that removes
+/// privileged access; EntraChecks does not run what it generates, and
+/// that invariant must not depend on a per-machine file association.
+const NEVER_SHELL_OPEN: &[&str] = &["ps1", "psm1", "bat", "cmd", "com", "exe", "vbs", "js"];
+
+/// Pure so it can be tested without an `AppHandle`.
+fn is_never_shell_open(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| NEVER_SHELL_OPEN.contains(&e.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
 #[tauri::command]
 fn open_report(app: AppHandle, path: String) -> Result<(), String> {
+    let p = Path::new(&path);
+    if is_never_shell_open(p) {
+        // Reveal the containing folder instead. The user opens the file
+        // deliberately, in the editor of their choosing.
+        let parent = p
+            .parent()
+            .ok_or_else(|| format!("No containing folder for {path}"))?;
+        return app
+            .opener()
+            .open_path(parent.to_string_lossy().into_owned(), None::<&str>)
+            .map_err(|e| e.to_string());
+    }
     app.opener()
         .open_path(path, None::<&str>)
         .map_err(|e| e.to_string())
@@ -792,6 +821,29 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_report_never_shell_opens_an_executable_artifact() {
+        // The remediation generator emits a .ps1 that removes privileged
+        // access. "Open remediation-script" must reveal its folder, never
+        // hand it to the shell — on a host where .ps1 is associated with
+        // PowerShell, opening it IS running it, and EntraChecks does not
+        // run what it generates.
+        for ext in ["ps1", "PS1", "psm1", "bat", "cmd", "exe", "vbs", "js"] {
+            let p = std::path::PathBuf::from(format!("C:\\campaigns\\remediate.{ext}"));
+            assert!(
+                is_never_shell_open(&p),
+                ".{ext} must not be shell-opened"
+            );
+        }
+        // Everything the app actually wants opened still opens.
+        for ext in ["html", "csv", "json", "xlsx", "md", "txt"] {
+            let p = std::path::PathBuf::from(format!("C:\\out\\report.{ext}"));
+            assert!(!is_never_shell_open(&p), ".{ext} should open normally");
+        }
+        // An extensionless path is not treated as executable.
+        assert!(!is_never_shell_open(&std::path::PathBuf::from("C:\\out\\report")));
+    }
 
     #[test]
     fn app_version_matches_cargo_manifest() {
@@ -865,13 +917,25 @@ mod tests {
         // Mirrors -AccessReviewAction's ValidateSet. A typo from the
         // webview must fail here, before an auth prompt costs the user
         // a sign-in for a run the engine would then reject.
-        for a in ["Open", "Close", "Report"] {
+        for a in ["Open", "Close", "Report", "Remediate"] {
             assert_eq!(normalize_access_review_action(a.into()).unwrap(), a);
         }
         assert_eq!(normalize_access_review_action(" Close ".into()).unwrap(), "Close");
         assert!(normalize_access_review_action("".into()).is_err());
         assert!(normalize_access_review_action("close".into()).is_err());
         assert!(normalize_access_review_action("Delete".into()).is_err());
+        // Near-misses for the new action: the generator writes a script
+        // the operator then runs by hand, so a silently-accepted typo
+        // that produced the wrong artifact would be worse than a hard
+        // failure here.
+        assert!(normalize_access_review_action("remediate".into()).is_err());
+        assert!(normalize_access_review_action("Remediation".into()).is_err());
+        // Every action except Open needs a campaign to act on — the rule
+        // in run_access_review is `action != "Open"`, so Remediate is
+        // covered by construction. Pin that it stays that way.
+        for a in ACCESS_REVIEW_ACTIONS {
+            assert_eq!(*a != "Open", ["Close", "Report", "Remediate"].contains(a));
+        }
     }
 
     #[test]

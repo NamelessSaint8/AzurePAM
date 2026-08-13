@@ -203,7 +203,16 @@
           <button id="btn-ar-worksheet" type="button" class="secondary" disabled>Open worksheet</button>
           <button id="btn-ar-close" type="button" class="secondary" disabled>Close campaign</button>
           <button id="btn-ar-report" type="button" class="secondary" disabled>Regenerate report</button>
+          <button id="btn-ar-remediate" type="button" class="secondary" disabled>Generate remediation script</button>
         </div>
+        <!-- The one thing to get wrong about this feature: EntraChecks
+             writes the script, it never runs it. Stated at the button,
+             not only in the docs. -->
+        <p class="muted ar-remediate-note">
+          EntraChecks writes the remediation script and its plan — it never
+          runs them. Read the script, then run it yourself. Needs a
+          <code>Closed</code> campaign.
+        </p>
         <p id="ar-status" class="run-status"></p>
       </section>
 
