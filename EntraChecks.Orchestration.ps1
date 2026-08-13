@@ -298,7 +298,11 @@ function Invoke-EcfGraphDeviceCodeToken {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string[]]$Scopes,
-        [scriptblock]$DeviceCodeCallback
+        [scriptblock]$DeviceCodeCallback,
+        # 0 = wait for the code's full life (what a user who explicitly chose
+        # device code expects). A positive value caps the wait - see the
+        # deadline comment below.
+        [int]$TimeoutSeconds = 0
     )
 
     # Microsoft Graph PowerShell's public-client app id. We use the
@@ -350,6 +354,17 @@ function Invoke-EcfGraphDeviceCodeToken {
 
     $interval = [Math]::Max(1, [int]$device.interval)
     $expires = if ([int]$device.expires_in -gt 0) { [int]$device.expires_in } else { 900 }
+    # ponytail: cap the wait instead of plumbing the cancel sentinel down
+    # here. Cancellation in this engine is cooperative (a sentinel file; the
+    # child is never killed) and is only polled between phases, so nothing
+    # can interrupt this loop - an unattended sign-in would pin the run for
+    # the code's full ~15-minute life. Trade-off: a caller that did NOT ask
+    # for device code (the browser-failure fallback) passes a cap and fails
+    # clearly when it lapses; the direct DeviceCode path passes nothing and
+    # keeps the full window. Upgrade path: pass the run context in and poll
+    # Test-EcfCancelled here if per-second cancellation is ever needed.
+    $capped = ($TimeoutSeconds -gt 0 -and $TimeoutSeconds -lt $expires)
+    if ($capped) { $expires = $TimeoutSeconds }
     $deadline = (Get-Date).AddSeconds($expires)
     $tokenBody = @{
         grant_type = 'urn:ietf:params:oauth:grant-type:device_code'
@@ -381,6 +396,13 @@ function Invoke-EcfGraphDeviceCodeToken {
         }
     }
 
+    if ($capped) {
+        # "timed out" is load-bearing: Get-EcfAuthFailureCode classifies on
+        # this text, and without a timeout keyword a lapsed fallback reports
+        # auth.failed ("re-run and sign in") instead of auth.cancelled
+        # ("complete the device-code prompt") — the accurate advice here.
+        throw "Device-code sign-in timed out after the $expires second limit applied to this automatic fallback."
+    }
     throw "Device-code sign-in expired before it was completed."
 }
 
@@ -388,10 +410,11 @@ function Connect-EcfMgGraphDeviceCode {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string[]]$Scopes,
-        [scriptblock]$DeviceCodeCallback
+        [scriptblock]$DeviceCodeCallback,
+        [int]$TimeoutSeconds = 0
     )
 
-    $token = Invoke-EcfGraphDeviceCodeToken -Scopes $Scopes -DeviceCodeCallback $DeviceCodeCallback
+    $token = Invoke-EcfGraphDeviceCodeToken -Scopes $Scopes -DeviceCodeCallback $DeviceCodeCallback -TimeoutSeconds $TimeoutSeconds
     if (-not $token -or [string]::IsNullOrWhiteSpace([string]$token.access_token)) {
         throw "Device-code sign-in completed but no access token was returned."
     }
@@ -449,6 +472,165 @@ function Connect-EcfMgGraphDeviceCode {
     return Add-EcfMgContextFallback -Context (Get-MgContext -ErrorAction SilentlyContinue)
 }
 
+function Test-EcfBrokerAuthFailure {
+    <#
+    .SYNOPSIS
+        True when a Graph sign-in error is the WAM broker's missing
+        parent-window-handle host limitation.
+
+    .DESCRIPTION
+        Azure.Identity 1.18.x (shipped with Microsoft.Graph.Authentication
+        2.37.0) throws "A window handle must be configured" instead of
+        falling back to the system browser when the WAM broker is present
+        and no parent window handle is available. The desktop app spawns
+        PowerShell with CREATE_NO_WINDOW, so there is no handle to supply
+        and browser sign-in dies in ~4 seconds with no browser and no code.
+
+        Matched on that signature ONLY - the missing parent window handle -
+        so genuine failures (bad credentials, cancelled sign-in, consent
+        required, MFA required, blocked account, network) are NOT mistaken
+        for a host limitation. Merely naming WAM or the broker does not
+        qualify: those errors are relayed THROUGH the broker and quote it in
+        their text, so matching the bare words fired a pointless device-code
+        retry and re-labelled a real privileges failure as auth.failed.
+
+    .PARAMETER Message
+        The exception message to classify.
+
+    .EXAMPLE
+        Test-EcfBrokerAuthFailure -Message 'A window handle must be configured.'
+        Returns $true.
+
+    .EXAMPLE
+        Test-EcfBrokerAuthFailure -Message 'WAM Error: AADSTS65001: consent required'
+        Returns $false - a broker-relayed consent failure, not a host limitation.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param([AllowNull()][string]$Message)
+
+    if ([string]::IsNullOrWhiteSpace($Message)) { return $false }
+    # Case-insensitive by default. Second alternative also covers the
+    # aka.ms/msal-net-wam#parent-window-handles link Azure.Identity appends.
+    return [bool]($Message -match 'a window handle must be configured|parent[- ]window[- ]handle')
+}
+
+function Get-EcfLastAuthError {
+    <#
+    .SYNOPSIS
+        The underlying sign-in error recorded by the last
+        Connect-EntraCheck attempt ('' when there is none).
+
+    .DESCRIPTION
+        Connect-EntraCheck used to Write-Host the real exception and then
+        return $false, which callers swallow ($null = Connect-EntraCheck).
+        The Auth phase only ever saw its own generic "no Graph context"
+        message. Recording the cause in script scope lets the phase put
+        the real reason on the auth.failed event and classify on it.
+
+    .EXAMPLE
+        Get-EcfLastAuthError
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param()
+
+    $recorded = Get-Variable -Name EcfLastAuthError -Scope Script -ErrorAction SilentlyContinue
+    if ($recorded -and $recorded.Value) { return [string]$recorded.Value }
+    return ''
+}
+
+function Get-EcfAuthFailureCode {
+    <#
+    .SYNOPSIS
+        Maps an authentication error message to a run-contract auth.* code.
+
+    .DESCRIPTION
+        Broker/window-handle failures are checked first: they are a host
+        limitation, not a privileges problem, and must never be reported
+        as auth.insufficientPrivileges (whose "sign in as Global Reader"
+        remediation misdirects).
+
+    .PARAMETER Message
+        The underlying sign-in error message to classify.
+
+    .EXAMPLE
+        Get-EcfAuthFailureCode -Message 'AADSTS65001: consent required'
+        Returns 'auth.insufficientPrivileges'.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([AllowNull()][string]$Message)
+
+    if (Test-EcfBrokerAuthFailure -Message $Message) { return 'auth.failed' }
+    if ($Message -match 'insufficient|privilege|consent|scope|forbidden') { return 'auth.insufficientPrivileges' }
+    if ($Message -match 'cancel|timed out|timeout|expired|declined') { return 'auth.cancelled' }
+    return 'auth.failed'
+}
+
+function Connect-EcfMgGraphInteractive {
+    <#
+    .SYNOPSIS
+        Browser (WAM/MSAL) Graph sign-in with a one-shot device-code
+        fallback when the host cannot host the broker.
+
+    .DESCRIPTION
+        Attempts the normal interactive Connect-MgGraph. If — and only if
+        — it fails with the broker's parent-window-handle signature, the
+        in-engine device-code path is retried EXACTLY once (it talks to
+        the raw OAuth device-code endpoints, so it needs no broker and no
+        window). Any other failure is rethrown unchanged.
+
+        A failure inside the fallback is a DEVICE-CODE failure and is
+        rethrown as one - the caller must classify on that cause. The fact
+        that the fallback ran is carried structurally in
+        $script:EcfDeviceCodeFallbackUsed rather than in the message text.
+
+    .PARAMETER Scopes
+        Graph scopes to request.
+
+    .PARAMETER DeviceCodeCallback
+        Optional callback invoked with the device-code info if the
+        fallback runs, so the GUI Sign-in panel shows the real code.
+
+    .EXAMPLE
+        Connect-EcfMgGraphInteractive -Scopes $script:AllGraphScopes
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string[]]$Scopes,
+        [scriptblock]$DeviceCodeCallback
+    )
+
+    try {
+        Connect-MgGraph -Scopes $Scopes -NoWelcome -ErrorAction Stop | Out-Null
+        return Get-MgContext
+    }
+    catch {
+        if (-not (Test-EcfBrokerAuthFailure -Message $_.Exception.Message)) { throw }
+
+        Write-Host "    [i] Browser sign-in is unavailable in this host (no window handle for the WAM broker). Falling back to device code..." -ForegroundColor Yellow
+        Write-Log -Level WARN -Message "Browser sign-in unavailable (WAM broker needs a parent window handle) - falling back to device code" -Category "Authentication" -ErrorRecord $_
+        # Structural marker, read by the Auth phase. The previous version
+        # embedded the broker signature in the rethrown text below; that
+        # string re-matched Test-EcfBrokerAuthFailure during classification,
+        # discarded the real device-code cause and advised "re-run with
+        # Device code sign-in" immediately after device code had failed.
+        $script:EcfDeviceCodeFallbackUsed = $true
+        try {
+            # 300s: long enough for a browser + MFA round trip, short enough
+            # that an unattended failure does not pin the run (see the
+            # deadline comment in Invoke-EcfGraphDeviceCodeToken).
+            return Connect-EcfMgGraphDeviceCode -Scopes $Scopes -DeviceCodeCallback $DeviceCodeCallback -TimeoutSeconds 300
+        }
+        catch {
+            # Deliberately free of the window-handle signature: this failure
+            # must classify on the device-code cause, not the broker.
+            throw "Device-code fallback for unavailable browser sign-in failed: $($_.Exception.Message)"
+        }
+    }
+}
+
 function Connect-EntraCheck {
     param(
         [switch]$GraphOnly,
@@ -456,6 +638,14 @@ function Connect-EntraCheck {
         [switch]$UseDeviceCode,
         [scriptblock]$DeviceCodeCallback
     )
+
+    # Cleared per attempt; the Graph catch records the real exception so
+    # the Auth phase can report and classify on it (see Get-EcfLastAuthError).
+    $script:EcfLastAuthError = ''
+    # Cleared per attempt; set by Connect-EcfMgGraphInteractive when the
+    # browser path falls back to device code, so the Auth phase never
+    # advises device code after device code has already been tried.
+    $script:EcfDeviceCodeFallbackUsed = $false
 
     Write-Host "`n[+] Authenticating..." -ForegroundColor Cyan
     Write-Log -Level INFO -Message "Starting authentication process" -Category "Authentication" -Properties @{
@@ -502,8 +692,7 @@ function Connect-EntraCheck {
                         $context = Connect-EcfMgGraphDeviceCode -Scopes $script:AllGraphScopes -DeviceCodeCallback $DeviceCodeCallback
                     }
                     else {
-                        Connect-MgGraph -Scopes $script:AllGraphScopes -NoWelcome -ErrorAction Stop
-                        $context = Get-MgContext
+                        $context = Connect-EcfMgGraphInteractive -Scopes $script:AllGraphScopes -DeviceCodeCallback $DeviceCodeCallback
                     }
                     Write-Host "    [OK] Connected as: $($context.Account)" -ForegroundColor Green
                 }
@@ -516,8 +705,7 @@ function Connect-EntraCheck {
                 }
                 else {
                     Write-Host "    TIP: If browser auth fails, select [A] Authentication and try device code" -ForegroundColor Gray
-                    Connect-MgGraph -Scopes $script:AllGraphScopes -NoWelcome -ErrorAction Stop
-                    $context = Get-MgContext
+                    $context = Connect-EcfMgGraphInteractive -Scopes $script:AllGraphScopes -DeviceCodeCallback $DeviceCodeCallback
                 }
                 Write-Host "    [OK] Connected as: $($context.Account)" -ForegroundColor Green
             }
@@ -530,6 +718,11 @@ function Connect-EntraCheck {
             Write-AuditLog -EventType "AuthenticationSuccess" -Description "Microsoft Graph authentication succeeded" -TargetObject "Microsoft Graph API" -Result "Success"
         }
         catch {
+            # Record the real exception before returning $false. Callers do
+            # `$null = Connect-EntraCheck`, so without this the text only
+            # ever reached the console and the Auth phase reported its own
+            # generic "no Graph context" message instead.
+            $script:EcfLastAuthError = [string]$_.Exception.Message
             Write-Host "    [!] Graph connection failed: $($_.Exception.Message)" -ForegroundColor Red
             Write-Log -Level ERROR -Message "Microsoft Graph authentication failed" -Category "Authentication" -ErrorRecord $_
             Write-AuditLog -EventType "AuthenticationFailure" -Description "Microsoft Graph authentication failed" -TargetObject "Microsoft Graph API" -Result "Failure"
@@ -1326,23 +1519,27 @@ function Invoke-SOC2ReadinessFromMenu {
         }
     }
 
-    # Load SOC 2 config (fall back to defaults)
+    # Load SOC 2 config (fall back to defaults). Same merged-config
+    # preference as Get-SOC2EnabledFromConfig — a run ENABLED by an
+    # environment override must also be CONFIGURED by it, or the two halves
+    # come from different files.
     $soc2Cfg = $null
-    $accessReviewDir = '.\Output\AccessReview'
-    $configPath = Join-Path $PSScriptRoot "config\entrachecks.config.json"
-    if (Test-Path $configPath) {
+    $configPath = if ($ConfigFile) { $ConfigFile } else { Join-Path $PSScriptRoot "config\entrachecks.config.json" }
+    if ($script:Config -and $script:Config.SOC2) {
+        $soc2Cfg = $script:Config.SOC2
+    } elseif (Test-Path $configPath) {
         try {
             $cfg = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
             if ($cfg.SOC2) { $soc2Cfg = $cfg.SOC2 }
-            if ($cfg.AccessReview -and $cfg.AccessReview.OutputDirectory) {
-                $accessReviewDir = [string]$cfg.AccessReview.OutputDirectory
-            }
         } catch {
             Write-Host "  [!] Could not parse config; using SOC 2 defaults." -ForegroundColor Yellow
         }
     }
     # Reference-if-present: a closed access-review campaign under this
     # directory is cited as CC6.x evidence in the SOC 2 evidence matrix.
+    # Read through the shared reader so it can never point somewhere other
+    # than where the campaign was actually written.
+    $accessReviewDir = (Get-AccessReviewConfig -ConfigPath $configPath).Directory
     if (-not [System.IO.Path]::IsPathRooted($accessReviewDir)) {
         $accessReviewDir = Join-Path $PSScriptRoot $accessReviewDir
     }
@@ -1522,6 +1719,10 @@ function Invoke-SOC2ReadinessFromMenu {
 .DESCRIPTION
     Extracted from Invoke-SOC2ReadinessIfEnabled so the flag-reading logic is
     testable in isolation without invoking the full SOC 2 pipeline.
+
+    Prefers the merged base + -Environment config on $script:Config for the
+    same reason as Get-AccessReviewConfig: a SOC2 block that only exists in
+    an environment override must still be able to enable the auto-run.
 #>
 function Get-SOC2EnabledFromConfig {
     [CmdletBinding()]
@@ -1530,6 +1731,8 @@ function Get-SOC2EnabledFromConfig {
         [Parameter(Mandatory)]
         [string]$ConfigPath
     )
+
+    if ($script:Config -and $script:Config.SOC2) { return [bool]$script:Config.SOC2.Enabled }
 
     if (-not (Test-Path -LiteralPath $ConfigPath)) { return $false }
     try {
@@ -1575,7 +1778,10 @@ function Invoke-SOC2ReadinessIfEnabled {
         [bool]$OpenBrowser = $true
     )
 
-    $configPath = Join-Path $PSScriptRoot 'config\entrachecks.config.json'
+    # The run's own -ConfigFile decides this, not the repo default — mirrors
+    # the AccessReview gate in Invoke-EcfAssessmentSequence. Empty on the
+    # interactive menu path, which keeps reading the repo default.
+    $configPath = if ($ConfigFile) { $ConfigFile } else { Join-Path $PSScriptRoot 'config\entrachecks.config.json' }
     if (-not (Get-SOC2EnabledFromConfig -ConfigPath $configPath)) { return }
 
     Write-Host "`n  [i] SOC2.Enabled = true; running SOC 2 readiness assessment..." -ForegroundColor Cyan
@@ -1761,6 +1967,260 @@ function Invoke-SOC2TypeTwoFromMenu {
     }
 }
 
+<#
+.SYNOPSIS
+    Reads the AccessReview block for the current run and applies the
+    defaults. No console output; a missing or unparseable file yields the
+    defaults with ParseError set.
+
+.DESCRIPTION
+    One reader for both the interactive menu (option [9]) and the headless
+    -Mode AccessReview / in-concert paths, so the two can never drift on
+    which folder, period label, or guest scope a campaign uses.
+    ParseError is surfaced instead of printed so an -EmitEvents run keeps
+    stdout clean; the menu prints its own warning from the flag.
+
+    Prefers $script:Config — the base + -Environment merge Import-Configuration
+    leaves behind in Start-EntraChecks.ps1 — so an AccessReview block that
+    lives only in an environment override (entrachecks.config.prod.json) can
+    still enable or redirect a campaign. Only Import-Configuration performs
+    that merge, so raw-parsing -ConfigPath alone would never see it. Falls
+    back to the raw file read on the menu path and under Pester, where no
+    merged config was ever loaded ($script:Config stays $null).
+#>
+function Get-AccessReviewConfig {
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [string]$ConfigPath
+    )
+
+    $enabled = $false
+    $directory = '.\Output\AccessReview'
+    $includeGuests = $true
+    $periodLabel = ''
+    $parseError = $false
+
+    $cfgRoot = $null
+    if ($script:Config -and $script:Config.AccessReview) {
+        $cfgRoot = $script:Config
+    }
+    elseif (Test-Path -LiteralPath $ConfigPath) {
+        try {
+            $cfgRoot = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
+        }
+        catch {
+            $parseError = $true
+        }
+    }
+
+    # Shape-agnostic: the merged config is a hashtable, the raw parse a
+    # PSCustomObject; a missing key yields $null on both.
+    if ($cfgRoot -and $cfgRoot.AccessReview) {
+        if ($null -ne $cfgRoot.AccessReview.Enabled) { $enabled = [bool]$cfgRoot.AccessReview.Enabled }
+        if ($cfgRoot.AccessReview.OutputDirectory) { $directory = [string]$cfgRoot.AccessReview.OutputDirectory }
+        if ($null -ne $cfgRoot.AccessReview.IncludeGuests) { $includeGuests = [bool]$cfgRoot.AccessReview.IncludeGuests }
+        if ($cfgRoot.AccessReview.PeriodLabel) { $periodLabel = [string]$cfgRoot.AccessReview.PeriodLabel }
+    }
+
+    return [pscustomobject]@{
+        Enabled = $enabled
+        Directory = $directory
+        IncludeGuests = $includeGuests
+        PeriodLabel = $periodLabel
+        ParseError = $parseError
+    }
+}
+
+<#
+.SYNOPSIS
+    Non-interactive Access Review dispatcher — the headless counterpart of
+    Invoke-AccessReviewFromMenu and the body of the ECF 'AccessReview'
+    phase.
+
+.DESCRIPTION
+    Resolves the campaign root (-CampaignDirectory > config
+    AccessReview.OutputDirectory > .\Output\AccessReview), imports the two
+    Access Review modules, and dispatches one action:
+
+        Open   -> New-AccessReviewCampaign
+        Close  -> Complete-AccessReviewCampaign, then New-AccessReviewReport
+        Report -> New-AccessReviewReport (Open campaigns render as DRAFT)
+
+    Takes every choice as a parameter — there is no prompting and no
+    console output, so it is safe inside an -EmitEvents run. When a run
+    context is supplied it owns the whole 'AccessReview' phase: it opens
+    the phase, records worksheet / access-review-html / manifest artifacts
+    for the files that exist, and closes the phase exactly once.
+
+    A module that returns { Success = $false; FailureReason = ... } is an
+    expected outcome, not a crash: the reason is emitted verbatim as a
+    NON-FATAL accessReview.failed error, the phase completes with status
+    'failed', and the run carries on to run.result. An incomplete
+    worksheet is the common case — the campaign stays Open.
+
+.PARAMETER Action
+    Open, Close, or Report.
+
+.PARAMETER TenantName
+    Friendly tenant name stamped into campaign evidence (Open only).
+
+.PARAMETER CampaignDirectory
+    Campaign root. Relative paths resolve against the repo root. Empty =
+    take the config value.
+
+.PARAMETER CampaignId
+    Campaign FOLDER NAME (not a path). Required for Close and Report.
+
+.PARAMETER ConfigPath
+    Configuration file the AccessReview block is read from. Empty = the
+    repo default (config\entrachecks.config.json). Callers pass the run's
+    own -ConfigFile so an environment-specific config can redirect or
+    re-scope campaigns.
+
+.PARAMETER EntraRoster
+    Pre-built privileged roster (Get-PrivilegedIdentityRosterEntra shape)
+    to reuse for Open instead of re-pulling it from Graph.
+
+.PARAMETER Context
+    ECF run context. Omit for the interactive menu path (no events).
+
+.EXAMPLE
+    Invoke-AccessReviewPhase -Action Open -TenantName Contoso -Context $ctx
+
+.EXAMPLE
+    Invoke-AccessReviewPhase -Action Close -CampaignId '2026-Q3-20260803-141500'
+#>
+function Invoke-AccessReviewPhase {
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('Open', 'Close', 'Report')]
+        [string]$Action,
+        [string]$TenantName,
+        [string]$CampaignDirectory,
+        [string]$CampaignId,
+        [string]$ConfigPath,
+        [hashtable]$EntraRoster,
+        [object]$Context
+    )
+
+    $useEvents = ($null -ne $Context) -and [bool](Get-Command Write-EcfEvent -ErrorAction SilentlyContinue)
+    if ($useEvents) { Start-EcfPhase -Context $Context -Phase 'AccessReview' }
+
+    $result = $null
+    $campaignDir = $null
+    try {
+        $cfgFile = if ($ConfigPath) { $ConfigPath } else { Join-Path $PSScriptRoot 'config\entrachecks.config.json' }
+        $cfg = Get-AccessReviewConfig -ConfigPath $cfgFile
+        $root = if ($CampaignDirectory) { $CampaignDirectory } else { $cfg.Directory }
+        if (-not [System.IO.Path]::IsPathRooted($root)) { $root = Join-Path $PSScriptRoot $root }
+
+        foreach ($name in @('EntraChecks-AccessReview', 'EntraChecks-AccessReviewReport')) {
+            $modulePath = Join-Path $script:ModulesPath "$name.psm1"
+            if (-not (Test-Path -LiteralPath $modulePath)) {
+                throw "Missing required module: $modulePath"
+            }
+            # Import only when absent: the menu already loaded these, and a
+            # -Force re-import mid-run would tear down the live module
+            # instance for no gain.
+            if (-not (Get-Module -Name $name)) {
+                Import-Module $modulePath -Force -DisableNameChecking
+            }
+        }
+
+        if ($Action -ne 'Open') {
+            if (-not $CampaignId) {
+                throw "-CampaignId is required for the '$Action' action (the campaign folder name, e.g. 2026-Q3-20260803-141500)."
+            }
+            $campaignDir = Join-Path $root $CampaignId
+            if (-not (Test-Path -LiteralPath $campaignDir)) {
+                throw "Campaign '$CampaignId' not found under $root."
+            }
+        }
+
+        switch ($Action) {
+            'Open' {
+                $openArgs = @{
+                    OutputDirectory = $root
+                    TenantName = $TenantName
+                    PeriodLabel = $cfg.PeriodLabel
+                    IncludeGuests = $cfg.IncludeGuests
+                }
+                # Only Open reuses a pre-built roster. Close needs the FINAL
+                # privileged state, so it must always re-pull — an Open-time
+                # roster there would verify remediation against stale data.
+                if ($EntraRoster) { $openArgs['EntraRoster'] = $EntraRoster }
+                $result = New-AccessReviewCampaign @openArgs
+                if ($result.Success) { $campaignDir = $result.Directory }
+            }
+            'Close' {
+                $result = Complete-AccessReviewCampaign -CampaignDirectory $campaignDir
+                if ($result.Success) {
+                    # The campaign is already Closed on disk at this point.
+                    # A render fault must not reach the outer catch and
+                    # overwrite that result: it would drop the evidence
+                    # artifacts, report accessReview.failed for a campaign
+                    # that IS closed, and leave no way to retry (only Open
+                    # campaigns can be closed). Report it separately.
+                    try {
+                        $report = New-AccessReviewReport -CampaignDirectory $campaignDir
+                        if ($report.Success) { $result['ReportPath'] = $report.ReportPath }
+                        else { $result['ReportError'] = [string]$report.FailureReason }
+                    }
+                    catch {
+                        $result['ReportError'] = $_.Exception.Message
+                    }
+                }
+            }
+            'Report' {
+                $result = New-AccessReviewReport -CampaignDirectory $campaignDir
+            }
+        }
+    }
+    catch {
+        $result = @{ Success = $false; FailureReason = $_.Exception.Message }
+    }
+
+    if (-not $result) {
+        $result = @{ Success = $false; FailureReason = "Access review action '$Action' produced no result." }
+    }
+
+    if ($useEvents) {
+        if ($result.Success -and $campaignDir) {
+            # Only files that actually exist ride the artifact channel —
+            # Open has no report yet, Report does not touch the manifest.
+            $kinds = @(
+                @('worksheet', 'review-worksheet.csv'),
+                @('access-review-html', 'AccessReview-Report.html'),
+                @('manifest', 'manifest.json')
+            )
+            foreach ($kind in $kinds) {
+                $artifactPath = Join-Path $campaignDir $kind[1]
+                if (Test-Path -LiteralPath $artifactPath) {
+                    Add-EcfArtifact -Context $Context -Kind $kind[0] -Path $artifactPath
+                }
+            }
+        }
+        if ($result.Success) {
+            # A close that succeeded but could not render its report is a
+            # warning, not a failed phase — the evidence bundle is intact.
+            if ($result.ReportError) {
+                Write-EcfWarning -Context $Context -Message "Campaign closed, but the report render failed: $($result.ReportError)" -Code 'accessReview.reportFailed'
+            }
+            Complete-EcfPhase -Context $Context -Phase 'AccessReview' -Status 'ok'
+        }
+        else {
+            Write-EcfError -Context $Context -Code 'accessReview.failed' -Message ([string]$result.FailureReason)
+            Complete-EcfPhase -Context $Context -Phase 'AccessReview' -Status 'failed'
+        }
+    }
+
+    return $result
+}
+
 function Invoke-AccessReviewFromMenu {
     <#
     .SYNOPSIS
@@ -1789,23 +2249,17 @@ function Invoke-AccessReviewFromMenu {
         Import-Module $m -Force -DisableNameChecking
     }
 
-    # Defaults + config overrides (AccessReview block)
-    $arDir = '.\Output\AccessReview'
-    $includeGuests = $true
-    $periodLabel = ''
-    $configPath = Join-Path $PSScriptRoot "config\entrachecks.config.json"
-    if (Test-Path $configPath) {
-        try {
-            $cfgRoot = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
-            if ($cfgRoot.AccessReview) {
-                if ($cfgRoot.AccessReview.OutputDirectory) { $arDir = [string]$cfgRoot.AccessReview.OutputDirectory }
-                if ($null -ne $cfgRoot.AccessReview.IncludeGuests) { $includeGuests = [bool]$cfgRoot.AccessReview.IncludeGuests }
-                if ($cfgRoot.AccessReview.PeriodLabel) { $periodLabel = [string]$cfgRoot.AccessReview.PeriodLabel }
-            }
-        } catch {
-            Write-Host "  [!] Could not parse config; using access-review defaults." -ForegroundColor Yellow
-        }
+    # Defaults + config overrides (AccessReview block). Read through the
+    # shared Get-AccessReviewConfig so the menu and the headless path can
+    # never disagree about folder / period / guest scope. PeriodLabel and
+    # IncludeGuests are consumed by Invoke-AccessReviewPhase, which reads
+    # the same block.
+    $arCfgPath = if ($ConfigFile) { $ConfigFile } else { Join-Path $PSScriptRoot "config\entrachecks.config.json" }
+    $arCfg = Get-AccessReviewConfig -ConfigPath $arCfgPath
+    if ($arCfg.ParseError) {
+        Write-Host "  [!] Could not parse config; using access-review defaults." -ForegroundColor Yellow
     }
+    $arDir = $arCfg.Directory
     if (-not [System.IO.Path]::IsPathRooted($arDir)) { $arDir = Join-Path $PSScriptRoot $arDir }
 
     while ($true) {
@@ -1821,7 +2275,7 @@ function Invoke-AccessReviewFromMenu {
         switch ($choice) {
             '1' {
                 if (-not $TenantName) { $TenantName = Read-Host "  Enter tenant name" }
-                $r = New-AccessReviewCampaign -OutputDirectory $arDir -TenantName $TenantName -PeriodLabel $periodLabel -IncludeGuests $includeGuests
+                $r = Invoke-AccessReviewPhase -Action 'Open' -TenantName $TenantName -CampaignDirectory $arDir -ConfigPath $arCfgPath
                 if ($r.Success) {
                     Write-Host "  [OK] Campaign $($r.CampaignId) opened." -ForegroundColor Green
                     Write-Host "      Worksheet: $($r.WorksheetPath)" -ForegroundColor White
@@ -1844,7 +2298,12 @@ function Invoke-AccessReviewFromMenu {
                     Write-Host "  [!] Invalid selection." -ForegroundColor Red
                     continue
                 }
-                $r = Complete-AccessReviewCampaign -CampaignDirectory $open[$idx - 1].Directory
+                # Split the folder the listing actually came from instead of
+                # rebuilding $arDir + the id inside campaign.json — those
+                # differ for a restored or renamed evidence bundle.
+                $sel = $open[$idx - 1].Directory
+                $r = Invoke-AccessReviewPhase -Action 'Close' -ConfigPath $arCfgPath `
+                    -CampaignDirectory (Split-Path -Parent $sel) -CampaignId (Split-Path -Leaf $sel)
                 if ($r.Success) {
                     Write-Host "  [OK] Campaign $($r.CampaignId) closed." -ForegroundColor Green
                     Write-Host "      Certified=$($r.Summary.Certified) Revoked=$($r.Summary.Revoked) Modified=$($r.Summary.Modified) Investigate=$($r.Summary.Investigated)" -ForegroundColor White
@@ -1852,9 +2311,12 @@ function Invoke-AccessReviewFromMenu {
                     foreach ($f in @($r.Flags)) {
                         Write-Host "      [$($f.Flag)] $($f.DisplayName): $($f.Detail)" -ForegroundColor Yellow
                     }
-                    $rep = New-AccessReviewReport -CampaignDirectory $open[$idx - 1].Directory
-                    if ($rep.Success) {
-                        Write-Host "      Report: $($rep.ReportPath)" -ForegroundColor White
+                    if ($r.ReportPath) {
+                        Write-Host "      Report: $($r.ReportPath)" -ForegroundColor White
+                    }
+                    if ($r.ReportError) {
+                        Write-Host "      [!] Report render failed (campaign is still closed): $($r.ReportError)" -ForegroundColor Yellow
+                        Write-Host "          Use [4] Regenerate report once the cause is cleared." -ForegroundColor Gray
                     }
                 } else {
                     Write-Host "  [!] $($r.FailureReason)" -ForegroundColor Red
@@ -1883,7 +2345,9 @@ function Invoke-AccessReviewFromMenu {
                     Write-Host "  [!] Invalid selection." -ForegroundColor Red
                     continue
                 }
-                $rep = New-AccessReviewReport -CampaignDirectory $all[$idx - 1].Directory
+                $sel = $all[$idx - 1].Directory
+                $rep = Invoke-AccessReviewPhase -Action 'Report' -ConfigPath $arCfgPath `
+                    -CampaignDirectory (Split-Path -Parent $sel) -CampaignId (Split-Path -Leaf $sel)
                 if ($rep.Success) {
                     $draftNote = if ($rep.IsDraft) { ' (DRAFT)' } else { '' }
                     Write-Host "  [OK] Report$draftNote : $($rep.ReportPath)" -ForegroundColor Green
@@ -2022,6 +2486,12 @@ function Export-AssessmentResult {
     # so auditors get the standalone artefacts even when the full report
     # pipeline is skipped or fails. (PRs 2/3/4/5 of the roster work.)
     $script:UnifiedPrivilegedRoster = $null
+    # Access Review reuse (PR 1 of Access-Review-GUI-Implementation-Plan):
+    # the in-concert AccessReview phase runs after this one, so publishing
+    # the Entra roster to script scope lets it open a campaign without a
+    # second Graph pull. Stays $null when -EmitPrivilegedRoster is off —
+    # the campaign module then builds its own.
+    $script:AccessReviewEntraRoster = $null
     if ($EmitPrivilegedRoster) {
         # PR 2 — Active Directory roster
         Write-Host "`n[+] Building privileged identity roster (AD)..." -ForegroundColor Cyan
@@ -2056,6 +2526,9 @@ function Export-AssessmentResult {
             try {
                 Import-Module $rosterModuleEntra -Force -DisableNameChecking
                 $entraRoster = Get-PrivilegedIdentityRosterEntra
+                if ($entraRoster -is [hashtable] -and $entraRoster.Available) {
+                    $script:AccessReviewEntraRoster = $entraRoster
+                }
                 $rosterJson = Join-Path $reportDir 'PrivilegedIdentityRoster-Entra.json'
                 $entraRoster | ConvertTo-Json -Depth 6 | Out-File -FilePath $rosterJson -Encoding utf8
                 if ($entraRoster.Available) {
@@ -2646,7 +3119,39 @@ function Get-EcfInvocationParams {
         SkipAuthentication = ([bool]$SkipAuthentication -or $AuthMethod -eq 'Skip')
         AuthMethod = $AuthMethod
         EmitEvents = [bool]$EmitEvents
+        AccessReviewAction = $AccessReviewAction
+        AccessReviewDirectory = $AccessReviewDirectory
+        CampaignId = $CampaignId
+        OpenAccessReviewCampaign = [bool]$OpenAccessReviewCampaign
     }
+}
+
+function New-EcfDeviceCodeCallback {
+    <#
+    .SYNOPSIS
+        Builds the callback that pushes a real device code onto the run's
+        event stream (the GUI Sign-in panel), or $null when there is no
+        run context / no runner module.
+
+    .PARAMETER Context
+        The run context, or $null.
+
+    .EXAMPLE
+        New-EcfDeviceCodeCallback -Context $RunContext
+    #>
+    [CmdletBinding()]
+    [OutputType([scriptblock])]
+    param([AllowNull()][object]$Context)
+
+    if (-not $Context) { return $null }
+    if (-not (Get-Command Write-EcfAuthDeviceCode -ErrorAction SilentlyContinue)) { return $null }
+    return {
+        param([Parameter(Mandatory)][object]$CodeInfo)
+        Write-EcfAuthDeviceCode -Context $Context `
+            -UserCode ([string]$CodeInfo.UserCode) `
+            -VerificationUri ([string]$CodeInfo.VerificationUri) `
+            -Capture 'captured'
+    }.GetNewClosure()
 }
 
 function New-EcfAuthRunOptions {
@@ -2656,20 +3161,18 @@ function New-EcfAuthRunOptions {
         'DeviceCode' {
             $authAction = {
                 param([AllowNull()][object]$Context)
-                $callback = $null
-                if ($Context -and (Get-Command Write-EcfAuthDeviceCode -ErrorAction SilentlyContinue)) {
-                    $callback = {
-                        param([Parameter(Mandatory)][object]$CodeInfo)
-                        Write-EcfAuthDeviceCode -Context $Context `
-                            -UserCode ([string]$CodeInfo.UserCode) `
-                            -VerificationUri ([string]$CodeInfo.VerificationUri) `
-                            -Capture 'captured'
-                    }.GetNewClosure()
-                }
-                $null = Connect-EntraCheck -UseDeviceCode -DeviceCodeCallback $callback
+                $null = Connect-EntraCheck -UseDeviceCode -DeviceCodeCallback (New-EcfDeviceCodeCallback -Context $Context)
             }
         }
-        'Interactive' { $authAction = { param([AllowNull()][object]$Context) $null = Connect-EntraCheck } }
+        # Interactive also gets the callback: if the browser attempt hits
+        # the WAM broker's missing-window-handle limitation, Connect-EntraCheck
+        # falls back to device code and the GUI still gets the real code.
+        'Interactive' {
+            $authAction = {
+                param([AllowNull()][object]$Context)
+                $null = Connect-EntraCheck -DeviceCodeCallback (New-EcfDeviceCodeCallback -Context $Context)
+            }
+        }
     }
     return [pscustomobject]@{
         Method = $effectiveAuthMethod
@@ -2734,7 +3237,9 @@ function Invoke-EcfAssessmentSequence {
     #>
     param(
         [Parameter(Mandatory)][string]$TenantNameValue,
-        [Parameter(Mandatory)][string[]]$ModuleSet,
+        # AllowEmptyCollection so a campaign-only run (-AccessReviewOnly)
+        # can pass @() honestly instead of naming modules it never runs.
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$ModuleSet,
         [switch]$RunHybridCorrelation,
         [switch]$DoCompareWithLast,
         [switch]$ErrorActionStop,
@@ -2769,7 +3274,14 @@ function Invoke-EcfAssessmentSequence {
         # (pre-authenticated / -SkipAuthentication).
         [scriptblock]$AuthAction,
         [ValidateSet('Interactive', 'DeviceCode', 'AppOnly', 'ManagedIdentity', 'Skip')]
-        [string]$AuthMethod = 'Interactive'
+        [string]$AuthMethod = 'Interactive',
+        # PR 1 of Access-Review-GUI-Implementation-Plan — campaign-only run
+        # (-Mode AccessReview). Auth still runs (the roster comes from
+        # Graph), then the AccessReview phase; Modules / Report / Snapshot /
+        # SOC2 are skipped so opening or closing a campaign does not cost a
+        # full tenant assessment. Default off => every existing caller keeps
+        # the full pipeline unchanged.
+        [switch]$AccessReviewOnly
     )
 
     if ($ErrorActionStop) { $ErrorActionPreference = "Stop" }
@@ -2875,7 +3387,12 @@ function Invoke-EcfAssessmentSequence {
             $mgCtx = Get-EcfMgContextSafe
             if ($mgCtx -and $mgCtx.Account) { $acct = [string]$mgCtx.Account }
             if (-not $acct) {
-                throw "Authentication did not produce a Microsoft Graph context (no account). Either Connect-MgGraph failed silently, or the consented session was lost. Check the prior log lines for the underlying error."
+                # Carry the underlying sign-in error (recorded by
+                # Connect-EntraCheck) into the message so the event stream
+                # shows the real reason, not just "no account".
+                $underlying = Get-EcfLastAuthError
+                $detail = if ($underlying) { "Underlying error: $underlying" } else { "Check the prior log lines for the underlying error." }
+                throw "Authentication did not produce a Microsoft Graph context (no account). Either Connect-MgGraph failed silently, or the signed-in session was lost. $detail"
             }
             if ($useEvents) {
                 Write-EcfAuthSucceeded -Context $RunContext -Account $acct -Method $AuthMethod
@@ -2884,9 +3401,22 @@ function Invoke-EcfAssessmentSequence {
         }
         catch {
             $authMsg = $_.Exception.Message
-            $authCode = if ($authMsg -match 'insufficient|privilege|consent|scope|forbidden') { 'auth.insufficientPrivileges' }
-            elseif ($authMsg -match 'cancel|timed out|timeout|expired|declined') { 'auth.cancelled' }
-            else { 'auth.failed' }
+            # Classify on the UNDERLYING sign-in error when one was
+            # recorded, not on this phase's wrapper. The wrapper contains
+            # the word "consent", so classifying on it reported every
+            # silent auth failure as auth.insufficientPrivileges — whose
+            # "sign in as Global Reader" remediation actively misdirects
+            # for a host/broker problem.
+            $authCause = Get-EcfLastAuthError
+            if (-not $authCause) { $authCause = $authMsg }
+            $authCode = Get-EcfAuthFailureCode -Message $authCause
+            # Only advise device code when it has NOT already been tried:
+            # the browser path falls back automatically, so after a failed
+            # fallback this would tell the user to do what just failed.
+            $fellBackToDeviceCode = [bool](Get-Variable -Name EcfDeviceCodeFallbackUsed -Scope Script -ValueOnly -ErrorAction SilentlyContinue)
+            if (-not $fellBackToDeviceCode -and (Test-EcfBrokerAuthFailure -Message $authCause)) {
+                $authMsg = "$authMsg Browser sign-in cannot start in this host (the WAM broker requires a parent window handle) - re-run with Device code sign-in."
+            }
             if ($useEvents) {
                 Write-EcfAuthFailed -Context $RunContext -Message $authMsg -Code $authCode
                 Complete-EcfPhase -Context $RunContext -Phase 'Auth' -Status 'failed'
@@ -2899,7 +3429,7 @@ function Invoke-EcfAssessmentSequence {
     }
 
     if (-not $cancelled -and -not $fatalAbort -and (checkpoint)) { $cancelled = $true }
-    if (-not $cancelled -and -not $fatalAbort) {
+    if (-not $cancelled -and -not $fatalAbort -and -not $AccessReviewOnly) {
         phaseStart 'Modules'
         try {
             $results = Invoke-ModuleAssessment -SelectedModules $ModuleSet -TenantName $TenantNameValue -OutputDir $OutputDirectory
@@ -2938,7 +3468,7 @@ function Invoke-EcfAssessmentSequence {
     }
 
     if (-not $cancelled -and -not $fatalAbort -and (checkpoint)) { $cancelled = $true }
-    if (-not $cancelled -and -not $fatalAbort) {
+    if (-not $cancelled -and -not $fatalAbort -and -not $AccessReviewOnly) {
         phaseStart 'Report'
         try {
             $reportDir = Export-AssessmentResult -OutputDir $OutputDirectory -TenantName $TenantNameValue -IncludeUnified -GenerateComprehensiveReport:$GenerateComprehensiveReport -GenerateExecutiveSummary:$GenerateExecutiveSummary -GenerateExcelReport:$GenerateExcelReport -GenerateRemediationScripts:$GenerateRemediationScripts -HtmlReportSet $HtmlReportSet -HtmlDeepDiveDomains $HtmlDeepDiveDomains
@@ -2968,7 +3498,7 @@ function Invoke-EcfAssessmentSequence {
     }
 
     if (-not $cancelled -and -not $fatalAbort -and (checkpoint)) { $cancelled = $true }
-    if (-not $cancelled -and -not $fatalAbort -and -not $SkipSequenceSnapshot -and $SaveSnapshot) {
+    if (-not $cancelled -and -not $fatalAbort -and -not $AccessReviewOnly -and -not $SkipSequenceSnapshot -and $SaveSnapshot) {
         phaseStart 'Snapshot'
         try {
             $deltaModule = Join-Path $script:ModulesPath "EntraChecks-DeltaReporting.psm1"
@@ -2987,8 +3517,36 @@ function Invoke-EcfAssessmentSequence {
         }
     }
 
+    # Access Review campaign phase. Deliberately sits between Modules and
+    # SOC2 so a campaign opened in this run is on disk before the SOC 2
+    # evidence matrix looks for one. Runs when the caller opted in per run
+    # (-OpenAccessReviewCampaign), when AccessReview.Enabled is true in
+    # config (the automation default, mirroring SOC2.Enabled), or always on
+    # a campaign-only run. Invoke-AccessReviewPhase owns the phase
+    # lifecycle + error mapping and never throws, so there is no failPhase
+    # here — a refused close is a failed phase, not a failed run.
+    # The run's own -ConfigFile decides this, not the repo default — an
+    # environment-specific config must be able to enable/redirect campaigns.
+    $arConfigPath = if ($ConfigFile) { $ConfigFile } else { Join-Path $PSScriptRoot 'config\entrachecks.config.json' }
+    $runAccessReview = [bool]$AccessReviewOnly -or [bool]$OpenAccessReviewCampaign
+    if (-not $runAccessReview) {
+        $runAccessReview = (Get-AccessReviewConfig -ConfigPath $arConfigPath).Enabled
+    }
     if (-not $cancelled -and -not $fatalAbort -and (checkpoint)) { $cancelled = $true }
-    if (-not $cancelled -and -not $fatalAbort) {
+    if (-not $cancelled -and -not $fatalAbort -and $runAccessReview) {
+        # Only a campaign-only run carries an action; an in-concert /
+        # config-enabled campaign always opens. Start-EntraChecks.ps1
+        # rejects -AccessReviewAction outside -Mode AccessReview, so this
+        # can no longer silently rewrite a requested Close.
+        $arAction = if ($AccessReviewOnly -and $AccessReviewAction) { $AccessReviewAction } else { 'Open' }
+        $null = Invoke-AccessReviewPhase -Action $arAction -TenantName $TenantNameValue `
+            -CampaignDirectory $AccessReviewDirectory -CampaignId $CampaignId `
+            -ConfigPath $arConfigPath `
+            -EntraRoster $script:AccessReviewEntraRoster -Context $RunContext
+    }
+
+    if (-not $cancelled -and -not $fatalAbort -and (checkpoint)) { $cancelled = $true }
+    if (-not $cancelled -and -not $fatalAbort -and -not $AccessReviewOnly) {
         # Auto-run SOC 2 readiness when SOC2.Enabled = true in config. Browser
         # open is suppressed in scripted modes (automation friendly); the
         # interactive menu passes -OpenSoc2Browser to preserve its behaviour.
@@ -3005,7 +3563,7 @@ function Invoke-EcfAssessmentSequence {
     }
 
     if (-not $cancelled -and -not $fatalAbort -and (checkpoint)) { $cancelled = $true }
-    if (-not $cancelled -and -not $fatalAbort -and $DoCompareWithLast) {
+    if (-not $cancelled -and -not $fatalAbort -and -not $AccessReviewOnly -and $DoCompareWithLast) {
         phaseStart 'Snapshot'
         try {
             $deltaModule = Join-Path $script:ModulesPath "EntraChecks-DeltaReporting.psm1"
@@ -3103,6 +3661,43 @@ function Start-QuickMode {
     $durMin = if ($seq.Results -and $seq.Results.Duration) { $seq.Results.Duration.TotalMinutes.ToString('0.0') } else { 'n/a' }
     Write-Host "    Duration: $durMin minutes" -ForegroundColor Cyan
     Write-Host "    Reports: $($seq.ReportDir)" -ForegroundColor Cyan
+}
+
+function Start-AccessReviewMode {
+    <#
+    .SYNOPSIS
+        -Mode AccessReview: run one access-review campaign action on its
+        own (Auth -> AccessReview), with no assessment.
+
+    .DESCRIPTION
+        The headless / GUI entry point for the campaign lifecycle. Opening
+        a quarterly campaign should not cost a full tenant assessment, and
+        closing one happens days later once a human has filled the
+        worksheet. Auth still runs — the roster comes from Graph.
+
+        Headless by contract: every choice is a parameter, so this path
+        throws with an actionable message instead of prompting.
+    #>
+    if (-not $AccessReviewAction) {
+        throw "Start-EntraChecks: -Mode AccessReview requires -AccessReviewAction <Open|Close|Report>."
+    }
+    if ([string]::IsNullOrWhiteSpace($TenantName)) {
+        throw "Start-EntraChecks: -Mode AccessReview requires -TenantName (this path never prompts)."
+    }
+
+    if (-not $EmitEvents) {
+        Write-Host "`n[+] Access Review Mode ($AccessReviewAction)" -ForegroundColor Magenta
+    }
+
+    $authRun = New-EcfAuthRunOptions
+    $seq = Invoke-EcfAssessmentSequence -TenantNameValue $TenantName -ModuleSet @() -AccessReviewOnly `
+        -InvocationParams (Get-EcfInvocationParams -ResolvedTenant $TenantName) -EmitEvents:$EmitEvents `
+        -AuthAction $authRun.Action -AuthMethod $authRun.Method
+
+    if (-not $EmitEvents) {
+        $status = if ($seq.Manifest) { $seq.Manifest.status } else { 'n/a' }
+        Write-Host "`n[+] Access Review Complete — $status" -ForegroundColor Green
+    }
 }
 
 function Start-HybridMode {

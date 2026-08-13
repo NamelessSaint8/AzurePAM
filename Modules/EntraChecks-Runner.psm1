@@ -38,7 +38,7 @@ $script:ModuleVersion = '1.0.0'
 $script:EcfSchemaVersion = '1.0'
 
 # Canonical phase names (the only legal values of the `phase` field).
-$script:EcfPhases = @('Prereqs', 'Auth', 'Core', 'Modules', 'Snapshot', 'SOC2', 'Report')
+$script:EcfPhases = @('Prereqs', 'Auth', 'Core', 'Modules', 'AccessReview', 'Snapshot', 'SOC2', 'Report')
 
 # Parameter keys allowed into the sanitized params echo. Anything not on
 # this allowlist is dropped — secrets/tokens can never leak into the
@@ -47,7 +47,9 @@ $script:EcfSafeParamKeys = @(
     'TenantName', 'OutputDirectory', 'Modules', 'ExportFormat', 'ConfigFile',
     'Environment', 'SaveSnapshot', 'CompareWithLast', 'HtmlReportSet',
     'HtmlDeepDiveDomains', 'EmitPrivilegedRoster', 'IdentityOverridesPath',
-    'SkipAuthentication', 'AuthMethod', 'RunId', 'EmitEvents'
+    'SkipAuthentication', 'AuthMethod', 'RunId', 'EmitEvents',
+    'AccessReviewAction', 'AccessReviewDirectory', 'CampaignId',
+    'OpenAccessReviewCampaign'
 )
 
 #region ==================== CONTRACT PRIMITIVES ====================
@@ -143,11 +145,17 @@ function New-EcfRunContext {
         CancelFlag = $CancelFlag
         Cancelled = $false
         SafeParams = (ConvertTo-EcfSafeParams -Params $Params)
-        Events = (New-Object System.Collections.Generic.List[object])
-        Artifacts = (New-Object System.Collections.Generic.List[object])
-        Errors = (New-Object System.Collections.Generic.List[object])
-        Warnings = (New-Object System.Collections.Generic.List[object])
-        OpenPhases = (New-Object System.Collections.Generic.List[string])
+        # ::new(), not New-Object: New-Object hands back a PSObject-wrapped
+        # List[object], and wrapping one of those in @() throws "Argument
+        # types do not match" (a PS binder bug, on 5.1 and 7.x alike,
+        # whether the list is empty or not). These lists are handed to the
+        # orchestration, the TUI renderer and the Tauri sidecar, so the
+        # constructor is the one place that fixes it for every consumer.
+        Events = ([System.Collections.Generic.List[object]]::new())
+        Artifacts = ([System.Collections.Generic.List[object]]::new())
+        Errors = ([System.Collections.Generic.List[object]]::new())
+        Warnings = ([System.Collections.Generic.List[object]]::new())
+        OpenPhases = ([System.Collections.Generic.List[string]]::new())
         RunStarted = $false
         RunEnded = $false
     }
@@ -352,6 +360,7 @@ $script:EcfErrorCatalog = [ordered]@{
     'report.writeFailed' = @{ Fatal = $true; Remediation = 'Writing the report output failed. Check the output directory exists and is writable, then re-run.' }
     'snapshot.failed' = @{ Fatal = $false; Remediation = 'Saving / comparing the compliance snapshot failed. The assessment itself completed; retry the snapshot step.' }
     'snapshot.insufficient' = @{ Fatal = $false; Remediation = 'At least two snapshots are required to compare. Save a snapshot now and compare on a later run.' }
+    'accessReview.failed' = @{ Fatal = $false; Remediation = 'The access-review campaign action did not complete; the reason is in the message. An incomplete worksheet is the common case — fill every Decision cell plus the sign-off rows in review-worksheet.csv and close the campaign again. The campaign stays Open until it closes cleanly.' }
     'cancelled' = @{ Fatal = $false; Remediation = 'The run was cancelled by request. Re-run to produce a complete assessment.' }
     'internal' = @{ Fatal = $false; Remediation = 'An unexpected error occurred. Re-run with -Verbose and report the message if it persists.' }
 }
@@ -537,7 +546,7 @@ function Add-EcfArtifact {
     [OutputType([void])]
     param(
         [Parameter(Mandatory)][pscustomobject]$Context,
-        [Parameter(Mandatory)][ValidateSet('cockpit-html', 'legacy-html', 'csv', 'json', 'excel', 'soc2-html', 'soc2-workbook', 'privileged-roster', 'snapshot', 'delta')]
+        [Parameter(Mandatory)][ValidateSet('cockpit-html', 'legacy-html', 'csv', 'json', 'excel', 'soc2-html', 'soc2-workbook', 'privileged-roster', 'snapshot', 'delta', 'worksheet', 'access-review-html', 'manifest')]
         [string]$Kind,
         [Parameter(Mandatory)][string]$Path
     )
