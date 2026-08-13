@@ -110,7 +110,8 @@
     "Enabled": false,
     "OutputDirectory": ".\\Output\\AccessReview",
     "IncludeGuests": true,
-    "PeriodLabel": ""
+    "PeriodLabel": "",
+    "EnableRemediation": false
   },
   "SOC2": {
     "_comment": "SOC 2 internal readiness assessment. See docs/SOC2-Guide.md. Disabled by default.",

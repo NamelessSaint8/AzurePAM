@@ -2001,6 +2001,10 @@ function Get-AccessReviewConfig {
     $includeGuests = $true
     $periodLabel = ''
     $parseError = $false
+    # Remediation-script generation ships off. It emits PowerShell that
+    # removes privileged access, and an operator runs it holding rights
+    # to do exactly that - opt in deliberately, per tenant.
+    $enableRemediation = $false
 
     $cfgRoot = $null
     if ($script:Config -and $script:Config.AccessReview) {
@@ -2022,6 +2026,7 @@ function Get-AccessReviewConfig {
         if ($cfgRoot.AccessReview.OutputDirectory) { $directory = [string]$cfgRoot.AccessReview.OutputDirectory }
         if ($null -ne $cfgRoot.AccessReview.IncludeGuests) { $includeGuests = [bool]$cfgRoot.AccessReview.IncludeGuests }
         if ($cfgRoot.AccessReview.PeriodLabel) { $periodLabel = [string]$cfgRoot.AccessReview.PeriodLabel }
+        if ($null -ne $cfgRoot.AccessReview.EnableRemediation) { $enableRemediation = [bool]$cfgRoot.AccessReview.EnableRemediation }
     }
 
     return [pscustomobject]@{
@@ -2029,6 +2034,7 @@ function Get-AccessReviewConfig {
         Directory = $directory
         IncludeGuests = $includeGuests
         PeriodLabel = $periodLabel
+        EnableRemediation = $enableRemediation
         ParseError = $parseError
     }
 }
@@ -2120,6 +2126,18 @@ function Invoke-AccessReviewPhase {
         $cfg = Get-AccessReviewConfig -ConfigPath $cfgFile
         $root = if ($CampaignDirectory) { $CampaignDirectory } else { $cfg.Directory }
         if (-not [System.IO.Path]::IsPathRooted($root)) { $root = Join-Path $PSScriptRoot $root }
+
+        # Remediation ships behind an opt-in. The generator emits PowerShell
+        # that removes privileged access; a tenant turns that on knowingly,
+        # rather than discovering the button exists. Refuse before loading
+        # the module or touching the campaign.
+        # Thrown, not returned: the caller started the phase above, so an
+        # early return would leave it open and emit no error. The catch
+        # below maps this to the same non-fatal accessReview.failed every
+        # other refusal uses.
+        if ($Action -eq 'Remediate' -and -not $cfg.EnableRemediation) {
+            throw "Remediation-script generation is disabled. Set AccessReview.EnableRemediation to true in config\entrachecks.config.json to enable it. The generated script removes privileged access and is never run by EntraChecks - you run it deliberately. See docs/AccessReview-Guide.md."
+        }
 
         $needed = @('EntraChecks-AccessReview', 'EntraChecks-AccessReviewReport')
         # The generator is only loaded for the action that uses it.
