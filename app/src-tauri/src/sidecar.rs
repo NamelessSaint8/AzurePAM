@@ -20,6 +20,45 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+/// The console situation this process is in. Three states, not a bool,
+/// because the middle one is the entire bug: a console that exists but
+/// has no window is useless to the WAM broker AND blocks `AllocConsole`.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConsoleState {
+    /// A console WITH a window — classic conhost, or one we allocated
+    /// earlier. Already everything we need; never touch it.
+    Windowed,
+    /// Attached to a console that has NO window: a pseudoconsole
+    /// (ConPTY). Windows Terminal, VS Code's terminal and `cargo test`
+    /// all hand us this one.
+    Conpty,
+    /// No console at all — the release `windows_subsystem = "windows"`
+    /// build launched from Explorer.
+    Detached,
+}
+
+/// Pure classifier for the state above, split out so every branch is
+/// unit-testable off a real console. `GetConsoleProcessList` is the
+/// discriminator rather than a probing `AllocConsole` call: it is
+/// side-effect-free and unambiguous. Measured on this host:
+///
+/// | state              | `GetConsoleWindow()` | `GetConsoleProcessList` |
+/// |--------------------|----------------------|-------------------------|
+/// | Windowed (conhost) | non-zero             | >= 1                    |
+/// | Conpty (`cargo test`) | 0                 | 8                       |
+/// | Detached (post-`FreeConsole`) | 0          | 0                       |
+#[cfg(windows)]
+fn classify_console(console_hwnd: isize, attached_process_count: u32) -> ConsoleState {
+    if console_hwnd != 0 {
+        ConsoleState::Windowed
+    } else if attached_process_count > 0 {
+        ConsoleState::Conpty
+    } else {
+        ConsoleState::Detached
+    }
+}
+
 /// Windows: make sure THIS process owns a console window, hidden.
 ///
 /// We need one to exist because MSAL's WAM broker — which Azure.Identity
@@ -30,9 +69,51 @@ use std::process::{Command, Stdio};
 /// anyone in. A console that exists but is hidden satisfies it while
 /// staying just as invisible as no console at all.
 ///
-/// Never hides a console we did not create: in debug builds (and when
-/// launched from a terminal) the process already has one, and that is
-/// where our own output goes.
+/// # The ConPTY case, and the FreeConsole tradeoff
+///
+/// A bare `AllocConsole` is not enough. Under a pseudoconsole — what
+/// Windows Terminal, VS Code's terminal and `cargo test` all provide —
+/// the process is ALREADY attached to a console, so `AllocConsole` is
+/// refused with `ERROR_ACCESS_DENIED` (5); and that console has no
+/// window, so `GetConsoleWindow()` returns 0. Both probes therefore say
+/// "no window available" and the old code gave up, fell back to
+/// `CREATE_NO_WINDOW`, and interactive sign-in was impossible — but only
+/// for users who launched the app from a terminal, which is why it
+/// survived testing from Explorer. Measured on this host under
+/// `cargo test`: `GetConsoleWindow()` → 0, `GetConsoleProcessList` → 8,
+/// `AllocConsole` → rc 0 / `GetLastError` 5. After `FreeConsole` → rc 1
+/// and the process list reports 0; the retried `AllocConsole` → rc 1
+/// with a real, non-zero window handle.
+///
+/// So in that state we `FreeConsole()` first and then allocate. **This
+/// detaches us from the launching terminal**: writes to our own
+/// stdout/stderr that were going to that terminal's console go to the
+/// new hidden console instead, i.e. nowhere a human will look. Judged
+/// acceptable, deliberately, because:
+///
+/// * The app's real output is the webview Log pane, fed by the piped
+///   child streams. Those pipes are explicit `Stdio::piped()` handles
+///   and are completely unaffected by any of this.
+/// * The entire Rust shell writes exactly one line to the terminal
+///   (`[update] check failed` in `lib.rs`), plus panic messages.
+/// * REDIRECTED output survives. Measured: with stdout/stderr on a pipe
+///   (`cargo test`, `app.exe > log.txt`, any CI harness), `AllocConsole`
+///   leaves the redirected std handles alone and the output still lands.
+///   Only output going straight to an interactive terminal is lost.
+/// * The release build launched from Explorer — the overwhelmingly
+///   common case — never reaches this branch at all: it is `Detached`,
+///   so the plain `AllocConsole` succeeds.
+///
+/// It is nonetheless kept strictly conditional: we only ever detach from
+/// a console that has NO window, and never from one that does. A real
+/// console window (classic conhost, `windows_subsystem` debug build under
+/// conhost) is both usable by the broker as-is and the place a developer
+/// is actually reading — the `Windowed` arm returns immediately without
+/// touching it.
+///
+/// Known cosmetic wart, pre-existing and not worsened: `AllocConsole`
+/// creates the window visible and we hide it on the next line, so a
+/// hidden console can flash for a frame. Win32 offers no allocate-hidden.
 #[cfg(windows)]
 fn ensure_hidden_console() -> bool {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -41,7 +122,9 @@ fn ensure_hidden_console() -> bool {
     #[link(name = "kernel32")]
     extern "system" {
         fn AllocConsole() -> i32;
+        fn FreeConsole() -> i32;
         fn GetConsoleWindow() -> isize;
+        fn GetConsoleProcessList(list: *mut u32, count: u32) -> u32;
     }
     #[link(name = "user32")]
     extern "system" {
@@ -53,11 +136,27 @@ fn ensure_hidden_console() -> bool {
     static HAVE_CONSOLE: AtomicBool = AtomicBool::new(false);
 
     INIT.call_once(|| {
-        // SAFETY: plain Win32 calls with no pointer arguments.
+        // SAFETY: `GetConsoleProcessList` gets a real, writable buffer
+        // and its true element count; the rest take no pointers. We only
+        // read the returned count, never the pids, so the documented
+        // "buffer too small, returns the required size" case is fine.
         unsafe {
-            if GetConsoleWindow() != 0 {
+            let mut pids = [0_u32; 8];
+            let state = classify_console(
+                GetConsoleWindow(),
+                GetConsoleProcessList(pids.as_mut_ptr(), pids.len() as u32),
+            );
+            if state == ConsoleState::Windowed {
                 HAVE_CONSOLE.store(true, Ordering::SeqCst);
                 return;
+            }
+            // ConPTY: drop the windowless console we are attached to, or
+            // `AllocConsole` below is refused with ERROR_ACCESS_DENIED.
+            // If the detach fails we have changed nothing — fall through
+            // and let `AllocConsole` fail too, ending in the
+            // CREATE_NO_WINDOW fallback exactly as before.
+            if state == ConsoleState::Conpty {
+                FreeConsole();
             }
             if AllocConsole() != 0 {
                 let hwnd = GetConsoleWindow();
@@ -69,6 +168,31 @@ fn ensure_hidden_console() -> bool {
         }
     });
     HAVE_CONSOLE.load(Ordering::SeqCst)
+}
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// The console decision, as a value: the exact creation-flag word
+/// `apply_no_console_window` hands the child. `0` means "no flag" — the
+/// child inherits OUR console, which is the whole point (see below).
+/// `CREATE_NO_WINDOW` is only the fallback for when we could not get a
+/// console at all.
+///
+/// Split out of `apply_no_console_window` so the contract is assertable
+/// as a value as well as through a spawned child. Both levels are pinned,
+/// and since `ensure_hidden_console` learned to recover a real console
+/// from the ConPTY state the spawn-level pin bites here too — mutating
+/// this to an unconditional `CREATE_NO_WINDOW` fails
+/// `spawned_child_inherits_our_console_when_pwsh_present` under
+/// `cargo test`. Measured, not assumed.
+#[cfg(windows)]
+fn console_creation_flags(have_console: bool) -> u32 {
+    if have_console {
+        0
+    } else {
+        CREATE_NO_WINDOW
+    }
 }
 
 /// Keep the console-subsystem child (pwsh, winget) from flashing a window
@@ -85,10 +209,12 @@ fn apply_no_console_window(cmd: &mut Command) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        if !ensure_hidden_console() {
-            cmd.creation_flags(CREATE_NO_WINDOW);
-        }
+        // Deliberately ONE statement, routed through the tested seam:
+        // a future "just put CREATE_NO_WINDOW back" has to edit
+        // `console_creation_flags`, where a test is watching. Passing 0
+        // is identical to never calling `creation_flags` (std defaults
+        // the field to 0 and ORs in CREATE_UNICODE_ENVIRONMENT itself).
+        cmd.creation_flags(console_creation_flags(ensure_hidden_console()));
     }
     // De-facto cross-tool convention (also honored by many pwsh
     // formatters / PSReadLine). Combined with the pwsh-specific
@@ -1025,43 +1151,127 @@ mod tests {
         );
     }
 
-    /// Pins the console-INHERITANCE contract of `apply_no_console_window`.
-    /// DO NOT DELETE AS NOISE — it is the only thing between a future "just
-    /// put `CREATE_NO_WINDOW` back, it's tidier" refactor and a GUI where
-    /// interactive sign-in is impossible. A child spawned with
-    /// `CREATE_NO_WINDOW` gets its own brand-new console instead of ours,
-    /// with no window; MSAL's WAM broker (Azure.Identity 1.18+, what
-    /// `Connect-MgGraph` interactive uses) resolves its parent window from
-    /// the process console, so it throws "A window handle must be
-    /// configured" and nobody can sign in — while every other test stays
-    /// green.
+    /// THE regression pin for console inheritance, and the one that fails on
+    /// every Windows host. DO NOT DELETE AS NOISE — it is what stands between
+    /// a future "just put `CREATE_NO_WINDOW` back, it's tidier" refactor and a
+    /// GUI where interactive sign-in is impossible. A child spawned with
+    /// `CREATE_NO_WINDOW` gets no console at all; MSAL's WAM broker
+    /// (Azure.Identity 1.18+, what `Connect-MgGraph` interactive uses)
+    /// resolves its parent window from the process console, so it throws
+    /// "A window handle must be configured" and nobody can sign in — while
+    /// every other test stays green.
     ///
-    /// Honest limits — do not read a green tick here as proof:
+    /// It asserts the DECISION as a value; `conpty_host_acquires_a_real_console`
+    /// and `spawned_child_inherits_our_console_when_pwsh_present` pin the two
+    /// halves either side of it (that the ConPTY state reaches `true` at all,
+    /// and that a real child is actually spawned that way).
     ///
-    /// 1. The allocate-and-hide branch is NOT covered. Measured under
-    ///    `cargo test` on a ConPTY host (Windows Terminal): the test
-    ///    process is already attached to a console (`GetConsoleProcessList`
-    ///    returns 6) but that console has no window (`GetConsoleWindow()`
-    ///    is 0), so `AllocConsole` IS reached and FAILS with
-    ///    `ERROR_ACCESS_DENIED` (5). `ensure_hidden_console()` therefore
-    ///    reports false and `apply_no_console_window` takes its documented
-    ///    `CREATE_NO_WINDOW` fallback. The branch that actually feeds the
-    ///    WAM broker a window runs only in a release
-    ///    (`windows_subsystem = "windows"`) build, which starts with no
-    ///    console at all and where `AllocConsole` succeeds.
-    /// 2. Consequently, on such a host this test does NOT catch the
-    ///    headline regression: reinstating an unconditional
-    ///    `CREATE_NO_WINDOW` was verified to leave it green there, because
-    ///    both spellings produce the identical child. It bites on a host
-    ///    with a real console window (classic conhost), where the
-    ///    assertion demands the child share OUR window. What it does pin
-    ///    everywhere is the opposite slip — dropping the fallback, so a
-    ///    child silently inherits a console we never meant to hand it.
+    /// NOT covered, and no green tick here should be read as covering it:
+    /// * That `apply_no_console_window` actually calls this. std exposes no
+    ///   way to read a `Command`'s creation flags back, so the guard is
+    ///   structural: that call site is a single statement routed through this
+    ///   function. The spawn-level test is what observes the outcome.
+    /// * The `Detached` arm of `ensure_hidden_console` (plain `AllocConsole`
+    ///   with no console at all), which needs a process that starts without
+    ///   one — a release `windows_subsystem = "windows"` build launched from
+    ///   Explorer, never a cargo test binary, which is always on a ConPTY.
+    ///   `classify_console` covers the classification half of it.
+    #[cfg(windows)]
+    #[test]
+    fn console_flags_drop_create_no_window_when_we_have_one() {
+        assert_eq!(
+            console_creation_flags(true),
+            0,
+            "a console we own must be INHERITED by the child: passing \
+             CREATE_NO_WINDOW when we have a console leaves the WAM broker \
+             with no window to parent its sign-in UI to, and interactive \
+             sign-in becomes impossible"
+        );
+        assert_eq!(
+            console_creation_flags(false),
+            CREATE_NO_WINDOW,
+            "with no console to inherit the child must still be windowless — \
+             dropping the fallback flashes a stray console at the user"
+        );
+        assert_eq!(
+            CREATE_NO_WINDOW, 0x0800_0000,
+            "wrong constant = a flag that does not suppress the window"
+        );
+    }
+
+    /// The three console states, by the numbers actually measured on this
+    /// host (see `classify_console`). The middle row is the whole bug: a
+    /// console with no window looks identical to "no console" through
+    /// `GetConsoleWindow()` alone, and treating it as such is what left
+    /// terminal-launched users unable to sign in.
+    #[cfg(windows)]
+    #[test]
+    fn classify_console_separates_conpty_from_no_console_at_all() {
+        assert_eq!(classify_console(33363174, 1), ConsoleState::Windowed);
+        assert_eq!(
+            classify_console(0, 8),
+            ConsoleState::Conpty,
+            "attached (process list non-empty) but windowless is a ConPTY — \
+             it must NOT be read as 'no console', because the console has to \
+             be released before a real one can be allocated"
+        );
+        assert_eq!(
+            classify_console(0, 0),
+            ConsoleState::Detached,
+            "nothing attached — plain AllocConsole, nothing to release"
+        );
+        // A windowed console is windowed however many processes share it,
+        // and is never released.
+        assert_eq!(classify_console(42, 0), ConsoleState::Windowed);
+    }
+
+    /// The pin for the acquisition fix, and the reason the flag test above
+    /// is no longer the only observable level. `cargo test` runs under a
+    /// ConPTY (measured: `GetConsoleWindow()` → 0, `GetConsoleProcessList`
+    /// → 8, `AllocConsole` → ERROR_ACCESS_DENIED), i.e. exactly the state
+    /// that used to return false and fall back to `CREATE_NO_WINDOW`.
+    ///
+    /// Deleting the `FreeConsole` recovery makes this fail here and only
+    /// here — the flag test still passes (its inputs are literals) and so
+    /// does the spawn test (a false decision and a windowless child agree
+    /// with each other). Windows-only by construction; there is no
+    /// non-Windows console to acquire.
+    #[cfg(windows)]
+    #[test]
+    fn conpty_host_acquires_a_real_console() {
+        assert!(
+            ensure_hidden_console(),
+            "on Windows we must always end up owning a console: under a \
+             ConPTY (Windows Terminal, VS Code, cargo test) that needs \
+             FreeConsole before AllocConsole, and without it the app falls \
+             back to CREATE_NO_WINDOW and interactive sign-in is impossible \
+             for anyone who launched the app from a terminal"
+        );
+        assert_eq!(
+            console_creation_flags(ensure_hidden_console()),
+            0,
+            "and the flags computed for THIS state must hand the child our \
+             console, not CREATE_NO_WINDOW"
+        );
+    }
+
+    /// Companion to the flag test above, kept for the coverage it adds where
+    /// the flag test cannot reach: it observes a REAL child, so it also
+    /// proves `apply_no_console_window` is on the spawn path at all.
+    ///
+    /// It now catches the headline regression on THIS host too, which it could
+    /// not before: once `ensure_hidden_console` recovers a real console from
+    /// the ConPTY state, `have_console` is true under `cargo test`, so an
+    /// unconditional `CREATE_NO_WINDOW` gives the child its own console and the
+    /// `INHERITED`/`SEPARATE` assertion fails. Mutation-tested, not assumed.
+    /// It catches the opposite slip as well — dropping the fallback, so a child
+    /// silently inherits a console we never meant to hand it. And with a real
+    /// window handle now present, the check below additionally demands the child
+    /// see OUR window: the handle the broker actually asks for.
     ///
     /// Inheritance is probed via the child's console *process list* rather
     /// than its window handle, since that is the signal that survives a
-    /// windowless ConPTY host; the window-handle check is layered on
-    /// wherever a real console window exists.
+    /// windowless host.
     ///
     /// Skips cleanly where pwsh is absent, like the probe tests above.
     #[cfg(windows)]

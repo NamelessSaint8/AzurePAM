@@ -546,7 +546,7 @@ function Add-EcfArtifact {
     [OutputType([void])]
     param(
         [Parameter(Mandatory)][pscustomobject]$Context,
-        [Parameter(Mandatory)][ValidateSet('cockpit-html', 'legacy-html', 'csv', 'json', 'excel', 'soc2-html', 'soc2-workbook', 'privileged-roster', 'snapshot', 'delta', 'worksheet', 'access-review-html', 'manifest')]
+        [Parameter(Mandatory)][ValidateSet('cockpit-html', 'legacy-html', 'csv', 'json', 'excel', 'soc2-html', 'soc2-workbook', 'privileged-roster', 'snapshot', 'delta', 'worksheet', 'access-review-html', 'manifest', 'remediation-script', 'remediation-plan')]
         [string]$Kind,
         [Parameter(Mandatory)][string]$Path
     )

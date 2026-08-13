@@ -102,7 +102,7 @@ Campaigns that are still Open render with a **DRAFT watermark** and are not vali
 
 Everything menu `[9]` does is scriptable. Two shapes:
 
-**Campaign-only** — `-Mode AccessReview`. Auth runs, then the `AccessReview` phase; no assessment, no unified report, no SOC 2 pass.
+**Campaign-only** — `-Mode AccessReview`. Auth runs, then the `AccessReview` phase; no assessment, no unified report, no SOC 2 pass. (`Remediate` is the exception: it never authenticates — see below.)
 
 ```powershell
 # Open this quarter's campaign into a durable evidence folder
@@ -117,6 +117,12 @@ Everything menu `[9]` does is scriptable. Two shapes:
 # Re-render a report (Open campaigns render as DRAFT)
 .\Start-EntraChecks.ps1 -Mode AccessReview -AccessReviewAction Report `
     -TenantName Contoso -CampaignId '2026-Q3-20260803-141500'
+
+# Generate the remediation script for a CLOSED campaign. No sign-in happens:
+# this reads the campaign folder and writes a .ps1 — nothing touches the tenant.
+.\Start-EntraChecks.ps1 -Mode AccessReview -AccessReviewAction Remediate `
+    -TenantName Contoso -AccessReviewDirectory 'C:\Evidence\AccessReview' `
+    -CampaignId '2026-Q3-20260803-141500'
 ```
 
 **In concert** — a normal run that also opens a campaign. The `AccessReview` phase runs after `Modules` and before `SOC2`, so the campaign is on disk in time for the SOC 2 evidence matrix to cite it. With `-EmitPrivilegedRoster` the campaign reuses the privileged roster the run already built instead of re-pulling it.
@@ -130,10 +136,12 @@ Setting `AccessReview.Enabled = true` in `config/entrachecks.config.json` makes 
 
 | Parameter | Meaning |
 |---|---|
-| `-AccessReviewAction Open\|Close\|Report` | The campaign action. Requires `-Mode AccessReview` (any other mode is rejected — use `-OpenAccessReviewCampaign` to open a campaign during a normal run). |
+| `-AccessReviewAction Open\|Close\|Report\|Remediate` | The campaign action. Requires `-Mode AccessReview` (any other mode is rejected — use `-OpenAccessReviewCampaign` to open a campaign during a normal run). |
 | `-AccessReviewDirectory <path>` | Campaign root. Overrides `AccessReview.OutputDirectory`. Relative paths resolve against the repo root. **Never point this at a temp folder** — a campaign spans days and is audit evidence. |
-| `-CampaignId <folder name>` | Campaign folder name (e.g. `2026-Q3-20260803-141500`), not a path. Required for `Close` and `Report`. |
+| `-CampaignId <folder name>` | Campaign folder name (e.g. `2026-Q3-20260803-141500`), not a path. Required for `Close`, `Report`, and `Remediate`. |
 | `-OpenAccessReviewCampaign` | In-concert opt-in on a normal run. |
+
+**`Remediate` never signs in.** The generator makes no Graph call, so the run skips the `Auth` phase entirely — no browser, no device code, no `auth.*` events. Generating a script costs nothing but a file read, which is also why it is safe to run from a machine that has no tenant session at all. `-AuthMethod` is ignored for this action.
 
 `PeriodLabel` and `IncludeGuests` still come from the config block on every path. That block is read from the run's own `-ConfigFile` when one is supplied (so an environment-specific config can enable or redirect campaigns), otherwise from `config/entrachecks.config.json`.
 
@@ -148,7 +156,7 @@ The same parameters exist on the contract wrapper `Invoke-EntraChecksRun.ps1` (w
     -AccessReviewDirectory 'C:\Evidence\AccessReview' -AuthMethod Skip -EmitEvents
 ```
 
-**Reading the outcome.** The phase emits `phase.started` / `phase.completed` for `AccessReview` and records the files it produced as artifacts: `worksheet` (`review-worksheet.csv`), `access-review-html` (`AccessReview-Report.html`), `manifest` (`manifest.json`).
+**Reading the outcome.** The phase emits `phase.started` / `phase.completed` for `AccessReview` and records the files it produced as artifacts: `worksheet` (`review-worksheet.csv`), `access-review-html` (`AccessReview-Report.html`), `manifest` (`manifest.json`). A `Remediate` run instead records `remediation-script` (`remediate-<CampaignId>.ps1`) and `remediation-plan` (`remediation-plan.md`) — both outside the campaign folder, so the sealed bundle still verifies.
 
 A refused close is a normal outcome, not a crash. An incomplete worksheet, a tampered row set, or a missing sign-off produces a **non-fatal** `accessReview.failed` error carrying the module's reason verbatim, the phase completes with status `failed`, the campaign stays **Open**, and the run still finishes with a `run.result`. Fix the worksheet and close again.
 
@@ -164,6 +172,8 @@ A closed campaign proves what was decided; it does not undo anything. `New-Acces
 Import-Module .\Modules\EntraChecks-AccessReviewRemediation.psm1
 New-AccessReviewRemediationScript -CampaignDirectory .\Output\AccessReview\2026-Q3-20260803-141500
 ```
+
+Or drive it the same way as the rest of the lifecycle — menu `[9]` → `[5] Generate remediation script` (closed campaigns only), or `-AccessReviewAction Remediate` headless. Both paths print the script path and the action / manual / skipped counts, and neither one signs in.
 
 Output lands in a **sibling** of the campaign folder — `<campaign root>\remediation\<CampaignId>\` — containing `remediate-<CampaignId>.ps1`, `remediation-plan.md`, and (once run) `remediation-log-<utc>.json`. Nothing is written inside the campaign folder: `manifest.json` covers every file there, and adding one after sign-off would either break the bundle hash or force a re-seal of a folder whose contents changed after the reviewer signed.
 

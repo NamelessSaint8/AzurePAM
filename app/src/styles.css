@@ -664,7 +664,8 @@ button:hover {
   margin-bottom: 3px;
 }
 
-.ar-steps-note {
+.ar-steps-note,
+.ar-remediate-note {
   margin-top: 0;
   margin-bottom: 14px;
 }

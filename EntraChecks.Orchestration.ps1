@@ -2041,12 +2041,15 @@ function Get-AccessReviewConfig {
 
 .DESCRIPTION
     Resolves the campaign root (-CampaignDirectory > config
-    AccessReview.OutputDirectory > .\Output\AccessReview), imports the two
+    AccessReview.OutputDirectory > .\Output\AccessReview), imports the
     Access Review modules, and dispatches one action:
 
-        Open   -> New-AccessReviewCampaign
-        Close  -> Complete-AccessReviewCampaign, then New-AccessReviewReport
-        Report -> New-AccessReviewReport (Open campaigns render as DRAFT)
+        Open      -> New-AccessReviewCampaign
+        Close     -> Complete-AccessReviewCampaign, then New-AccessReviewReport
+        Report    -> New-AccessReviewReport (Open campaigns render as DRAFT)
+        Remediate -> New-AccessReviewRemediationScript (CLOSED campaigns
+                     only; reads the sealed bundle and writes a script the
+                     operator runs deliberately — no Graph, no tenant change)
 
     Takes every choice as a parameter — there is no prompting and no
     console output, so it is safe inside an -EmitEvents run. When a run
@@ -2061,7 +2064,7 @@ function Get-AccessReviewConfig {
     worksheet is the common case — the campaign stays Open.
 
 .PARAMETER Action
-    Open, Close, or Report.
+    Open, Close, Report, or Remediate.
 
 .PARAMETER TenantName
     Friendly tenant name stamped into campaign evidence (Open only).
@@ -2097,7 +2100,7 @@ function Invoke-AccessReviewPhase {
     [OutputType([hashtable])]
     param(
         [Parameter(Mandatory)]
-        [ValidateSet('Open', 'Close', 'Report')]
+        [ValidateSet('Open', 'Close', 'Report', 'Remediate')]
         [string]$Action,
         [string]$TenantName,
         [string]$CampaignDirectory,
@@ -2118,7 +2121,10 @@ function Invoke-AccessReviewPhase {
         $root = if ($CampaignDirectory) { $CampaignDirectory } else { $cfg.Directory }
         if (-not [System.IO.Path]::IsPathRooted($root)) { $root = Join-Path $PSScriptRoot $root }
 
-        foreach ($name in @('EntraChecks-AccessReview', 'EntraChecks-AccessReviewReport')) {
+        $needed = @('EntraChecks-AccessReview', 'EntraChecks-AccessReviewReport')
+        # The generator is only loaded for the action that uses it.
+        if ($Action -eq 'Remediate') { $needed += 'EntraChecks-AccessReviewRemediation' }
+        foreach ($name in $needed) {
             $modulePath = Join-Path $script:ModulesPath "$name.psm1"
             if (-not (Test-Path -LiteralPath $modulePath)) {
                 throw "Missing required module: $modulePath"
@@ -2178,6 +2184,12 @@ function Invoke-AccessReviewPhase {
             'Report' {
                 $result = New-AccessReviewReport -CampaignDirectory $campaignDir
             }
+            'Remediate' {
+                # Pure file-in/file-out: reads the sealed bundle, writes the
+                # script + plan to a SIBLING folder so the campaign's manifest
+                # still verifies. EntraChecks never runs what it generates.
+                $result = New-AccessReviewRemediationScript -CampaignDirectory $campaignDir
+            }
         }
     }
     catch {
@@ -2189,7 +2201,27 @@ function Invoke-AccessReviewPhase {
     }
 
     if ($useEvents) {
-        if ($result.Success -and $campaignDir) {
+        if ($result.Success -and $Action -eq 'Remediate') {
+            # The generator deliberately writes OUTSIDE the campaign folder,
+            # so its artifacts come from the result, not from $campaignDir.
+            $genPaths = @{}
+            $genPaths['remediation-script'] = [string]$result.ScriptPath
+            $genPaths['remediation-plan'] = [string]$result.PlanPath
+            foreach ($kind in @('remediation-script', 'remediation-plan')) {
+                $artifactPath = $genPaths[$kind]
+                if ($artifactPath -and (Test-Path -LiteralPath $artifactPath)) {
+                    Add-EcfArtifact -Context $Context -Kind $kind -Path $artifactPath
+                }
+            }
+            # The blast radius of the generated script, in the same shape
+            # the menu prints. Without it an event consumer sees a script
+            # path and no way to tell "nothing to do" from "removes ten
+            # role assignments".
+            Write-EcfLog -Context $Context -Level 'info' -Message (
+                "Remediation script: Actions=$([int]$result.ActionCount) " +
+                "Manual=$([int]$result.ManualCount) Skipped=$([int]$result.SkippedCount)")
+        }
+        elseif ($result.Success -and $campaignDir) {
             # Only files that actually exist ride the artifact channel —
             # Open has no report yet, Report does not touch the manifest.
             $kinds = @(
@@ -2229,8 +2261,9 @@ function Invoke-AccessReviewFromMenu {
     .DESCRIPTION
         Submenu over the EntraChecks-AccessReview / -AccessReviewReport
         modules: open a campaign (roster + worksheet), close a campaign
-        (worksheet ingest + verification + report), list campaigns, or
-        regenerate a report (Open campaigns render as DRAFT). Defaults come
+        (worksheet ingest + verification + report), list campaigns,
+        regenerate a report (Open campaigns render as DRAFT), or generate a
+        remediation script from a closed campaign. Defaults come
         from the AccessReview block in config/entrachecks.config.json.
         See docs/AccessReview-Guide.md for the quarterly runbook.
     #>
@@ -2269,6 +2302,7 @@ function Invoke-AccessReviewFromMenu {
         Write-Host "  [2] Close campaign      - Ingest worksheet, verify, render report" -ForegroundColor Yellow
         Write-Host "  [3] List campaigns" -ForegroundColor Yellow
         Write-Host "  [4] Regenerate report   - Open campaigns render as DRAFT" -ForegroundColor Yellow
+        Write-Host "  [5] Generate remediation script - Closed campaigns; you run it, EntraChecks never does" -ForegroundColor Yellow
         Write-Host "  [B] Back" -ForegroundColor Gray
         $choice = (Read-Host "`n  Select an option").Trim().ToUpper()
 
@@ -2353,6 +2387,36 @@ function Invoke-AccessReviewFromMenu {
                     Write-Host "  [OK] Report$draftNote : $($rep.ReportPath)" -ForegroundColor Green
                 } else {
                     Write-Host "  [!] $($rep.FailureReason)" -ForegroundColor Red
+                }
+            }
+            '5' {
+                # Closed only: the sign-off over a sealed bundle is what
+                # authorizes the script, so an Open campaign is not a
+                # candidate (the generator refuses one anyway).
+                $closed = @(Get-AccessReviewCampaign -OutputDirectory $arDir | Where-Object { $_.Status -eq 'Closed' })
+                if ($closed.Count -eq 0) {
+                    Write-Host "  [i] No closed campaigns in $arDir" -ForegroundColor Gray
+                    continue
+                }
+                for ($i = 0; $i -lt $closed.Count; $i++) {
+                    Write-Host "    [$($i + 1)] $($closed[$i].CampaignId)" -ForegroundColor White
+                }
+                $idx = 0
+                if (-not [int]::TryParse((Read-Host "  Select campaign"), [ref]$idx) -or $idx -lt 1 -or $idx -gt $closed.Count) {
+                    Write-Host "  [!] Invalid selection." -ForegroundColor Red
+                    continue
+                }
+                $sel = $closed[$idx - 1].Directory
+                $rem = Invoke-AccessReviewPhase -Action 'Remediate' -ConfigPath $arCfgPath `
+                    -CampaignDirectory (Split-Path -Parent $sel) -CampaignId (Split-Path -Leaf $sel)
+                if ($rem.Success) {
+                    Write-Host "  [OK] Remediation script generated." -ForegroundColor Green
+                    Write-Host "      Script: $($rem.ScriptPath)" -ForegroundColor White
+                    Write-Host "      Plan:   $($rem.PlanPath)" -ForegroundColor White
+                    Write-Host "      Actions=$($rem.ActionCount) Manual=$($rem.ManualCount) Skipped=$($rem.SkippedCount)" -ForegroundColor White
+                    Write-Host "      Read it, then run it yourself (-Execute). EntraChecks applies nothing." -ForegroundColor Gray
+                } else {
+                    Write-Host "  [!] $($rem.FailureReason)" -ForegroundColor Red
                 }
             }
             'B' { return }
@@ -3101,8 +3165,14 @@ function Get-EcfInvocationParams {
         for the runner's allowlist sanitizer (ConvertTo-EcfSafeParams).
         Reads script-scope params directly; -ResolvedTenant carries the
         post-prompt tenant so the manifest reflects what actually ran.
+        The auth pair comes from New-EcfAuthRunOptions — the single place
+        that decides it — so run.started and the run-history manifest
+        record the sign-in that actually happened. Echoing the raw
+        parameters instead would claim an Interactive sign-in for a
+        Remediate run, which never authenticates at all.
     #>
     param([string]$ResolvedTenant)
+    $authRun = New-EcfAuthRunOptions
     return @{
         TenantName = $ResolvedTenant
         OutputDirectory = $OutputDirectory
@@ -3116,8 +3186,8 @@ function Get-EcfInvocationParams {
         HtmlDeepDiveDomains = $HtmlDeepDiveDomains
         EmitPrivilegedRoster = [bool]$EmitPrivilegedRoster
         IdentityOverridesPath = $IdentityOverridesPath
-        SkipAuthentication = ([bool]$SkipAuthentication -or $AuthMethod -eq 'Skip')
-        AuthMethod = $AuthMethod
+        SkipAuthentication = ($authRun.Method -eq 'Skip')
+        AuthMethod = $authRun.Method
         EmitEvents = [bool]$EmitEvents
         AccessReviewAction = $AccessReviewAction
         AccessReviewDirectory = $AccessReviewDirectory
@@ -3155,7 +3225,22 @@ function New-EcfDeviceCodeCallback {
 }
 
 function New-EcfAuthRunOptions {
-    $effectiveAuthMethod = if ($SkipAuthentication -or $AuthMethod -eq 'Skip') { 'Skip' } else { $AuthMethod }
+    <#
+    .SYNOPSIS
+        Builds the { Method; Action } pair the sequence's Auth phase runs.
+        A $null Action means no Auth phase at all (the sequence gates on
+        `if (-not $cancelled -and $AuthAction)`).
+
+    .DESCRIPTION
+        Reads the run's ambient auth parameters. -AccessReviewAction
+        Remediate is forced to 'Skip': the generator reads a closed campaign
+        off disk and makes no Graph call, so generating a script must not
+        cost a sign-in. Guarding on the action alone is safe because
+        Start-EntraChecks.ps1 rejects -AccessReviewAction outside
+        -Mode AccessReview.
+    #>
+    $noAuthNeeded = ($AccessReviewAction -eq 'Remediate')
+    $effectiveAuthMethod = if ($SkipAuthentication -or $AuthMethod -eq 'Skip' -or $noAuthNeeded) { 'Skip' } else { $AuthMethod }
     $authAction = $null
     switch ($effectiveAuthMethod) {
         'DeviceCode' {
@@ -3673,13 +3758,16 @@ function Start-AccessReviewMode {
         The headless / GUI entry point for the campaign lifecycle. Opening
         a quarterly campaign should not cost a full tenant assessment, and
         closing one happens days later once a human has filled the
-        worksheet. Auth still runs — the roster comes from Graph.
+        worksheet. Auth still runs for Open/Close/Report — the roster comes
+        from Graph. Remediate reads a closed campaign off disk instead, so
+        New-EcfAuthRunOptions hands back a $null auth action and the
+        sequence runs with no Auth phase.
 
         Headless by contract: every choice is a parameter, so this path
         throws with an actionable message instead of prompting.
     #>
     if (-not $AccessReviewAction) {
-        throw "Start-EntraChecks: -Mode AccessReview requires -AccessReviewAction <Open|Close|Report>."
+        throw "Start-EntraChecks: -Mode AccessReview requires -AccessReviewAction <Open|Close|Report|Remediate>."
     }
     if ([string]::IsNullOrWhiteSpace($TenantName)) {
         throw "Start-EntraChecks: -Mode AccessReview requires -TenantName (this path never prompts)."
