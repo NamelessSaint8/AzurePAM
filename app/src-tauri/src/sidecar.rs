@@ -20,20 +20,75 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-/// Suppress the console-window that Windows otherwise allocates when
-/// a GUI-subsystem parent (Tauri) spawns a console-subsystem child
-/// (pwsh, winget); also turn off ANSI/VT colour escapes from
-/// PowerShell so a piped stderr doesn't end up littered with raw
-/// `\e[36;1m`-style bytes that look like garbage in the Log pane.
-/// `apply_no_console_window` is the misnomer name for legacy reasons;
-/// it carries both the platform-specific console suppression and the
-/// cross-platform colour-disable env vars.
+/// Windows: make sure THIS process owns a console window, hidden.
+///
+/// We need one to exist because MSAL's WAM broker — which Azure.Identity
+/// 1.18+ uses by default for `Connect-MgGraph` interactive sign-in —
+/// resolves its parent window from the process console. Spawn the engine
+/// with `CREATE_NO_WINDOW` and the child has no console at all, so the
+/// broker throws "A window handle must be configured" instead of signing
+/// anyone in. A console that exists but is hidden satisfies it while
+/// staying just as invisible as no console at all.
+///
+/// Never hides a console we did not create: in debug builds (and when
+/// launched from a terminal) the process already has one, and that is
+/// where our own output goes.
+#[cfg(windows)]
+fn ensure_hidden_console() -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Once;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn AllocConsole() -> i32;
+        fn GetConsoleWindow() -> isize;
+    }
+    #[link(name = "user32")]
+    extern "system" {
+        fn ShowWindow(hwnd: isize, cmd: i32) -> i32;
+    }
+    const SW_HIDE: i32 = 0;
+
+    static INIT: Once = Once::new();
+    static HAVE_CONSOLE: AtomicBool = AtomicBool::new(false);
+
+    INIT.call_once(|| {
+        // SAFETY: plain Win32 calls with no pointer arguments.
+        unsafe {
+            if GetConsoleWindow() != 0 {
+                HAVE_CONSOLE.store(true, Ordering::SeqCst);
+                return;
+            }
+            if AllocConsole() != 0 {
+                let hwnd = GetConsoleWindow();
+                if hwnd != 0 {
+                    ShowWindow(hwnd, SW_HIDE);
+                    HAVE_CONSOLE.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+    });
+    HAVE_CONSOLE.load(Ordering::SeqCst)
+}
+
+/// Keep the console-subsystem child (pwsh, winget) from flashing a window
+/// at the user, and turn off ANSI/VT colour escapes from PowerShell so a
+/// piped stderr doesn't end up littered with raw `\e[36;1m`-style bytes
+/// that look like garbage in the Log pane.
+///
+/// On Windows the child now INHERITS our hidden console rather than being
+/// given `CREATE_NO_WINDOW`. Both are equally invisible; only the former
+/// leaves a window handle for the WAM broker to parent its sign-in UI to.
+/// `CREATE_NO_WINDOW` remains the fallback if we cannot get a console at
+/// all — an invisible child beats a stray console window.
 fn apply_no_console_window(cmd: &mut Command) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
+        if !ensure_hidden_console() {
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
     }
     // De-facto cross-tool convention (also honored by many pwsh
     // formatters / PSReadLine). Combined with the pwsh-specific
@@ -528,6 +583,10 @@ pub fn extract_device_code(line: &str) -> Option<String> {
     }
 }
 
+// Two flat in-concert params rather than a bag struct: they mirror the
+// engine switches (`-OpenAccessReviewCampaign` / `-AccessReviewDirectory`)
+// one-for-one, which is what makes a call site readable.
+#[allow(clippy::too_many_arguments)]
 pub fn core_args(
     core_script: &str,
     tenant: &str,
@@ -535,6 +594,8 @@ pub fn core_args(
     modules: &[String],
     auth_method: &str,
     deep_dives: &[String],
+    open_access_review: bool,
+    campaign_dir: Option<&str>,
 ) -> Vec<String> {
     let modules_literal = format!(
         "@({})",
@@ -568,6 +629,23 @@ pub fn core_args(
     if auth_method == "Skip" {
         command.push_str(" -SkipAuthentication");
     }
+    // "In concert" (plan §1): the normal assessment additionally opens
+    // an access-review campaign, reusing the privileged roster the run
+    // already built.
+    if open_access_review {
+        command.push_str(" -OpenAccessReviewCampaign");
+    }
+    // The durable folder rides along whenever the user has one set, NOT
+    // only with the checkbox: the engine also starts the phase when
+    // config `AccessReview.Enabled` is true, and without the override
+    // that campaign would silently land in the config default instead of
+    // the folder the panel shows (plan §3.1 — never the run's TEMP dir).
+    if let Some(dir) = campaign_dir.filter(|d| !d.is_empty()) {
+        command.push_str(&format!(
+            " -AccessReviewDirectory {}",
+            ps_single_quote(dir)
+        ));
+    }
     command.push_str(" *>&1");
     vec![
         "-NoProfile".to_string(),
@@ -575,6 +653,51 @@ pub fn core_args(
         // Bundled core scripts can be Mark-of-the-Web-tagged by NSIS;
         // the default RemoteSigned policy would silently refuse to
         // run them. Bypass scopes only to this invocation.
+        "-ExecutionPolicy".to_string(),
+        "Bypass".to_string(),
+        "-Command".to_string(),
+        command,
+    ]
+}
+
+/// Sibling of `core_args` for a campaign-only run (plan §4.2): the
+/// engine's `-Mode AccessReview` path — prereqs, auth, and the
+/// `AccessReview` phase, with no Core/Modules/unified report.
+///
+/// `output_dir` stays the run's working output (that is where the
+/// cancel sentinel lives); `campaign_dir` is the durable, user-chosen
+/// campaign folder and is deliberately never TEMP. `campaign_id` is a
+/// campaign *folder name*, required by Close/Report and empty for
+/// Open (which mints its own). Pure + unit-tested.
+pub fn access_review_args(
+    core_script: &str,
+    tenant: &str,
+    output_dir: &str,
+    campaign_dir: &str,
+    auth_method: &str,
+    action: &str,
+    campaign_id: &str,
+) -> Vec<String> {
+    let mut command = format!(
+        "& {} -TenantName {} -OutputDirectory {} -AccessReviewAction {} \
+         -AccessReviewDirectory {} -AuthMethod {} -EmitEvents",
+        ps_single_quote(core_script),
+        ps_single_quote(tenant),
+        ps_single_quote(output_dir),
+        ps_single_quote(action),
+        ps_single_quote(campaign_dir),
+        ps_single_quote(auth_method)
+    );
+    if !campaign_id.is_empty() {
+        command.push_str(&format!(" -CampaignId {}", ps_single_quote(campaign_id)));
+    }
+    if auth_method == "Skip" {
+        command.push_str(" -SkipAuthentication");
+    }
+    command.push_str(" *>&1");
+    vec![
+        "-NoProfile".to_string(),
+        "-NonInteractive".to_string(),
         "-ExecutionPolicy".to_string(),
         "Bypass".to_string(),
         "-Command".to_string(),
@@ -902,6 +1025,111 @@ mod tests {
         );
     }
 
+    /// Pins the console-INHERITANCE contract of `apply_no_console_window`.
+    /// DO NOT DELETE AS NOISE — it is the only thing between a future "just
+    /// put `CREATE_NO_WINDOW` back, it's tidier" refactor and a GUI where
+    /// interactive sign-in is impossible. A child spawned with
+    /// `CREATE_NO_WINDOW` gets its own brand-new console instead of ours,
+    /// with no window; MSAL's WAM broker (Azure.Identity 1.18+, what
+    /// `Connect-MgGraph` interactive uses) resolves its parent window from
+    /// the process console, so it throws "A window handle must be
+    /// configured" and nobody can sign in — while every other test stays
+    /// green.
+    ///
+    /// Honest limits — do not read a green tick here as proof:
+    ///
+    /// 1. The allocate-and-hide branch is NOT covered. Measured under
+    ///    `cargo test` on a ConPTY host (Windows Terminal): the test
+    ///    process is already attached to a console (`GetConsoleProcessList`
+    ///    returns 6) but that console has no window (`GetConsoleWindow()`
+    ///    is 0), so `AllocConsole` IS reached and FAILS with
+    ///    `ERROR_ACCESS_DENIED` (5). `ensure_hidden_console()` therefore
+    ///    reports false and `apply_no_console_window` takes its documented
+    ///    `CREATE_NO_WINDOW` fallback. The branch that actually feeds the
+    ///    WAM broker a window runs only in a release
+    ///    (`windows_subsystem = "windows"`) build, which starts with no
+    ///    console at all and where `AllocConsole` succeeds.
+    /// 2. Consequently, on such a host this test does NOT catch the
+    ///    headline regression: reinstating an unconditional
+    ///    `CREATE_NO_WINDOW` was verified to leave it green there, because
+    ///    both spellings produce the identical child. It bites on a host
+    ///    with a real console window (classic conhost), where the
+    ///    assertion demands the child share OUR window. What it does pin
+    ///    everywhere is the opposite slip — dropping the fallback, so a
+    ///    child silently inherits a console we never meant to hand it.
+    ///
+    /// Inheritance is probed via the child's console *process list* rather
+    /// than its window handle, since that is the signal that survives a
+    /// windowless ConPTY host; the window-handle check is layered on
+    /// wherever a real console window exists.
+    ///
+    /// Skips cleanly where pwsh is absent, like the probe tests above.
+    #[cfg(windows)]
+    #[test]
+    fn spawned_child_inherits_our_console_when_pwsh_present() {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetConsoleWindow() -> isize;
+        }
+        let loc = match discover_pwsh() {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        // Exactly the call `apply_no_console_window` gates on: is there a
+        // console for the child to inherit in the first place?
+        let have_console = ensure_hidden_console();
+        // SAFETY: plain Win32 call with no pointer arguments.
+        let parent_hwnd = unsafe { GetConsoleWindow() };
+
+        // The child reports its own console window handle plus whether OUR
+        // pid sits on its console's process list — sharing a console is the
+        // signal that survives a windowless ConPTY host.
+        let script = format!(
+            "Add-Type -Namespace N -Name K -MemberDefinition \
+             '[DllImport(\"kernel32.dll\")] public static extern \
+             System.IntPtr GetConsoleWindow(); \
+             [DllImport(\"kernel32.dll\")] public static extern \
+             uint GetConsoleProcessList(uint[] l, uint c);'; \
+             $b = New-Object uint[] 64; \
+             $n = [N.K]::GetConsoleProcessList($b, 64); \
+             $v = if ($n -gt 0 -and ($b[0..($n - 1)] -contains {})) \
+             {{ 'INHERITED' }} else {{ 'SEPARATE' }}; \
+             'hwnd=' + [N.K]::GetConsoleWindow() + ' ' + $v",
+            std::process::id()
+        );
+        let mut lines = Vec::new();
+        let code = spawn_streaming(
+            &loc.path,
+            &["-NoProfile", "-NonInteractive", "-Command", script.as_str()],
+            |l| lines.push(l.to_string()),
+            |_| {},
+        )
+        .expect("console probe should spawn once pwsh is discovered");
+        assert_eq!(code, 0, "console probe must exit 0, got {lines:?}");
+        let report = lines
+            .iter()
+            .find(|l| l.contains("hwnd="))
+            .unwrap_or_else(|| panic!("child never reported its console: {lines:?}"));
+
+        assert_eq!(
+            report.contains("INHERITED"),
+            have_console,
+            "the child must share OUR console whenever we have one (and only \
+             fall back to its own when we do not): reintroducing \
+             CREATE_NO_WINDOW here leaves the WAM broker with no window to \
+             parent to and kills interactive sign-in. have_console={have_console}, \
+             child reported {report:?}"
+        );
+        if have_console && parent_hwnd != 0 {
+            // A real console window exists — then it must be OUR window the
+            // child sees, because that handle is what the broker asks for.
+            assert!(
+                report.contains(&format!("hwnd={parent_hwnd} ")),
+                "child must see our console window {parent_hwnd}, got {report:?}"
+            );
+        }
+    }
+
     #[test]
     fn find_upwards_locates_a_marker_in_an_ancestor() {
         let base = std::env::temp_dir()
@@ -927,6 +1155,8 @@ mod tests {
             &["Core".to_string(), "SecureScore".to_string()],
             "Skip",
             &[],
+            false,
+            None,
         );
         // Both non-negotiable on Windows: bypass MotW-tagged bundled
         // scripts, and the core file we're running.
@@ -949,6 +1179,10 @@ mod tests {
         // Start-EntraChecks.ps1 and we want that path unaltered.
         assert!(!cmd.contains("-HtmlReportSet"));
         assert!(!cmd.contains("-HtmlDeepDiveDomains"));
+        // In-concert not requested -> the campaign switches must be
+        // absent, or every plain run would open a campaign.
+        assert!(!cmd.contains("-OpenAccessReviewCampaign"));
+        assert!(!cmd.contains("-AccessReviewDirectory"));
 
         let without = core_args(
             "/r/c.ps1",
@@ -957,6 +1191,8 @@ mod tests {
             &["Core".to_string()],
             "DeviceCode",
             &[],
+            false,
+            None,
         );
         let without_cmd = without
             .iter()
@@ -982,6 +1218,8 @@ mod tests {
                 "SecureScore".to_string(),
                 "DefenderCompliance".to_string(),
             ],
+            false,
+            None,
         );
         let cmd = args
             .iter()
@@ -993,6 +1231,180 @@ mod tests {
         // deep dives render alongside as separate HTML files.
         assert!(cmd.contains("-HtmlReportSet 'CockpitAndDeepDives'"));
         assert!(cmd.contains("-HtmlDeepDiveDomains @('SecureScore','DefenderCompliance')"));
+    }
+
+    #[test]
+    fn core_args_in_concert_flags_only_when_requested() {
+        // The checkbox is opt-in per run: the switch may only appear
+        // when the webview actually asked for it. The folder is NOT
+        // tied to the switch — a config-enabled campaign still has to
+        // land in the folder the panel shows.
+        let on = core_args(
+            "/r/c.ps1",
+            "T",
+            "/o",
+            &["Core".to_string()],
+            "DeviceCode",
+            &[],
+            true,
+            Some("/campaigns"),
+        );
+        let on_cmd = on
+            .iter()
+            .skip_while(|x| *x != "-Command")
+            .nth(1)
+            .expect("-Command payload");
+        assert!(on_cmd.contains("-OpenAccessReviewCampaign"));
+        assert!(on_cmd.contains("-AccessReviewDirectory '/campaigns'"));
+        assert!(on_cmd.ends_with("*>&1"), "redirection stays last");
+
+        // Switch on, no folder -> engine falls back to its configured
+        // AccessReview.OutputDirectory rather than being handed ''.
+        let no_dir = core_args(
+            "/r/c.ps1",
+            "T",
+            "/o",
+            &["Core".to_string()],
+            "DeviceCode",
+            &[],
+            true,
+            Some(""),
+        );
+        let no_dir_cmd = no_dir
+            .iter()
+            .skip_while(|x| *x != "-Command")
+            .nth(1)
+            .expect("-Command payload");
+        assert!(no_dir_cmd.contains("-OpenAccessReviewCampaign"));
+        assert!(!no_dir_cmd.contains("-AccessReviewDirectory"));
+
+        // Folder remembered but checkbox off -> no switch, but the
+        // folder still travels: `AccessReview.Enabled` in config starts
+        // the phase without the checkbox, and it must use this folder.
+        let off = core_args(
+            "/r/c.ps1",
+            "T",
+            "/o",
+            &["Core".to_string()],
+            "DeviceCode",
+            &[],
+            false,
+            Some("/campaigns"),
+        );
+        let off_cmd = off
+            .iter()
+            .skip_while(|x| *x != "-Command")
+            .nth(1)
+            .expect("-Command payload");
+        assert!(!off_cmd.contains("-OpenAccessReviewCampaign"));
+        assert!(off_cmd.contains("-AccessReviewDirectory '/campaigns'"));
+
+        // Nothing set at all -> neither appears.
+        let none = core_args(
+            "/r/c.ps1",
+            "T",
+            "/o",
+            &["Core".to_string()],
+            "DeviceCode",
+            &[],
+            false,
+            None,
+        );
+        let none_cmd = none
+            .iter()
+            .skip_while(|x| *x != "-Command")
+            .nth(1)
+            .expect("-Command payload");
+        assert!(!none_cmd.contains("-OpenAccessReviewCampaign"));
+        assert!(!none_cmd.contains("-AccessReviewDirectory"));
+    }
+
+    #[test]
+    fn access_review_args_shape_per_action() {
+        // Open mints its own campaign id, so -CampaignId must be
+        // absent — handing the engine an empty one would fail its
+        // Close/Report lookup for no reason.
+        let open = access_review_args(
+            "/r/Invoke-EntraChecksRun.ps1",
+            "Contoso",
+            "/o",
+            "/campaigns",
+            "DeviceCode",
+            "Open",
+            "",
+        );
+        assert!(open.contains(&"-ExecutionPolicy".to_string()));
+        assert!(open.contains(&"Bypass".to_string()));
+        let open_cmd = open
+            .iter()
+            .skip_while(|x| *x != "-Command")
+            .nth(1)
+            .expect("-Command payload");
+        // Exact shape: this string is the contract between the shell
+        // and the engine's -Mode AccessReview param block. -EmitEvents
+        // is how the GUI sees anything at all, and *>&1 must stay the
+        // final token or PowerShell parses the rest as redirected.
+        assert_eq!(
+            open_cmd,
+            "& '/r/Invoke-EntraChecksRun.ps1' -TenantName 'Contoso' \
+             -OutputDirectory '/o' -AccessReviewAction 'Open' \
+             -AccessReviewDirectory '/campaigns' -AuthMethod 'DeviceCode' \
+             -EmitEvents *>&1"
+        );
+        assert!(!open_cmd.contains("-CampaignId"));
+        assert!(!open_cmd.contains("-SkipAuthentication"));
+        // A campaign-only run never carries assessment switches.
+        assert!(!open_cmd.contains("-Modules"));
+
+        for action in ["Close", "Report"] {
+            let args = access_review_args(
+                "/r/c.ps1",
+                "T",
+                "/o",
+                "/campaigns",
+                "DeviceCode",
+                action,
+                "2026-Q3-20260803-141500",
+            );
+            let cmd = args
+                .iter()
+                .skip_while(|x| *x != "-Command")
+                .nth(1)
+                .expect("-Command payload");
+            assert!(cmd.contains(&format!("-AccessReviewAction '{action}'")));
+            // The folder NAME, not a path — the engine joins it onto
+            // -AccessReviewDirectory itself.
+            assert!(cmd.contains("-CampaignId '2026-Q3-20260803-141500'"));
+        }
+    }
+
+    #[test]
+    fn access_review_args_escapes_quotes_and_toggles_skip_auth() {
+        // A real Documents path can contain an apostrophe (O'Brien),
+        // which would close the PS string literal early and turn the
+        // rest of the path into commands. Doubling is the fix, and
+        // "use my existing session" is the fast path for Close/Report.
+        let args = access_review_args(
+            "/r/c.ps1",
+            "O'Brien Ltd",
+            "/o",
+            r"C:\Users\O'Brien\Documents\EntraChecks\AccessReview",
+            "Skip",
+            "Report",
+            "2026-Q3'-1",
+        );
+        let cmd = args
+            .iter()
+            .skip_while(|x| *x != "-Command")
+            .nth(1)
+            .expect("-Command payload");
+        assert!(cmd.contains("-TenantName 'O''Brien Ltd'"));
+        assert!(cmd.contains(
+            r"-AccessReviewDirectory 'C:\Users\O''Brien\Documents\EntraChecks\AccessReview'"
+        ));
+        assert!(cmd.contains("-CampaignId '2026-Q3''-1'"));
+        assert!(cmd.contains("-SkipAuthentication"));
+        assert!(cmd.ends_with("*>&1"), "redirection stays last");
     }
 
     #[test]

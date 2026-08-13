@@ -115,6 +115,17 @@
           <button id="btn-dd-none" type="button" class="secondary">No deep dives</button>
         </div>
         <div class="form-row">
+          <div class="field-stack">
+            <label class="check"><input type="checkbox" id="chk-access-review" /> Also open an access-review campaign</label>
+            <p class="field-help">
+              Adds an Access Review phase to this run, reusing the
+              privileged roster the run already builds. The campaign is
+              written to <code id="ar-dir-hint"></code> — change it in the
+              Access Review card below.
+            </p>
+          </div>
+        </div>
+        <div class="form-row">
           <button id="btn-run" disabled>Run assessment</button>
           <button id="btn-cancel" class="secondary hidden">Cancel</button>
         </div>
@@ -124,6 +135,76 @@
       <section id="auth-panel" class="card auth hidden">
         <h2>Sign-in</h2>
         <div id="auth-body"></div>
+      </section>
+
+      <section id="access-review-card" class="card">
+        <div class="readiness-head">
+          <h2>Access Review (UAR)</h2>
+          <button id="btn-ar-refresh" type="button" class="secondary">Refresh</button>
+        </div>
+        <p class="muted">
+          A campaign runs on its own — no assessment modules, no unified
+          report. Open one, let the reviewer fill
+          <code>review-worksheet.csv</code> in Excel, then close it to
+          verify the decisions and render the report. The campaign folder
+          is audit evidence, so it lives outside the temporary run folder
+          and is remembered between launches.
+        </p>
+
+        <!-- The reviewer is usually not the person who ran the tool, and a
+             pre-seeded CSV does not state its own vocabulary. The decision
+             values here are the validator's set (EntraChecks-AccessReview
+             .psm1 $script:ValidDecisions) — keep them in step. -->
+        <ol class="ar-steps">
+          <li><strong>Open new campaign</strong> — writes the roster,
+            <code>review-worksheet.csv</code> and a hashed manifest.</li>
+          <li><strong>Open worksheet</strong> and set <code>Decision</code> on
+            every <code>Access</code> row to one of
+            <code>Certify</code>, <code>Revoke</code>, <code>Modify</code> or
+            <code>Investigate</code>. Add <code>Notes</code> where useful.</li>
+          <li>Fill the three <code>SignOff</code> rows — put
+            <code>ReviewerName</code>, <code>ReviewerTitle</code> and
+            <code>SignOffDate</code> (<code>YYYY-MM-DD</code>) in each row's
+            <code>Notes</code> column.</li>
+          <li>Save as CSV. Do not add, remove or reorder rows or columns —
+            the worksheet is checked against the baseline.</li>
+          <li><strong>Make the access changes yourself</strong> in Entra ID /
+            PIM. EntraChecks is read-only and never revokes anything — a
+            <code>Revoke</code> decision records intent, it does not act.</li>
+          <li>Select the campaign and <strong>Close campaign</strong>. It
+            re-reads the tenant and checks each decision against what actually
+            changed, flagging <code>NOT_REMEDIATED</code> where a revoke never
+            happened, then renders the report.</li>
+        </ol>
+        <p class="muted ar-steps-note">
+          Close before making the changes and every revoke comes back
+          <code>NOT_REMEDIATED</code>. A close that fails writes nothing and
+          leaves the campaign <code>Open</code> — fix and close again.
+        </p>
+
+        <div class="form-row">
+          <div class="field-stack ar-dir-field">
+            <label for="ar-dir">Campaign folder</label>
+            <!-- A concrete example, not %USERPROFILE%: the value is handed
+                 to PowerShell verbatim, which does not expand cmd-style
+                 variables and would create a folder of that name. -->
+            <input id="ar-dir" placeholder="C:\Users\you\Documents\EntraChecks\AccessReview" />
+          </div>
+          <button id="btn-ar-folder" type="button" class="secondary ar-dir-btn">Open folder</button>
+        </div>
+        <div class="form-row compact">
+          <button id="btn-ar-open" type="button">Open new campaign</button>
+        </div>
+
+        <ul id="ar-list" class="ar-list"></ul>
+        <p id="ar-count" class="muted"></p>
+
+        <div class="form-row">
+          <button id="btn-ar-worksheet" type="button" class="secondary" disabled>Open worksheet</button>
+          <button id="btn-ar-close" type="button" class="secondary" disabled>Close campaign</button>
+          <button id="btn-ar-report" type="button" class="secondary" disabled>Regenerate report</button>
+        </div>
+        <p id="ar-status" class="run-status"></p>
       </section>
 
       <section id="result-card" class="card hidden">

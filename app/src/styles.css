@@ -483,6 +483,78 @@ button.secondary {
   flex-wrap: wrap;
 }
 
+.ar-dir-field {
+  flex: 1 1 420px;
+}
+
+.ar-dir-field input {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+/* Line the folder button up with the input, not with the label above
+   it (.form-row aligns its children to the top). */
+.ar-dir-btn {
+  align-self: flex-end;
+}
+
+.ar-list {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0;
+}
+
+.ar-row {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr) 90px 80px 140px;
+  gap: 10px;
+  align-items: center;
+  padding: 6px 10px;
+  border-radius: 6px;
+  font-size: 0.85rem;
+  border-left: 3px solid #cfcfcf;
+  background: #fafafa;
+  margin-bottom: 4px;
+}
+
+.ar-row.ar-head {
+  background: transparent;
+  border-left-color: transparent;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: #777;
+  margin-bottom: 2px;
+}
+
+.ar-row[data-state="open"] {
+  border-left-color: #1e8e3e;
+}
+.ar-row[data-state="closed"] {
+  border-left-color: #b0b0b0;
+  opacity: 0.85;
+}
+
+.ar-pick {
+  display: flex;
+  align-items: center;
+}
+
+.ar-id {
+  font-weight: 600;
+  word-break: break-all;
+}
+
+.ar-opened {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.78rem;
+  color: #6a6a6a;
+}
+
+.ar-empty {
+  padding: 6px 0;
+}
+
 .auth {
   border-left: 3px solid #3b82f6;
 }
@@ -572,6 +644,36 @@ button {
 
 button:hover {
   border-color: #396cd8;
+}
+
+/* `button` sets an explicit colour and background, which defeats the
+   engine's default greying of a disabled control. Without this the
+   Access Review actions read as live while they are gated on a
+   selection — three buttons that look clickable and do nothing. */
+/* Review steps: the reviewer reads these once, so they must be scannable
+   without competing with the controls underneath. */
+.ar-steps {
+  margin: 4px 0 6px;
+  padding-left: 20px;
+  font-size: 0.92em;
+  line-height: 1.55;
+  opacity: 0.85;
+}
+
+.ar-steps li {
+  margin-bottom: 3px;
+}
+
+.ar-steps-note {
+  margin-top: 0;
+  margin-bottom: 14px;
+}
+
+button:disabled,
+button:disabled:hover {
+  opacity: 0.45;
+  cursor: not-allowed;
+  border-color: #d0d0d0;
 }
 
 button:active {
@@ -703,6 +805,15 @@ button:active {
   }
   .ready-row {
     background: #242424;
+  }
+  .ar-row {
+    background: #242424;
+  }
+  .ar-row.ar-head {
+    color: #999;
+  }
+  .ar-opened {
+    color: #999;
   }
   .module-picker,
   .deepdive-picker {
