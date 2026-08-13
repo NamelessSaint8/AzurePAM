@@ -1,4 +1,4 @@
-# Access Review Guide
+﻿# Access Review Guide
 
 Quarterly runbook for producing the **User Access Review (UAR) evidence package** a SOC 2 or PCI DSS assessor asks for:
 
@@ -119,6 +119,7 @@ Everything menu `[9]` does is scriptable. Two shapes:
     -TenantName Contoso -CampaignId '2026-Q3-20260803-141500'
 
 # Generate the remediation script for a CLOSED campaign. No sign-in happens:
+
 # this reads the campaign folder and writes a .ps1 — nothing touches the tenant.
 .\Start-EntraChecks.ps1 -Mode AccessReview -AccessReviewAction Remediate `
     -TenantName Contoso -AccessReviewDirectory 'C:\Evidence\AccessReview' `
@@ -163,6 +164,19 @@ A refused close is a normal outcome, not a crash. An incomplete worksheet, a tam
 ---
 
 ## Remediation script generator
+
+> **Off by default.** Set `AccessReview.EnableRemediation` to `true` in
+> `config\entrachecks.config.json` to enable generation. The generated script
+> removes privileged access and EntraChecks never runs it — you run it
+> deliberately, after reading it.
+>
+> **What the integrity gate does and does not prove.** It verifies the campaign
+> bundle is internally consistent — every file matches its recorded hash, the
+> manifest's own bundle hash recomputes, and the artifacts it reads are covered.
+> It is tamper-evidence, not a signature: anyone who recomputes every hash can
+> produce a bundle that passes. Treat the campaign folder as you would any other
+> audit evidence.
+
 
 **EntraChecks never applies a change to your tenant.** It has no write scopes, asks for none, and the generator makes no Graph calls at all — it reads a closed campaign folder and writes a `.ps1`. Running that script is a separate, deliberate human act.
 

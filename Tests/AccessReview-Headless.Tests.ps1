@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Pester 5 test suite for the headless Access Review path
     (PR 1 of plans/Access-Review-GUI-Implementation-Plan.md).
@@ -458,7 +458,21 @@ Describe 'Campaign close — an incomplete worksheet is a non-fatal outcome' {
         $AccessReviewDirectory = $script:CampaignRoot
         $CampaignId = $script:Opened.CampaignId
         $OpenAccessReviewCampaign = $false
-        $null = $OutputDirectory, $AccessReviewAction, $AccessReviewDirectory, $CampaignId, $OpenAccessReviewCampaign
+        # Remediation is opt-in; this test is about the GENERATOR's own
+        # refusal, so opt in via the merged-config seam Get-AccessReviewConfig
+        # consults first - this call drives the sequence directly, so there is
+        # no -ConfigFile to thread.
+        $script:Config = @{ AccessReview = @{ EnableRemediation = $true } }
+        $ConfigFile = Join-Path $script:Tmp 'ar-enabled.config.json'
+        @{ AccessReview = @{ EnableRemediation = $true } } | ConvertTo-Json -Depth 5 |
+            Set-Content -LiteralPath $ConfigFile -Encoding UTF8
+        $null = $OutputDirectory, $AccessReviewAction, $AccessReviewDirectory, $CampaignId,
+        $OpenAccessReviewCampaign, $ConfigFile
+    }
+
+    AfterEach {
+        # Do not leak the opt-in into other Describes.
+        $script:Config = $null
     }
 
     It 'emits a non-fatal accessReview.failed, fails the phase, and still reaches run.result' {
@@ -553,15 +567,48 @@ Describe 'Invoke-AccessReviewPhase — Remediate' {
         # The generator has its own 33-test suite; this file tests the wiring.
         # The mock still binds against the real signature, so a wrong
         # parameter name on the call site fails here.
+        # Remediation ships disabled; these tests exercise the wiring behind
+        # the opt-in, so they supply a config that turns it on. The gate
+        # itself is covered separately below.
+        $script:RemConfig = Join-Path $script:RemRoot 'ar-enabled.config.json'
+        @{ AccessReview = @{ EnableRemediation = $true } } | ConvertTo-Json -Depth 5 |
+            Set-Content -LiteralPath $script:RemConfig -Encoding UTF8
+
         Mock New-AccessReviewRemediationScript {
             @{ Success = $true; FailureReason = $null; ScriptPath = $script:RemScript; PlanPath = $script:RemPlan; ActionCount = 3; ManualCount = 1; SkippedCount = 2 }
         }
     }
 
+    It 'refuses when remediation is not opted in, before loading the generator' {
+        # The shipped default. A tenant turns this on knowingly - discovering
+        # the button and having it emit a privileged-access removal script is
+        # not a reasonable default.
+        $off = Join-Path $script:RemRoot 'ar-disabled.config.json'
+        @{ AccessReview = @{ EnableRemediation = $false } } | ConvertTo-Json -Depth 5 |
+            Set-Content -LiteralPath $off -Encoding UTF8
+
+        $ctx = & $script:MakeCtx 'ar-remediate-off' $script:RemRoot
+        $r = Invoke-AccessReviewPhase -Action 'Remediate' -CampaignDirectory $script:RemRoot `
+            -CampaignId 'camp-closed' -ConfigPath $off -Context $ctx
+
+        $r.Success | Should -BeFalse
+        $r.FailureReason | Should -Match 'EnableRemediation'
+        # Refused before the generator is reached, not after it ran.
+        Should -Invoke New-AccessReviewRemediationScript -Times 0 -Exactly
+        @($ctx.Artifacts).Count | Should -Be 0
+    }
+
+    It 'ships disabled: the repo config does not opt in' {
+        # Guards the shipped default itself, so enabling it in config/ has to
+        # be a deliberate edit that fails this test loudly.
+        (Get-AccessReviewConfig -ConfigPath $script:RepoConfigPath).EnableRemediation |
+            Should -BeFalse
+    }
+
     It 'runs the phase and records the script + plan artifacts' {
         $ctx = & $script:MakeCtx 'ar-remediate' $script:RemRoot
         $r = Invoke-AccessReviewPhase -Action 'Remediate' -CampaignDirectory $script:RemRoot `
-            -CampaignId 'camp-closed' -Context $ctx
+            -CampaignId 'camp-closed' -ConfigPath $script:RemConfig -Context $ctx
 
         $r.Success | Should -BeTrue -Because ($r.FailureReason)
         $r.ActionCount | Should -Be 3
@@ -593,7 +640,7 @@ Describe 'Invoke-AccessReviewPhase — Remediate' {
         # an event consumer (the GUI) must get them too.
         $ctx = & $script:MakeCtx 'ar-counts' $script:RemRoot
         $null = Invoke-AccessReviewPhase -Action 'Remediate' -CampaignDirectory $script:RemRoot `
-            -CampaignId 'camp-closed' -Context $ctx
+            -CampaignId 'camp-closed' -ConfigPath $script:RemConfig -Context $ctx
 
         $counts = @($ctx.Events | Where-Object { $_.type -eq 'log' -and $_.message -match 'Actions=' })
         $counts.Count | Should -Be 1
@@ -603,7 +650,7 @@ Describe 'Invoke-AccessReviewPhase — Remediate' {
     }
 
     It 'rejects a missing -CampaignId before calling the generator' {
-        $r = Invoke-AccessReviewPhase -Action 'Remediate' -CampaignDirectory $script:RemRoot
+        $r = Invoke-AccessReviewPhase -Action 'Remediate' -CampaignDirectory $script:RemRoot -ConfigPath $script:RemConfig
         $r.Success | Should -BeFalse
         $r.FailureReason | Should -Match 'CampaignId'
         Should -Invoke New-AccessReviewRemediationScript -Times 0 -Exactly
@@ -656,7 +703,14 @@ Describe 'Remediate — a generator refusal is a non-fatal outcome' {
         $err = @($seq.Manifest.errors | Where-Object { $_.code -eq 'accessReview.failed' })
         $err.Count | Should -Be 1
         $err[0].fatal | Should -BeFalse
-        $err[0].message | Should -BeExactly "Campaign 'camp-open' is Open, not Closed. Nothing generated."
+        # Since remediation became opt-in, the gate refuses on this path
+        # before the generator is reached, so this is the refusal that
+        # surfaces here. The property under test is unchanged - a refusal is
+        # non-fatal, reaches run.result, and carries its reason verbatim.
+        # The generator's own "campaign is Open" refusal is covered by
+        # Tests/AccessReview-Remediation.Tests.ps1 against the real module.
+        $err[0].message | Should -Match 'EnableRemediation'
+        $err[0].message | Should -Match 'never run by EntraChecks'
 
         $done = @($seen | Where-Object { $_.type -eq 'phase.completed' -and $_.phase -eq 'AccessReview' })
         $done.Count | Should -Be 1
@@ -753,8 +807,11 @@ Describe 'Remediate — the run never authenticates' {
         $AccessReviewDirectory = $script:CampaignRoot
         $CampaignId = 'camp-closed'
         $OpenAccessReviewCampaign = $false
+        $ConfigFile = Join-Path $script:Tmp 'ar-enabled-e2e.config.json'
+        @{ AccessReview = @{ EnableRemediation = $true } } | ConvertTo-Json -Depth 5 |
+            Set-Content -LiteralPath $ConfigFile -Encoding UTF8
         $null = $TenantName, $SkipAuthentication, $AuthMethod, $EmitEvents, $OutputDirectory,
-        $AccessReviewAction, $AccessReviewDirectory, $CampaignId, $OpenAccessReviewCampaign
+        $AccessReviewAction, $AccessReviewDirectory, $CampaignId, $OpenAccessReviewCampaign, $ConfigFile
 
         # The NDJSON contract is written to real stdout ([Console]::Out), not
         # the PowerShell pipeline, so the console is redirected for the call.
