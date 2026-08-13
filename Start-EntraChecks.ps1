@@ -101,7 +101,7 @@
 [CmdletBinding()]
 param(
     [Parameter()]
-    [ValidateSet("Interactive", "Quick", "Scheduled", "Hybrid")]
+    [ValidateSet("Interactive", "Quick", "Scheduled", "Hybrid", "AccessReview")]
     [string]$Mode = "Interactive",
 
     [Parameter()]
@@ -170,7 +170,27 @@ param(
     # event contract to stdout. Off by default: the run is silent
     # (the run-history manifest is still written). The Phase 2 console
     # renderer is what restores rich progress for interactive CLI use.
-    [switch]$EmitEvents
+    [switch]$EmitEvents,
+
+    # PR 1 of Access-Review-GUI-Implementation-Plan — the headless campaign
+    # path. -Mode AccessReview + -AccessReviewAction runs the campaign
+    # lifecycle on its own (Auth -> AccessReview, no Core/Modules/Report/
+    # Snapshot/SOC2); -OpenAccessReviewCampaign instead adds an AccessReview
+    # phase to a normal run ("in concert"), reusing the privileged roster
+    # that run already built.
+    [ValidateSet('Open', 'Close', 'Report')]
+    [string]$AccessReviewAction,
+
+    # Campaign root. Overrides AccessReview.OutputDirectory from config.
+    # Campaigns are durable audit evidence — never point this at a temp dir.
+    [string]$AccessReviewDirectory,
+
+    # Campaign FOLDER NAME (not a path), e.g. 2026-Q3-20260803-141500.
+    # Required for -AccessReviewAction Close / Report.
+    [string]$CampaignId,
+
+    # "In concert": also open an access-review campaign during a normal run.
+    [switch]$OpenAccessReviewCampaign
 )
 
 # Default comprehensive report and executive summary to enabled
@@ -338,8 +358,12 @@ if ($ConfigFile) {
 
         # PR 4 of HTML-Reporting-Consolidation-Plan: HTML routing overrides from
         # the Assessment.Output.Html block. Param > config > hard default.
+        # Import-Configuration returns a hashtable, whose PSObject.Properties
+        # exposes only the dictionary members (Keys/Count/...) — never the
+        # config keys — so probing it for 'Html' was always false. Read the
+        # key directly; a missing key is $null on hashtable and PSCustomObject.
         $htmlCfg = $null
-        if ($script:Config.Assessment.Output -and $script:Config.Assessment.Output.PSObject.Properties['Html']) {
+        if ($script:Config.Assessment.Output) {
             $htmlCfg = $script:Config.Assessment.Output.Html
         }
         if ($htmlCfg) {
@@ -581,6 +605,15 @@ $script:AllGraphScopes = @(
 
 #region ==================== MAIN EXECUTION ====================
 
+# -AccessReviewAction only has meaning on the campaign-only path. On any
+# other mode it used to be silently rewritten to 'Open' (a requested Close
+# would open a brand-new campaign and exit 0) or dropped entirely. Fail
+# loudly instead. Checked after the config load so a config-supplied Mode
+# counts. Placed before the switch so the message is the whole error.
+if ($AccessReviewAction -and $Mode -ne 'AccessReview') {
+    throw "Start-EntraChecks: -AccessReviewAction requires -Mode AccessReview. Use -OpenAccessReviewCampaign to open a campaign during a normal run."
+}
+
 # Main entry point
 try {
     switch ($Mode) {
@@ -595,6 +628,9 @@ try {
         }
         "Hybrid" {
             Start-HybridMode
+        }
+        "AccessReview" {
+            Start-AccessReviewMode
         }
     }
 }

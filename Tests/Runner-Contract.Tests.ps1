@@ -522,3 +522,37 @@ Describe 'Auth-as-events primitives (Phase 3c)' {
         (Get-EcfErrorInfo -Code 'auth.failed').Fatal | Should -BeTrue
     }
 }
+
+Describe 'Run-context collections survive @() wrapping' {
+
+    # New-Object System.Collections.Generic.List[object] hands back a
+    # PSObject-wrapped list, and @() over one of those throws "Argument
+    # types do not match" — on Windows PowerShell 5.1 and pwsh 7.x alike,
+    # empty or not. The context lists cross into the orchestration, the
+    # TUI renderer and the sidecar, so any consumer may reasonably wrap
+    # them. ::new() in New-EcfRunContext is what keeps this passing.
+
+    It 'wraps cleanly while empty' {
+        $ctx = New-EcfRunContext -RunId 'wrap-empty' -Params @{} -OutputDirectory $env:TEMP
+        foreach ($name in 'Events', 'Artifacts', 'Errors', 'Warnings', 'OpenPhases') {
+            { @($ctx.$name) } | Should -Not -Throw -Because "@(`$ctx.$name) must not throw on the empty success path"
+            @($ctx.$name).Count | Should -Be 0
+        }
+    }
+
+    It 'wraps cleanly once populated' {
+        # Emptiness is not the discriminator — a populated wrapped list
+        # throws identically. Pin both so the fix cannot regress halfway.
+        $ctx = New-EcfRunContext -RunId 'wrap-full' -Params @{} -OutputDirectory $env:TEMP
+        Write-EcfWarning -Context $ctx -Code 'test.warn' -Message 'w'
+        Write-EcfError -Context $ctx -Code 'internal' -Message 'e'
+        Add-EcfArtifact -Context $ctx -Kind 'manifest' -Path (Join-Path $env:TEMP 'nope.json')
+        Start-EcfPhase -Context $ctx -Phase 'Core'
+
+        @($ctx.Warnings).Count | Should -Be 1
+        @($ctx.Errors).Count | Should -Be 1
+        @($ctx.Artifacts).Count | Should -Be 1
+        @($ctx.OpenPhases).Count | Should -Be 1
+        @($ctx.Events).Count | Should -BeGreaterThan 0
+    }
+}

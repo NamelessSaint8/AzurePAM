@@ -57,9 +57,28 @@
     Stream the NDJSON event contract to stdout. Off = silent run; the
     run-history manifest is still written.
 
+.PARAMETER AccessReviewAction
+    Open | Close | Report. When supplied the run is campaign-only
+    (Mode=AccessReview): Auth then the AccessReview phase, no assessment.
+
+.PARAMETER AccessReviewDirectory
+    Campaign root folder. Overrides AccessReview.OutputDirectory in config.
+
+.PARAMETER CampaignId
+    Campaign FOLDER NAME (not a path). Required for Close / Report.
+
+.PARAMETER OpenAccessReviewCampaign
+    "In concert": keep the normal assessment run and also open a campaign,
+    reusing the privileged roster the run already built.
+
 .EXAMPLE
     ./Invoke-EntraChecksRun.ps1 -TenantName Contoso -SkipAuthentication -EmitEvents
     # Headless run; NDJSON on stdout for a sidecar/CI to consume.
+
+.EXAMPLE
+    ./Invoke-EntraChecksRun.ps1 -TenantName Contoso -AccessReviewAction Open `
+        -AccessReviewDirectory 'C:\Evidence\AccessReview' -EmitEvents
+    # Campaign-only run: opens a quarterly UAR campaign, no assessment.
 
 .NOTES
     plans/Native-App-Phase1-Headless-Core-Plan.md (4/4).
@@ -100,7 +119,16 @@ param(
 
     [switch]$SkipAuthentication,
 
-    [switch]$EmitEvents
+    [switch]$EmitEvents,
+
+    [ValidateSet('Open', 'Close', 'Report')]
+    [string]$AccessReviewAction,
+
+    [string]$AccessReviewDirectory,
+
+    [string]$CampaignId,
+
+    [switch]$OpenAccessReviewCampaign
 )
 
 $ErrorActionPreference = 'Stop'
@@ -130,13 +158,21 @@ $forward = @{
 }
 foreach ($name in @('Modules', 'ExportFormat', 'ConfigFile', 'Environment',
         'SaveSnapshot', 'CompareWithLast', 'HtmlReportSet', 'HtmlDeepDiveDomains',
-        'EmitPrivilegedRoster', 'IdentityOverridesPath', 'SkipAuthentication')) {
+        'EmitPrivilegedRoster', 'IdentityOverridesPath', 'SkipAuthentication',
+        'AccessReviewAction', 'AccessReviewDirectory', 'CampaignId',
+        'OpenAccessReviewCampaign')) {
     if ($PSBoundParameters.ContainsKey($name)) {
         $forward[$name] = $PSBoundParameters[$name]
     }
 }
 if ($AuthMethod -eq 'Skip') {
     $forward['SkipAuthentication'] = $true
+}
+# An explicit campaign action switches the run to the campaign-only mode;
+# everything else (including the in-concert -OpenAccessReviewCampaign)
+# stays on the Quick path.
+if ($AccessReviewAction) {
+    $forward['Mode'] = 'AccessReview'
 }
 
 & $startScript @forward

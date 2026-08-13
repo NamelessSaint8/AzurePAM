@@ -86,10 +86,11 @@ function Get-ConfigurationSchema {
                     Mode = @{
                         type = "string"
                         # Must match the ValidateSet on Start-EntraChecks.ps1's -Mode
-                        # parameter (Interactive | Quick | Scheduled | Hybrid).
-                        # "CI/CD" is kept for backwards compatibility with older
-                        # config files that predate the orchestrator parameter set.
-                        enum = @("Interactive", "Quick", "Scheduled", "Hybrid", "CI/CD")
+                        # parameter (Interactive | Quick | Scheduled | Hybrid |
+                        # AccessReview). "CI/CD" is kept for backwards compatibility
+                        # with older config files that predate the orchestrator
+                        # parameter set.
+                        enum = @("Interactive", "Quick", "Scheduled", "Hybrid", "AccessReview", "CI/CD")
                         default = "Interactive"
                         description = "Execution mode"
                     }
