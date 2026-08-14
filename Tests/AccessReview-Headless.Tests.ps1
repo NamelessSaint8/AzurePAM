@@ -458,21 +458,7 @@ Describe 'Campaign close — an incomplete worksheet is a non-fatal outcome' {
         $AccessReviewDirectory = $script:CampaignRoot
         $CampaignId = $script:Opened.CampaignId
         $OpenAccessReviewCampaign = $false
-        # Remediation is opt-in; this test is about the GENERATOR's own
-        # refusal, so opt in via the merged-config seam Get-AccessReviewConfig
-        # consults first - this call drives the sequence directly, so there is
-        # no -ConfigFile to thread.
-        $script:Config = @{ AccessReview = @{ EnableRemediation = $true } }
-        $ConfigFile = Join-Path $script:Tmp 'ar-enabled.config.json'
-        @{ AccessReview = @{ EnableRemediation = $true } } | ConvertTo-Json -Depth 5 |
-            Set-Content -LiteralPath $ConfigFile -Encoding UTF8
-        $null = $OutputDirectory, $AccessReviewAction, $AccessReviewDirectory, $CampaignId,
-        $OpenAccessReviewCampaign, $ConfigFile
-    }
-
-    AfterEach {
-        # Do not leak the opt-in into other Describes.
-        $script:Config = $null
+        $null = $OutputDirectory, $AccessReviewAction, $AccessReviewDirectory, $CampaignId, $OpenAccessReviewCampaign
     }
 
     It 'emits a non-fatal accessReview.failed, fails the phase, and still reaches run.result' {
@@ -666,7 +652,20 @@ Describe 'Invoke-AccessReviewPhase — Remediate' {
     }
 }
 
-Describe 'Remediate — a generator refusal is a non-fatal outcome' {
+Describe 'Remediate — a refusal is a non-fatal outcome' {
+
+    # Two refusals live on this path and they are not the same wiring: the
+    # config gate refuses inside Invoke-AccessReviewPhase before the generator
+    # is loaded, the generator refuses on the campaign's own state. Each gets
+    # its own test, and each supplies the config that lets the OTHER one be
+    # the thing under test.
+    #
+    # Plumbing: Invoke-EcfAssessmentSequence resolves $arConfigPath from an
+    # ambient $ConfigFile read out of the caller's scope (dynamic scope, the
+    # same way it reads $OutputDirectory / $AccessReviewAction here), then
+    # hands it to Invoke-AccessReviewPhase -ConfigPath. So a run config set in
+    # the test scope does reach Get-AccessReviewConfig — nothing special is
+    # needed, and $script:Config is not the only seam.
 
     BeforeEach {
         Mock Invoke-ModuleAssessment { [pscustomobject]@{ Duration = [timespan]::Zero; Errors = @(); Modules = @{} } }
@@ -683,6 +682,15 @@ Describe 'Remediate — a generator refusal is a non-fatal outcome' {
         $script:Findings = @()
         $script:AccessReviewEntraRoster = $null
 
+        # The run config each test points $ConfigFile at. Written per test
+        # rather than shared, so neither refusal can be reached by accident.
+        $script:CfgOn = Join-Path $script:Tmp 'remediation-on.config.json'
+        @{ AccessReview = @{ EnableRemediation = $true } } | ConvertTo-Json -Depth 5 |
+            Set-Content -LiteralPath $script:CfgOn -Encoding UTF8
+        $script:CfgOff = Join-Path $script:Tmp 'remediation-off.config.json'
+        @{ AccessReview = @{ EnableRemediation = $false } } | ConvertTo-Json -Depth 5 |
+            Set-Content -LiteralPath $script:CfgOff -Encoding UTF8
+
         $OutputDirectory = $script:Tmp
         $AccessReviewAction = 'Remediate'
         $AccessReviewDirectory = $script:CampaignRoot
@@ -692,6 +700,12 @@ Describe 'Remediate — a generator refusal is a non-fatal outcome' {
     }
 
     It 'carries the reason verbatim, fails the phase, and still reaches run.result' {
+        # Remediation opted in, so the gate passes and the GENERATOR is what
+        # refuses — this pins the generator-to-run.result wiring, i.e. that
+        # the reason travels the whole way unrewritten.
+        $ConfigFile = $script:CfgOn
+        $null = $ConfigFile
+
         $seen = New-Object System.Collections.Generic.List[object]
         $sink = { param($e) $seen.Add($e) | Out-Null }
         $seq = Invoke-EcfAssessmentSequence -TenantNameValue 'Contoso' -ModuleSet @() -AccessReviewOnly `
@@ -700,15 +714,39 @@ Describe 'Remediate — a generator refusal is a non-fatal outcome' {
         $seq.Manifest | Should -Not -BeNullOrEmpty
         $seq.Manifest.type | Should -BeExactly 'run.result'
 
+        # The generator really ran — without this the gate could refuse first
+        # and a Should -Match on a substring might still pass.
+        Should -Invoke New-AccessReviewRemediationScript -Times 1 -Exactly
+
         $err = @($seq.Manifest.errors | Where-Object { $_.code -eq 'accessReview.failed' })
         $err.Count | Should -Be 1
         $err[0].fatal | Should -BeFalse
-        # Since remediation became opt-in, the gate refuses on this path
-        # before the generator is reached, so this is the refusal that
-        # surfaces here. The property under test is unchanged - a refusal is
-        # non-fatal, reaches run.result, and carries its reason verbatim.
-        # The generator's own "campaign is Open" refusal is covered by
-        # Tests/AccessReview-Remediation.Tests.ps1 against the real module.
+        $err[0].message | Should -BeExactly "Campaign 'camp-open' is Open, not Closed. Nothing generated."
+
+        $done = @($seen | Where-Object { $_.type -eq 'phase.completed' -and $_.phase -eq 'AccessReview' })
+        $done.Count | Should -Be 1
+        $done[0].status | Should -BeExactly 'failed'
+        @($seq.Manifest.artifacts).Count | Should -Be 0
+    }
+
+    It 'the config gate refuses the same way when remediation is not opted in' {
+        # Same run, same campaign, only the opt-in differs. The gate lives in
+        # Invoke-AccessReviewPhase, so this covers the OTHER refusal on the
+        # sequence path: it too is non-fatal and reaches run.result, and it
+        # happens before the generator is ever called.
+        $ConfigFile = $script:CfgOff
+        $null = $ConfigFile
+
+        $seen = New-Object System.Collections.Generic.List[object]
+        $sink = { param($e) $seen.Add($e) | Out-Null }
+        $seq = Invoke-EcfAssessmentSequence -TenantNameValue 'Contoso' -ModuleSet @() -AccessReviewOnly `
+            -InvocationParams @{ TenantName = 'Contoso'; OutputDirectory = $script:Tmp } -EventSink $sink
+
+        Should -Invoke New-AccessReviewRemediationScript -Times 0 -Exactly
+
+        $err = @($seq.Manifest.errors | Where-Object { $_.code -eq 'accessReview.failed' })
+        $err.Count | Should -Be 1
+        $err[0].fatal | Should -BeFalse
         $err[0].message | Should -Match 'EnableRemediation'
         $err[0].message | Should -Match 'never run by EntraChecks'
 
