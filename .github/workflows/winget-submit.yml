@@ -36,13 +36,17 @@ on:
       tag:
         description: "Release tag to submit (e.g. v1.7.0)"
         required: true
+      validate_only:
+        description: "Check WINGET_TOKEN and stop, without submitting anything"
+        type: boolean
+        default: false
 
 jobs:
   publish:
     name: Submit ${{ github.event.release.tag_name || inputs.tag }} to winget-pkgs
     runs-on: windows-latest
     steps:
-      - name: Check secret presence
+      - name: Check WINGET_TOKEN
         id: gate
         shell: pwsh
         env:
@@ -53,9 +57,47 @@ jobs:
             Write-Host "To enable: create a classic GitHub PAT with the 'public_repo'"
             Write-Host "scope and add it as a repo secret named WINGET_TOKEN."
             "submit=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          } else {
-            "submit=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            exit 0
           }
+
+          # A present-but-expired PAT used to surface as wingetcreate's
+          # "Token was invalid" after the installer had been downloaded and
+          # the manifests authored - a long way from the cause. Ask GitHub
+          # up front instead, and read the scopes off the response so a
+          # token that is live but under-scoped also fails here.
+          try {
+              $resp = Invoke-WebRequest -Uri "https://api.github.com/user" -Headers @{
+                  Authorization = "Bearer $env:TOKEN"
+                  'User-Agent'  = 'winget-submit-action'
+              } -ErrorAction Stop
+          } catch {
+              $code = $_.Exception.Response.StatusCode.value__
+              Write-Host "::error::WINGET_TOKEN was rejected by GitHub (HTTP $code)."
+              Write-Host "Classic PATs expire. Generate a new one with the 'public_repo'"
+              Write-Host "scope and update the secret: gh secret set WINGET_TOKEN"
+              exit 1
+          }
+
+          $scopes = $resp.Headers['X-OAuth-Scopes']
+          if ($scopes -is [array]) { $scopes = $scopes -join ', ' }
+          Write-Host "Token accepted for $(($resp.Content | ConvertFrom-Json).login); scopes: $scopes"
+
+          # Fine-grained PATs send no X-OAuth-Scopes header at all, so an
+          # empty value is inconclusive rather than wrong - warn, don't fail.
+          if ([string]::IsNullOrWhiteSpace($scopes)) {
+              Write-Host "::warning::No X-OAuth-Scopes header; cannot confirm 'public_repo'. Continuing."
+          } elseif ($scopes -notmatch '(^|,\s*)(public_repo|repo)(,|$)') {
+              Write-Host "::error::Token lacks the 'public_repo' scope (has: $scopes)."
+              exit 1
+          }
+
+          if ("${{ inputs.validate_only }}" -eq "true") {
+              Write-Host "validate_only requested - stopping before submission."
+              "submit=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+              exit 0
+          }
+
+          "submit=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - name: Resolve target tag + version + installer URL
         if: steps.gate.outputs.submit == 'true'
