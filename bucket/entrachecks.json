@@ -1,12 +1,12 @@
 {
-  "version": "1.8.0",
+  "version": "1.9.0",
   "description": "Read-only Microsoft Cloud (Entra ID / Azure / M365) compliance assessment toolkit. Produces analyst-cockpit HTML, CSV, JSON, and Excel reports across Conditional Access, MFA, Identity Protection, Intune, Secure Score, Defender for Cloud, Azure Policy, Purview, SOC 2 readiness, and on-prem AD.",
   "homepage": "https://github.com/f8l124/AzurePAM",
   "license": "MIT",
   "architecture": {
     "64bit": {
-      "url": "https://github.com/f8l124/AzurePAM/releases/download/v1.8.0/EntraChecks_1.8.0_x64-setup.exe",
-      "hash": "4cb01e16236a66449d506af709e1ce6cae1cc860e3976b8e538a656ac186464d"
+      "url": "https://github.com/NamelessSaint8/AzurePAM/releases/download/v1.9.0/EntraChecks_1.9.0_x64-setup.exe",
+      "hash": "023a2b6933e0a2f557892442929da429eb032882fc414fab1a8c6ff9a25d8845"
     }
   },
   "installer": {
