@@ -189,6 +189,26 @@ jobs:
       - name: Show downloaded files
         run: ls -lh dist
 
+      # The in-app updater GETs releases/latest/download/version.json on
+      # launch. Nothing ever produced that file, so the check has always
+      # 404'd and no release has ever been offered as an update. Generate
+      # it from the tag and ship it as a release asset.
+      - name: Build updater manifest
+        run: |
+          set -euo pipefail
+          TAG="${{ github.ref_name }}"
+          VERSION="${TAG#v}"
+          INSTALLER="$(ls dist/*.exe | head -1)"
+          FILENAME="$(basename "$INSTALLER")"
+          cat > dist/version.json <<EOF
+          {
+            "version": "$VERSION",
+            "url": "https://github.com/${{ github.repository }}/releases/download/$TAG/$FILENAME"
+          }
+          EOF
+          echo "--- version.json ---"
+          cat dist/version.json
+
       - name: Create draft release
         uses: softprops/action-gh-release@v2
         with:
@@ -196,5 +216,7 @@ jobs:
           name: "EntraChecks ${{ github.ref_name }}"
           tag_name: ${{ github.ref_name }}
           generate_release_notes: true
-          files: dist/*.exe
+          files: |
+            dist/*.exe
+            dist/version.json
           fail_on_unmatched_files: true
