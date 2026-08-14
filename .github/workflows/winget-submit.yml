@@ -150,18 +150,18 @@ jobs:
           $LF = [char]0x0A
 
           $versionManifest = @(
-              "# yaml-language-server: `$schema=https://aka.ms/winget-manifest.version.1.6.0.schema.json",
+              "# yaml-language-server: `$schema=https://aka.ms/winget-manifest.version.1.12.0.schema.json",
               "PackageIdentifier: Stells.EntraChecks",
               "PackageVersion: $version",
               "DefaultLocale: en-US",
               "ManifestType: version",
-              "ManifestVersion: 1.6.0"
+              "ManifestVersion: 1.12.0"
           ) -join $LF
           Set-Content -Path "$manifestDir/Stells.EntraChecks.yaml" -Value $versionManifest -Encoding utf8
 
           $description = "EntraChecks runs read-only security and compliance checks across Microsoft 365 and Azure environments, then produces analyst-friendly HTML, CSV, JSON, and Excel reports. Modules cover Conditional Access, MFA, Identity Protection, Intune, Microsoft Secure Score, Defender for Cloud regulatory compliance, Azure Policy, Microsoft Purview Compliance Manager, on-premises Active Directory, hybrid identity correlation, and SOC 2 readiness. The desktop app is a thin Tauri shell over the same PowerShell engine the CLI uses; all checks are read-only and never modify your tenant."
           $localeManifest = @(
-              "# yaml-language-server: `$schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json",
+              "# yaml-language-server: `$schema=https://aka.ms/winget-manifest.defaultLocale.1.12.0.schema.json",
               "PackageIdentifier: Stells.EntraChecks",
               "PackageVersion: $version",
               "PackageLocale: en-US",
@@ -189,17 +189,21 @@ jobs:
               "- powershell",
               "ReleaseNotesUrl: https://github.com/NamelessSaint8/AzurePAM/releases/tag/v$version",
               "ManifestType: defaultLocale",
-              "ManifestVersion: 1.6.0"
+              "ManifestVersion: 1.12.0"
           ) -join $LF
           Set-Content -Path "$manifestDir/Stells.EntraChecks.locale.en-US.yaml" -Value $localeManifest -Encoding utf8
 
           $installerManifest = @(
-              "# yaml-language-server: `$schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json",
+              "# yaml-language-server: `$schema=https://aka.ms/winget-manifest.installer.1.12.0.schema.json",
               "PackageIdentifier: Stells.EntraChecks",
               "PackageVersion: $version",
               "InstallerLocale: en-US",
               "InstallerType: nullsoft",
-              "Scope: machine",
+              # Must match tauri.conf.json bundle.windows.nsis.installMode
+              # ("currentUser"). Declaring machine scope here makes WinGet
+              # elevate and then fail to correlate the per-user ARP entry
+              # the installer actually writes.
+              "Scope: user",
               "InstallerSwitches:",
               "  Silent: /S",
               "  SilentWithProgress: /S",
@@ -208,7 +212,7 @@ jobs:
               "  InstallerUrl: $url",
               "  InstallerSha256: $sha",
               "ManifestType: installer",
-              "ManifestVersion: 1.6.0"
+              "ManifestVersion: 1.12.0"
           ) -join $LF
           Set-Content -Path "$manifestDir/Stells.EntraChecks.installer.yaml" -Value $installerManifest -Encoding utf8
 
