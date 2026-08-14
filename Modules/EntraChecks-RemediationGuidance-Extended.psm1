@@ -16,7 +16,7 @@
     - Testing and verification steps
 
 .NOTES
-    Author: David Stells
+    Author: NamelessSaint
     Version: 2.0.0
     Extends: EntraChecks-RemediationGuidance.psm1
 #>

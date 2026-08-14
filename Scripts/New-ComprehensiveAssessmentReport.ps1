@@ -54,7 +54,7 @@
 
 .NOTES
     Version: 2.0.0
-    Author: David Stells
+    Author: NamelessSaint
     Requires: EntraChecks modules (ComplianceMapping, RiskScoring, HTMLReporting, DeltaReporting, ExcelReporting, RemediationGuidance)
 #>
 

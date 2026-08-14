@@ -16,7 +16,7 @@
     
 .NOTES
     Version: 1.0.0
-    Author: David Stells
+    Author: NamelessSaint
     
 .LINK
     Main Script: Invoke-EntraChecks.ps1

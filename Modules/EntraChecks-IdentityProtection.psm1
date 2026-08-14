@@ -16,7 +16,7 @@
     
 .NOTES
     Version: 1.0.0
-    Author: David Stells
+    Author: NamelessSaint
     Requires: Microsoft.Graph PowerShell SDK
     License Requirement: Azure AD Premium P2
     

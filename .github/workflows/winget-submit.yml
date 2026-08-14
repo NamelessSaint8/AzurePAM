@@ -11,7 +11,7 @@
 #    non-interactively for first-time submissions because the package
 #    identifier is an interactive-only prompt.
 #
-#  - Subsequent submissions: `wingetcreate update Stells.EntraChecks
+#  - Subsequent submissions: `wingetcreate update NamelessSaint.EntraChecks
 #    --urls <new installer url> --version <new version> --submit`. The
 #    package identifier is already known, so wingetcreate can pull the
 #    previous manifest from microsoft/winget-pkgs and just bump it.
@@ -24,7 +24,7 @@
 #
 # The very first submission gets human review by the WinGet maintainers
 # (typically 1-3 days). After that's merged, future tag pushes auto-submit
-# updates against the established Stells.EntraChecks identifier.
+# updates against the established NamelessSaint.EntraChecks identifier.
 
 name: WinGet submission
 
@@ -92,10 +92,10 @@ jobs:
         shell: pwsh
         run: |
           # The path is deterministic from the identifier; a 200 means at
-          # least one version of Stells.EntraChecks is on file, a 404
+          # least one version of NamelessSaint.EntraChecks is on file, a 404
           # means this is the first-ever submission and we need to
           # hand-author the manifest set.
-          $probeUrl = "https://api.github.com/repos/microsoft/winget-pkgs/contents/manifests/s/Stells/EntraChecks"
+          $probeUrl = "https://api.github.com/repos/microsoft/winget-pkgs/contents/manifests/n/NamelessSaint/EntraChecks"
           $exists = $false
           try {
               $resp = Invoke-WebRequest -Uri $probeUrl -Method Get -Headers @{ 'User-Agent' = 'winget-submit-action' } -ErrorAction Stop
@@ -114,7 +114,7 @@ jobs:
         env:
           TOKEN: ${{ secrets.WINGET_TOKEN }}
         run: |
-          .\wingetcreate.exe update Stells.EntraChecks `
+          .\wingetcreate.exe update NamelessSaint.EntraChecks `
               --version "${{ steps.target.outputs.version }}" `
               --urls "${{ steps.target.outputs.url }}" `
               --token "$env:TOKEN" `
@@ -141,7 +141,7 @@ jobs:
           Remove-Item $tmp.FullName -Force
           Write-Host "SHA256: $sha"
 
-          $manifestDir = "manifests-out/s/Stells/EntraChecks/$version"
+          $manifestDir = "manifests-out/n/NamelessSaint/EntraChecks/$version"
           New-Item -ItemType Directory -Force -Path $manifestDir | Out-Null
 
           # Build each manifest as an array of lines so the embedded YAML
@@ -151,29 +151,29 @@ jobs:
 
           $versionManifest = @(
               "# yaml-language-server: `$schema=https://aka.ms/winget-manifest.version.1.12.0.schema.json",
-              "PackageIdentifier: Stells.EntraChecks",
+              "PackageIdentifier: NamelessSaint.EntraChecks",
               "PackageVersion: $version",
               "DefaultLocale: en-US",
               "ManifestType: version",
               "ManifestVersion: 1.12.0"
           ) -join $LF
-          Set-Content -Path "$manifestDir/Stells.EntraChecks.yaml" -Value $versionManifest -Encoding utf8
+          Set-Content -Path "$manifestDir/NamelessSaint.EntraChecks.yaml" -Value $versionManifest -Encoding utf8
 
           $description = "EntraChecks runs read-only security and compliance checks across Microsoft 365 and Azure environments, then produces analyst-friendly HTML, CSV, JSON, and Excel reports. Modules cover Conditional Access, MFA, Identity Protection, Intune, Microsoft Secure Score, Defender for Cloud regulatory compliance, Azure Policy, Microsoft Purview Compliance Manager, on-premises Active Directory, hybrid identity correlation, and SOC 2 readiness. The desktop app is a thin Tauri shell over the same PowerShell engine the CLI uses; all checks are read-only and never modify your tenant."
           $localeManifest = @(
               "# yaml-language-server: `$schema=https://aka.ms/winget-manifest.defaultLocale.1.12.0.schema.json",
-              "PackageIdentifier: Stells.EntraChecks",
+              "PackageIdentifier: NamelessSaint.EntraChecks",
               "PackageVersion: $version",
               "PackageLocale: en-US",
-              "Publisher: David Stells",
+              "Publisher: NamelessSaint",
               "PublisherUrl: https://github.com/NamelessSaint8",
               "PublisherSupportUrl: https://github.com/NamelessSaint8/AzurePAM/issues",
-              "Author: David Stells",
+              "Author: NamelessSaint",
               "PackageName: EntraChecks",
               "PackageUrl: https://github.com/NamelessSaint8/AzurePAM",
               "License: MIT",
               "LicenseUrl: https://github.com/NamelessSaint8/AzurePAM/blob/main/LICENSE",
-              "Copyright: Copyright (c) David Stells",
+              "Copyright: Copyright (c) NamelessSaint",
               "ShortDescription: Read-only Microsoft Cloud (Entra/Azure/M365) compliance assessment toolkit.",
               "Description: $description",
               "Moniker: entrachecks",
@@ -191,11 +191,11 @@ jobs:
               "ManifestType: defaultLocale",
               "ManifestVersion: 1.12.0"
           ) -join $LF
-          Set-Content -Path "$manifestDir/Stells.EntraChecks.locale.en-US.yaml" -Value $localeManifest -Encoding utf8
+          Set-Content -Path "$manifestDir/NamelessSaint.EntraChecks.locale.en-US.yaml" -Value $localeManifest -Encoding utf8
 
           $installerManifest = @(
               "# yaml-language-server: `$schema=https://aka.ms/winget-manifest.installer.1.12.0.schema.json",
-              "PackageIdentifier: Stells.EntraChecks",
+              "PackageIdentifier: NamelessSaint.EntraChecks",
               "PackageVersion: $version",
               "InstallerLocale: en-US",
               "InstallerType: nullsoft",
@@ -214,7 +214,7 @@ jobs:
               "ManifestType: installer",
               "ManifestVersion: 1.12.0"
           ) -join $LF
-          Set-Content -Path "$manifestDir/Stells.EntraChecks.installer.yaml" -Value $installerManifest -Encoding utf8
+          Set-Content -Path "$manifestDir/NamelessSaint.EntraChecks.installer.yaml" -Value $installerManifest -Encoding utf8
 
           Write-Host "--- manifests ---"
           Get-ChildItem $manifestDir | ForEach-Object {

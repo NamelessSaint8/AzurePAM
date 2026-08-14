@@ -22,7 +22,7 @@
 
 .NOTES
     Version: 1.0.1
-    Author:  David Stells
+    Author:  NamelessSaint
 #>
 
 [CmdletBinding()]

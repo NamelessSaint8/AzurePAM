@@ -1,7 +1,7 @@
 # EntraChecks — Microsoft Cloud Compliance Assessment Toolkit
 
 **Version 1.7.0** · Windows desktop app + PowerShell 5.1+ CLI · Windows 10/11 or Server 2016+
-**Author:** David Stells
+**Author:** NamelessSaint
 
 EntraChecks runs read-only security and compliance checks across your Microsoft 365
 and Azure environment, then produces actionable HTML/CSV/JSON/Excel reports you can
@@ -90,7 +90,7 @@ scoop install entrachecks
 **WinGet** (after the first manifest is accepted into `microsoft/winget-pkgs` — see [Packaging](#packaging) for status)
 
 ```powershell
-winget install Stells.EntraChecks
+winget install NamelessSaint.EntraChecks
 ```
 
 Both channels pull the same NSIS installer that lives on the GitHub
@@ -563,7 +563,7 @@ EntraChecks ships as:
   `Pull requests: write` on the user who'll fork `microsoft/winget-pkgs`).
   The very first submission gets human-reviewed by WinGet maintainers
   (1–3 days); after that, future releases auto-submit under the
-  `Stells.EntraChecks` identifier.
+  `NamelessSaint.EntraChecks` identifier.
 
 Microsoft Store packaging is deferred; the Tauri shell could be repackaged
 as MSIX if the free Microsoft signing route ever becomes worth the effort.

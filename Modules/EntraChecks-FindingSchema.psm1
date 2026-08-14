@@ -19,7 +19,7 @@
     description, or source.
 
 .NOTES
-    Author: David Stells
+    Author: NamelessSaint
     Version: 2.0.0
     Schema: 2.0
 #>

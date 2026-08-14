@@ -10,7 +10,7 @@
 
 .NOTES
     Version: 1.0.0
-    Author: David Stells
+    Author: NamelessSaint
     Requires: Az.KeyVault module (optional)
 #>
 

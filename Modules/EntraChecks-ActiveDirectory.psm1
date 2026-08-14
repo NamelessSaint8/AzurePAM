@@ -19,7 +19,7 @@
 
 .NOTES
     Version: 1.0.0
-    Author:  David Stells
+    Author:  NamelessSaint
     Requires: Windows + ActiveDirectory PowerShell module (RSAT)
     Optional: GroupPolicy PowerShell module (for GPO checks)
 

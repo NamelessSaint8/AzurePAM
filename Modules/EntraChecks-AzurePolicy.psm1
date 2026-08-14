@@ -19,7 +19,7 @@
     
 .NOTES
     Version: 1.0.0
-    Author: David Stells
+    Author: NamelessSaint
     Requires: Az.PolicyInsights, Az.Resources, Az.Accounts PowerShell modules
     
     Required Azure RBAC Role:

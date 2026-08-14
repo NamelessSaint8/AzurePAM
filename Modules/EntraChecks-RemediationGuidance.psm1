@@ -16,7 +16,7 @@
     - Rollback procedures
 
 .NOTES
-    Author: David Stells
+    Author: NamelessSaint
     Version: 1.0.0
 #>
 

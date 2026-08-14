@@ -16,7 +16,7 @@
     - Pivot-ready data structure
 
 .NOTES
-    Author: David Stells
+    Author: NamelessSaint
     Version: 1.0.0
     Requires: ImportExcel module (optional - will use CSV fallback if not available)
 #>

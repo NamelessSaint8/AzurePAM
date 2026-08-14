@@ -14,7 +14,7 @@
     - Remediation effort (time, complexity, risk)
 
 .NOTES
-    Author: David Stells
+    Author: NamelessSaint
     Version: 1.0.0
 #>
 

@@ -15,7 +15,7 @@
     - Professional styling for IT leadership
 
 .NOTES
-    Author: David Stells
+    Author: NamelessSaint
     Version: 1.0.0
 #>
 

@@ -8,7 +8,7 @@
 
 .NOTES
     Version: 1.0.0
-    Author: David Stells
+    Author: NamelessSaint
     Requires: PowerShell 5.1 or higher
 #>
 

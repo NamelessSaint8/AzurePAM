@@ -98,7 +98,7 @@
 
 .NOTES
     Version: 1.5.0
-    Author: David Stells
+    Author: NamelessSaint
     Requires: Microsoft.Graph PowerShell SDK
     
     Required Graph Permissions (Read-Only):

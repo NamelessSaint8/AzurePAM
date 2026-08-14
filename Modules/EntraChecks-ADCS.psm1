@@ -19,7 +19,7 @@
 
 .NOTES
     Version: 1.0.0
-    Author:  David Stells
+    Author:  NamelessSaint
     References:
     - SpecterOps "Certified Pre-Owned" whitepaper
     - MS-WCCE, MS-CRTD protocol specifications

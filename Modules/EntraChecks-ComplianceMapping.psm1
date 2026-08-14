@@ -13,7 +13,7 @@
     - PCI-DSS v4.0.1
 
 .NOTES
-    Author: David Stells
+    Author: NamelessSaint
     Version: 1.0.0
 #>
 
