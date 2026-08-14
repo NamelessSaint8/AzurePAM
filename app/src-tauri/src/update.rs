@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 /// no-op until the URL is wired. No user-visible noise in the
 /// meantime.
 pub const DEFAULT_MANIFEST_URL: &str =
-    "https://github.com/f8l124/AzurePAM/releases/latest/download/version.json";
+    "https://github.com/NamelessSaint8/AzurePAM/releases/latest/download/version.json";
 
 /// The frozen v1 shape of `version.json`. Additive-only within v1:
 /// unknown fields are ignored, missing optional fields default sane.

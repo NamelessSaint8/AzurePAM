@@ -51,7 +51,7 @@ Both surfaces drive the same assessment engine and produce the same reports.
 ## Desktop App — Quick Start (Windows)
 
 1. Download **`EntraChecks_<version>_x64-setup.exe`** from the
-   [latest release](https://github.com/f8l124/AzurePAM/releases/latest).
+   [latest release](https://github.com/NamelessSaint8/AzurePAM/releases/latest).
 2. Run the installer. The first time you launch it Windows SmartScreen will
    show **"Windows protected your PC"** — this is expected for unsigned
    installers from small projects. Click **More info → Run anyway**.
@@ -80,7 +80,7 @@ If you prefer not to download the `.exe` by hand, EntraChecks is listed in:
 
 ```powershell
 # Add this repo as a Scoop bucket (one-time setup)
-scoop bucket add entrachecks https://github.com/f8l124/AzurePAM
+scoop bucket add entrachecks https://github.com/NamelessSaint8/AzurePAM
 
 # Then install (needs an elevated shell — the NSIS installer writes to
 # Program Files)

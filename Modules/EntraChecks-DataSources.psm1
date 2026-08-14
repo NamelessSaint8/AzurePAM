@@ -43,7 +43,7 @@ $script:DataSourceCatalog = @{
         Tenant = $null
         Subscriptions = @()
         QueriedAt = $null
-        ReferenceUrl = "https://github.com/f8l124/AzurePAM"
+        ReferenceUrl = "https://github.com/NamelessSaint8/AzurePAM"
     }
     SecureScore = @{
         Description = "Microsoft Secure Score"
